@@ -4605,7 +4605,13 @@ async function exportInvoiceMasukExcel(entitas, tahun) {
 //  3. Script melapor balik ke baris "gsheet_status" -> ditampilkan di kotak Google Sheets.
 const GSHEET_STATUS_ID = 'gsheet_status';
 let gsheetPending = new Set();
-let gsheetTimer = null, gsheetBusy = false, gsheetLastStatus = null, gsheetRemote = null, gsheetPollTimer = null;
+let gsheetTimer = null, gsheetBusy = false, gsheetLastStatus = null, gsheetRemote = null, gsheetPollTimer = null, gsheetRemoteFetchedAt = 0;
+// Status script Google diambil ulang tiap 60 detik selama kotaknya kelihatan (dulu cuma sekali,
+// jadi setelah 5 menit label berubah "tidak jalan" padahal script-nya normal).
+setInterval(() => {
+  if (!document.getElementById('f1-gsheet-box') || document.visibilityState === 'hidden') return;
+  gsheetFetchRemoteStatus().then(st => { if (st) renderGsheetBox(); });
+}, 60000);
 function gsheetAffectedKey(inv) {
   if (!inv || !INV_MASUK_EXPORT_CFG[inv.entitas]) return null;
   const y = String(invMasukTanggalFaktur(inv)).slice(0, 4);
@@ -4686,6 +4692,7 @@ async function gsheetFetchRemoteStatus() {
     const r = await gsjSupabase.from('gsj_settings').select('data').eq('id', GSHEET_STATUS_ID).maybeSingle();
     if (r.error) return null;
     gsheetRemote = (r.data && r.data.data) || null;
+    gsheetRemoteFetchedAt = Date.now();
     return gsheetRemote;
   } catch (e) { return null; }
 }
@@ -4737,7 +4744,7 @@ function renderGsheetBox() {
   const rs = gsheetRemote;
   const links = (rs && rs.files) || (state.settings && state.settings.gsheetLinks) || {};
   const linkHtml = Object.keys(links).sort().map(n => `<a href="${escapeAttr(links[n])}" target="_blank" rel="noopener" style="font-size:12px;margin-right:10px;">📗 ${escapeAttr(n)}</a>`).join('');
-  const aktif = rs && rs.at && (Date.now() - rs.heartbeat < 5 * 60000 || Date.now() - rs.at < 5 * 60000);
+  const aktif = rs && rs.heartbeat && (Date.now() - rs.heartbeat < 5 * 60000);
   const pill = !rs ? '<span class="pill" style="background:#FEF3C7;color:#92400E;font-size:9.5px;text-transform:none;">script Google belum dipasang</span>'
     : aktif ? '<span class="pill" style="background:#E6F7EF;color:#106645;font-size:9.5px;text-transform:none;">aktif</span>'
     : '<span class="pill" style="background:#FEE2E2;color:#991B1B;font-size:9.5px;text-transform:none;">script Google tidak jalan &gt;5 menit</span>';
@@ -4759,7 +4766,10 @@ function renderGsheetBox() {
     renderGsheetBox();
   });
   gsheetRenderStatus();
-  if (gsheetRemote === null && !renderGsheetBox._fetched) { renderGsheetBox._fetched = true; gsheetFetchRemoteStatus().then(st => { if (st) renderGsheetBox(); }); }
+  if (Date.now() - gsheetRemoteFetchedAt > 30000 && !renderGsheetBox._busy) {
+    renderGsheetBox._busy = true;
+    gsheetFetchRemoteStatus().then(st => { renderGsheetBox._busy = false; if (st) renderGsheetBox(); }, () => { renderGsheetBox._busy = false; });
+  }
 }
 
 // Perbaikan data sekali jalan: faktur beli di marketplace yang terlanjur "Surat Jalan" -> "Nota".
