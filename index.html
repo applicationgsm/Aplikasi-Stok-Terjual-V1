@@ -3616,15 +3616,8 @@ function renderTab1FakturBaru() {
   // Auto-fill Satuan begitu nama barang yang SUDAH PERNAH dipakai sebelumnya dipilih/diketik
   // persis — mengambil satuan terakhir yang dipakai untuk barang itu, biar tidak perlu
   // ngetik ulang "Pcs"/"Box"/dll setiap kali.
-  document.getElementById('f1-item-nama').addEventListener('change', () => {
-    const nama = document.getElementById('f1-item-nama').value.trim();
-    if (!nama) return;
-    let lastSatuan = null;
-    [...state.invoices].sort((a,b)=>(a.tanggal<b.tanggal?1:-1)).some(inv =>
-      (inv.items||[]).some(it => { if (normalizeName(it.nama)===normalizeName(nama) && it.satuan) { lastSatuan = it.satuan; return true; } return false; })
-    );
-    if (lastSatuan) document.getElementById('f1-item-satuan').value = lastSatuan;
-  });
+  bindSatuanAutofill(document.getElementById('f1-item-nama'), document.getElementById('f1-item-satuan'), () => document.getElementById('f1-entitas').value);
+  document.getElementById('f1-entitas').addEventListener('change', () => { const n = document.getElementById('f1-item-nama'); if (n && n._satuanRefresh) n._satuanRefresh(); });
   bindGenericAutocomplete(document.getElementById('f1-item-nama'), (q) => searchInternalProductNames(q, 40));
   bindGenericAutocomplete(document.getElementById('f1-supplier'), (q) => searchSupplierNames(q, 40));
   bindGenericAutocomplete(document.getElementById('f1-item-satuan'), (q) => {
@@ -4604,6 +4597,18 @@ async function exportInvoiceMasukExcel(entitas, tahun) {
 //     menulis ulang file INVOICE_MASUKAN_<ENTITAS>_<TAHUN> di Google Drive (file dibuat sendiri).
 //  3. Script melapor balik ke baris "gsheet_status" -> ditampilkan di kotak Google Sheets.
 const GSHEET_STATUS_ID = 'gsheet_status';
+const GSHEET_POKE_TOKEN = 'gsm-invmasuk-7Qk2vR9xLp4T';
+function gsheetPokeUrl() { return (state.settings && state.settings.gsheetPokeUrl) || ''; }
+// "Colek" script Google supaya langsung sinkron (tanpa nunggu jadwal tiap menit).
+// no-cors + tanpa cookie login: tidak kena masalah CORS / banyak akun Google. Balasannya memang
+// tidak dibaca — hasilnya dipantau lewat laporan status di Supabase seperti biasa.
+function gsheetPoke() {
+  const url = gsheetPokeUrl();
+  if (!url) return;
+  try {
+    fetch(url, { method: 'POST', mode: 'no-cors', credentials: 'omit', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ token: GSHEET_POKE_TOKEN, action: 'poke' }) }).catch(() => {});
+  } catch (e) {}
+}
 let gsheetPending = new Set();
 let gsheetTimer = null, gsheetBusy = false, gsheetLastStatus = null, gsheetRemote = null, gsheetPollTimer = null, gsheetRemoteFetchedAt = 0;
 // Status script Google diambil ulang tiap 60 detik selama kotaknya kelihatan (dulu cuma sekali,
@@ -4676,7 +4681,8 @@ async function gsheetFlush() {
     });
     const r = await gsjSupabase.from('gsj_settings').upsert(rows);
     if (r.error) throw r.error;
-    gsheetLastStatus = { state: 'busy', at: Date.now(), sentAt: Date.now(), text: `Terkirim — menunggu Google menulis ${rows.map(x => x.data.book.fileName).join(', ')} (maks ±1 menit)…` };
+    gsheetPoke();
+    gsheetLastStatus = { state: 'busy', at: Date.now(), sentAt: Date.now(), text: `Terkirim — menunggu Google menulis ${rows.map(x => x.data.book.fileName).join(', ')} (${gsheetPokeUrl() ? '±10–30 detik' : 'maks ±1–2 menit'})…` };
     gsheetStartPoll();
   } catch (e) {
     keys.forEach(k => gsheetPending.add(k));
@@ -4751,6 +4757,10 @@ function renderGsheetBox() {
   box.innerHTML = `
     <div style="font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-bottom:6px;">🟢 Google Sheets otomatis ${pill}</div>
     <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <input type="text" id="f1-gsheet-poke" value="${escapeAttr(gsheetPokeUrl())}" placeholder="(Opsional, biar lebih cepat) URL Web App: https://script.google.com/macros/s/…/exec" style="flex:1 1 300px; padding:7px 8px; border:1px solid var(--line); border-radius:8px; font-size:12.5px;">
+      <button type="button" class="btn secondary small" id="f1-gsheet-poke-save">💾 Simpan URL</button>
+    </div>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px;">
       <button type="button" class="btn secondary small" id="f1-gsheet-syncall">🔄 Kirim semua (tahun terpilih)</button>
       <button type="button" class="btn secondary small" id="f1-gsheet-check">🔌 Cek status</button>
       ${linkHtml}
@@ -4758,6 +4768,16 @@ function renderGsheetBox() {
     <div id="f1-gsheet-status" style="font-size:12px; margin-top:6px;"></div>
     <div style="font-size:11.5px; color:var(--muted); margin-top:4px;">Setiap faktur disimpan/diedit/dihapus di device mana pun, file Google Sheets entitas itu ter-update otomatis (maks ±1 menit).${rs && rs.heartbeat ? ` Script Google terakhir cek: ${new Date(rs.heartbeat).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}.` : ''}</div>`;
   box.querySelector('#f1-gsheet-syncall').addEventListener('click', () => gsheetSyncAll(tab1ExportYear));
+  box.querySelector('#f1-gsheet-poke-save').addEventListener('click', () => {
+    const v = box.querySelector('#f1-gsheet-poke').value.trim();
+    if (v && !/^https:\/\/script\.google\.com\/(a\/[^/]+\/)?macros\/s\/[^/]+\/exec\/?$/.test(v)) { gsheetLastStatus = { state: 'err', at: Date.now(), text: 'URL harus berbentuk https://script.google.com/macros/s/…/exec (bukan /dev).' }; gsheetRenderStatus(); return; }
+    state.settings.gsheetPokeUrl = v;
+    gsjDetailedAudit(v ? 'menyimpan URL Web App Google Sheets (sinkron cepat)' : 'menghapus URL Web App Google Sheets');
+    saveState();
+    if (typeof gsjPushSettings === 'function') { clearTimeout(gsjSyncDebounceTimers.settings); gsjPushSettings(); }
+    gsheetLastStatus = { state: 'ok', at: Date.now(), text: v ? 'URL tersimpan (berlaku di semua device). Klik "Kirim semua" untuk tes — harusnya selesai dalam ±30 detik.' : 'URL dihapus — kembali ke jadwal tiap menit.' };
+    renderGsheetBox();
+  });
   box.querySelector('#f1-gsheet-check').addEventListener('click', async () => {
     await gsheetFetchRemoteStatus();
     if (!gsheetRemote) gsheetLastStatus = { state: 'err', at: Date.now(), text: 'Script Google belum pernah jalan. Pasang script-nya lalu jalankan fungsi "pasangOtomatis" sekali.' };
@@ -4876,6 +4896,7 @@ function bindInvoiceCardEvents(wrap) {
     const newItemNamaInput = card.querySelector('[data-newitem="nama"]');
     if (newItemNamaInput) bindGenericAutocomplete(newItemNamaInput, (q) => searchInternalProductNames(q, 40));
     const newItemSatuanInput = card.querySelector('[data-newitem="satuan"]');
+    if (newItemNamaInput && newItemSatuanInput) bindSatuanAutofill(newItemNamaInput, newItemSatuanInput, () => { const iv = state.invoices.find(x => x.id === invId); return iv ? iv.entitas : null; });
     if (newItemSatuanInput) bindGenericAutocomplete(newItemSatuanInput, (q) => {
       const opts = getKnownSatuanList();
       const qn = normalizeName(q);
@@ -6932,6 +6953,49 @@ function ensureProductSatuanMap() {
   _productSatuanMapCache = map;
   _productSatuanMapSourceLens = lens;
   return map;
+}
+// Satuan barang PERSIS seperti yang tampil di kolom Satuan tab Stok Terjual (entitas yang sama
+// dulu, kalau belum ada pakai entitas lain). null = barang belum punya satuan tercatat.
+function lookupStokTerjualSatuan(entitas, nama) {
+  const key = normalizeName(nama || '');
+  if (!key) return null;
+  const map = ensureProductSatuanMap();
+  if (entitas && map[entitas + '||' + key]) return map[entitas + '||' + key];
+  for (const e of (typeof ENTITIES !== 'undefined' ? ENTITIES : ['Gracia', 'HNH', 'Glomed'])) {
+    if (map[e + '||' + key]) return map[e + '||' + key];
+  }
+  return null;
+}
+// Isi otomatis kolom Satuan waktu nama barang dipilih/diketik. Kalau satuan sudah diubah manual
+// oleh user, tidak ditimpa (kecuali nama barangnya diganti lagi ke barang lain yang punya satuan).
+function bindSatuanAutofill(namaInput, satuanInput, getEntitas) {
+  if (!namaInput || !satuanInput || namaInput._satuanBound) return;
+  namaInput._satuanBound = true;
+  let lastAuto = null, lastNamaKey = null, t = null;
+  const apply = () => {
+    const nama = namaInput.value.trim();
+    const key = normalizeName(nama);
+    if (!key) { lastNamaKey = null; return; }
+    if (key === lastNamaKey) return;
+    lastNamaKey = key;
+    const sat = lookupStokTerjualSatuan(getEntitas && getEntitas(), nama);
+    const cur = satuanInput.value.trim();
+    if (!sat) {
+      // Nama belum dikenal (mis. masih ngetik): kalau satuan tadi hasil isi otomatis, kembalikan ke Pcs.
+      if (lastAuto && cur === lastAuto) { satuanInput.value = 'Pcs'; lastAuto = null; }
+      return;
+    }
+    if (cur !== sat) {
+      satuanInput.value = sat;
+      satuanInput.style.background = '#EEF6FF';
+      clearTimeout(apply._hl); apply._hl = setTimeout(() => { satuanInput.style.background = ''; }, 1500);
+    }
+    lastAuto = sat;
+    satuanInput.title = 'Otomatis dari satuan barang ini di tab Stok Terjual (boleh diubah)';
+  };
+  namaInput.addEventListener('change', apply);
+  namaInput.addEventListener('input', () => { clearTimeout(t); t = setTimeout(apply, 350); });
+  namaInput._satuanRefresh = () => { lastNamaKey = null; apply(); };
 }
 function getProductSatuan(entitas, nama) {
   return ensureProductSatuanMap()[entitas + '||' + normalizeName(nama)] || 'Pcs';
