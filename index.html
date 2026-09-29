@@ -671,6 +671,19 @@ table.dtable td input, table.dtable td select, table.dtable td textarea{
 .audit-item::before{ content:""; position:absolute; left:14px; top:18px; width:7px; height:7px; border-radius:99px; background:var(--accent); }
 .audit-item p.txt{ margin:0; font-size:13px; line-height:1.5; color:var(--ink); }
 .audit-item p.tm{ margin:3px 0 0; font-size:11px; color:var(--muted); font-family:var(--mono); }
+.audit-item{ padding-right:44px; }
+.audit-item p.txt{ overflow-wrap:anywhere; }
+.audit-del{ position:absolute; right:10px; top:8px; width:28px; height:28px; border:1px solid transparent; background:transparent; border-radius:8px; cursor:pointer; font-size:14px; line-height:1; color:var(--muted); }
+.audit-del:hover{ border-color:var(--red); color:var(--red); background:#FDECEA; }
+#gsjOwnOv{ position:fixed; inset:0; background:rgba(15,23,42,.5); z-index:600; display:flex; align-items:center; justify-content:center; padding:16px; }
+.gsj-own-box{ background:#fff; border-radius:14px; padding:20px; width:min(92vw,340px); box-shadow:0 20px 50px -12px rgba(15,23,42,.45); }
+.gsj-own-box h4{ margin:0 0 4px; font-size:15px; }
+.gsj-own-box p{ margin:0 0 12px; font-size:12.5px; color:var(--muted); }
+.gsj-own-in{ width:100%; box-sizing:border-box; padding:9px 11px; border:1.5px solid #D3D9E5; border-radius:8px; font-size:14px; }
+.gsj-own-in:focus{ outline:none; border-color:var(--accent); }
+.gsj-own-err{ min-height:18px; margin-top:6px; font-size:12px; color:var(--red); }
+.gsj-own-act{ display:flex; justify-content:flex-end; gap:8px; margin-top:6px; }
+#auditDrawer .adr-tools{ padding:8px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:flex-end; }
 
 #gsjToast{
   position:fixed; left:50%; bottom:24px; transform:translate(-50%,10px); z-index:600;
@@ -851,6 +864,7 @@ table.dtable td input, table.dtable td select, table.dtable td textarea{
     </div>
     <button class="btn secondary" id="closeAuditBtn" style="padding:6px 10px;">✕</button>
   </div>
+  <div class="adr-tools"><button class="btn danger small" id="clearAuditBtn" type="button">🗑 Hapus semua riwayat</button></div>
   <div id="auditList"></div>
 </div>
 <div id="gsjToast"></div>
@@ -12304,8 +12318,97 @@ function gsjRenderAudit() {
     <div class="audit-item">
       <p class="txt">${a.text}</p>
       <p class="tm">${gsjFullTimeLabel(a.ts)}</p>
+      <button class="audit-del" type="button" data-audit-id="${a.id}" title="Hapus riwayat ini" aria-label="Hapus riwayat ini">🗑</button>
     </div>
   `).join('');
+}
+// ---- Sandi pemilik: wajib diisi sebelum riwayat boleh dihapus ----
+// Yang disimpan hanya hash SHA-256 sandi, bukan sandinya. Untuk mengganti sandi: buka Console
+// browser di halaman ini, jalankan  gsjSha256('sandi-baru')  lalu tempel hasilnya ke bawah ini.
+const GSJ_OWNER_HASH = '1995f9faa217121c9123c9cf7bc258cc01e8ef585b0efc8e2362d6dbdecb5512';
+function gsjSha256(str) {
+  const K = [], H = [];
+  for (let n = 2, c = 0; c < 64; n++) {
+    let prime = true;
+    for (let i = 2; i * i <= n; i++) if (n % i === 0) { prime = false; break; }
+    if (!prime) continue;
+    K.push(Math.floor((Math.cbrt(n) % 1) * 4294967296));
+    if (c < 8) H.push(Math.floor((Math.sqrt(n) % 1) * 4294967296));
+    c++;
+  }
+  const bytes = Array.from(new TextEncoder().encode(str));
+  const bitLen = bytes.length * 8;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) bytes.push(0);
+  const hi = Math.floor(bitLen / 4294967296), lo = bitLen >>> 0;
+  for (let i = 3; i >= 0; i--) bytes.push((hi >>> (i * 8)) & 255);
+  for (let i = 3; i >= 0; i--) bytes.push((lo >>> (i * 8)) & 255);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let off = 0; off < bytes.length; off += 64) {
+    const w = new Array(64);
+    for (let i = 0; i < 16; i++) w[i] = (bytes[off+i*4] << 24) | (bytes[off+i*4+1] << 16) | (bytes[off+i*4+2] << 8) | bytes[off+i*4+3];
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >>> 3);
+      const s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >>> 10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) | 0;
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const t1 = (h + S1 + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const t2 = (S0 + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    [a, b, c, d, e, f, g, h].forEach((v, i) => { H[i] = (H[i] + v) | 0; });
+  }
+  return H.map(x => (x >>> 0).toString(16).padStart(8, '0')).join('');
+}
+function gsjAskOwner(title) {
+  return new Promise(resolve => {
+    const ov = document.createElement('div');
+    ov.id = 'gsjOwnOv';
+    ov.innerHTML = `<div class="gsj-own-box" role="dialog" aria-modal="true">
+      <h4>🔒 ${title}</h4>
+      <p>Masukkan sandi pemilik untuk melanjutkan.</p>
+      <input type="password" class="gsj-own-in" placeholder="Sandi pemilik" autocomplete="off">
+      <div class="gsj-own-err"></div>
+      <div class="gsj-own-act">
+        <button type="button" class="btn secondary small gsj-own-cancel">Batal</button>
+        <button type="button" class="btn danger small gsj-own-ok">Hapus</button>
+      </div></div>`;
+    document.body.appendChild(ov);
+    const inp = ov.querySelector('.gsj-own-in'), err = ov.querySelector('.gsj-own-err');
+    const done = (v) => { document.removeEventListener('keydown', onKey, true); ov.remove(); resolve(v); };
+    const submit = () => {
+      if (gsjSha256(inp.value) === GSJ_OWNER_HASH) { done(true); return; }
+      err.textContent = 'Sandi salah.'; inp.value = ''; inp.focus();
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.stopPropagation(); done(false); }
+      else if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    };
+    document.addEventListener('keydown', onKey, true);
+    ov.querySelector('.gsj-own-ok').addEventListener('click', submit);
+    ov.querySelector('.gsj-own-cancel').addEventListener('click', () => done(false));
+    ov.addEventListener('click', (e) => { if (e.target === ov) done(false); });
+    inp.focus();
+  });
+}
+async function gsjDeleteAudit(id) {
+  if (!(await gsjAskOwner('Hapus riwayat ini?'))) return;
+  gsjAudit = gsjAudit.filter(a => a.id !== id);
+  gsjPersistAudit();
+  gsjRenderAudit();
+  gsjShowToast('Riwayat dihapus');
+}
+async function gsjClearAudit() {
+  if (!gsjAudit.length) { gsjShowToast('Riwayat sudah kosong'); return; }
+  if (!(await gsjAskOwner('Hapus SEMUA riwayat (' + gsjAudit.length + ' entri)?'))) return;
+  gsjAudit = [];
+  gsjPersistAudit();
+  gsjRenderAudit();
+  gsjShowToast('Semua riwayat dihapus');
 }
 function gsjOpenAudit() {
   document.getElementById('auditOverlay').classList.add('show');
@@ -12521,6 +12624,11 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('logoutBtn').addEventListener('click', gsjHandleLogout);
   document.getElementById('openAuditBtn').addEventListener('click', gsjOpenAudit);
   document.getElementById('closeAuditBtn').addEventListener('click', gsjCloseAudit);
+  document.getElementById('clearAuditBtn').addEventListener('click', gsjClearAudit);
+  document.getElementById('auditList').addEventListener('click', (e) => {
+    const btn = e.target.closest('.audit-del');
+    if (btn) gsjDeleteAudit(btn.dataset.auditId);
+  });
   document.getElementById('auditOverlay').addEventListener('click', gsjCloseAudit);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') gsjCloseAudit(); });
 
