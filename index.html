@@ -481,6 +481,32 @@ footer.appfoot{text-align:center; color:var(--muted); font-size:10.5px; margin:2
 #t3-date-tabs .filter-chip.t3-rekapchip{ padding:4px 10px; border-radius:8px; font-size:12px; line-height:1.3; flex-shrink:0; border-style:dashed; }
 #t3-fs-target.fullscreen-table #t3-date-tabs.t3-datetabs-bottom{ gap:4px; padding:5px 6px; }
 
+/* Tabel Checker lebih tinggi: area filter di atasnya dipadatkan */
+#tab2 .table-wrap#t2-tablewrap{ max-height:calc(100vh - 150px); }
+#t2-fs-target.fullscreen-table{ padding:10px 14px 8px; }
+#t2-fs-target.fullscreen-table #t2-fs-header{ display:flex; flex-wrap:wrap; align-items:center; gap:4px 14px; margin-top:0 !important; margin-bottom:6px; }
+#t2-fs-target.fullscreen-table #t2-fs-header > .tag-row{ margin:0 !important; padding:0 !important; gap:4px; flex-wrap:wrap; }
+#t2-fs-target.fullscreen-table #t2-fs-header .filter-chip{ padding:3px 10px !important; font-size:11.5px !important; line-height:1.3 !important; }
+#t2-fs-target.fullscreen-table #t2-warning-banner{ flex-basis:100%; }
+#t2-fs-target.fullscreen-table #t2-warning-banner:empty{ display:none; }
+#t2-fs-target.fullscreen-table .t2-toolbar{ margin-bottom:4px !important; }
+
+/* Chip tanggal Checker (Tab 2) versi ringkas: cukup angka hari, bulan sudah tertulis di navigasi */
+#t2-datefilter{ align-items:center; gap:4px !important; }
+#t2-datefilter .filter-chip{ padding:4px 10px !important; font-size:12px !important; line-height:1.3 !important; border-radius:8px !important; min-height:0 !important; height:auto !important; flex-shrink:0; white-space:nowrap; }
+#t2-datefilter .filter-chip.t2-daychip{ padding:4px 0 !important; min-width:32px; text-align:center; position:relative; }
+#t2-datefilter .filter-chip.t2-daychip.t2-sun{ color:#c2410c; }
+#t2-datefilter .filter-chip.t2-daychip.active{ color:#fff; }
+#t2-datefilter .t2-daychip .date-chip-delete{
+  display:none; position:absolute; top:1px; right:1px; transform:none; width:12px; height:12px; padding:0;
+  font-size:8px; line-height:12px; text-align:center; border-radius:50%; opacity:1;
+  background:#fff; color:var(--red); box-shadow:0 0 0 1px #F3C2C2;
+}
+#t2-datefilter .t2-daychip:hover .date-chip-delete{ display:block; }
+#t2-datefilter .t2-monthnav{ display:inline-flex; flex-wrap:nowrap; flex-shrink:0; align-items:center; gap:2px; margin:0 6px 0 2px; }
+#t2-datefilter .t2-monthnav .icon-btn{ padding:2px 6px; font-size:11px; line-height:1.2; }
+#t2-fs-target.fullscreen-table #t2-datefilter.t2-datefilter-bottom{ gap:4px; padding:5px 6px; }
+
 .colfilter-icon{ color:#9ca3af; }
 .colfilter-icon:hover{ color:var(--accent); }
 .colfilter-icon.active{ color:var(--accent-dark); font-weight:900; }
@@ -1011,60 +1037,125 @@ function uid() {
 // saveState() unconditionally, and without excluding the edit-metadata fields from the
 // diff check, stamping "just now" would itself look like a change, permanently faking
 // constant editing activity and polluting undo history with meaningless timestamp-only steps.
-function snapshotForComparison(s) {
-  const clone = Object.assign({}, s);
-  delete clone.lastEditedBy;
-  delete clone.lastEditedAt;
-  return JSON.stringify(clone);
+// ================= SNAPSHOT STATE PER-TABEL (anti lag) =================
+// DULU: setiap saveState() men-JSON-kan SELURUH data 3-4x (cek perubahan, localStorage, 2x riwayat
+// Undo) dan menyimpan 50 salinan penuh untuk Undo. Dengan Master Produk ±18rb baris + Stok Awal +
+// Stok Terjual, itu ±13 MB per salinan -> tiap klik/simpan macet ±0,3–1 detik dan memori browser
+// bisa tembus 1–2 GB (laptop jadi lemot / tab crash).
+// SEKARANG: tiap tabel di-JSON-kan SEKALI per saveState, tabel yang tidak berubah memakai ulang
+// teks lama (memori dibagi antar langkah Undo), yang dikirim ke server cuma tabel yang berubah,
+// dan total memori riwayat Undo dibatasi.
+const SNAP_SKIP_KEYS = { lastEditedBy: 1, lastEditedAt: 1 };
+const UNDO_MAX_CHARS = 60e6; // ±120 MB teks unik untuk seluruh riwayat Undo
+const LOCAL_MAX_CHARS = 4.5e6; // batas aman localStorage (±5 juta karakter)
+function snapTake(prev) {
+  const out = {};
+  Object.keys(state).forEach(k => {
+    if (SNAP_SKIP_KEYS[k]) return;
+    const str = JSON.stringify(state[k]);
+    if (str === undefined) return;
+    out[k] = (prev && prev[k] === str) ? prev[k] : str; // isi sama -> pakai teks lama (hemat memori)
+  });
+  return out;
+}
+function snapChangedKeys(a, b) {
+  const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
+  return [...keys].filter(k => !a || !b || a[k] !== b[k]);
+}
+function snapToState(snap) {
+  const out = {};
+  Object.keys(snap).forEach(k => { out[k] = JSON.parse(snap[k]); });
+  return out;
+}
+function snapSameExcept(a, b, exclude) {
+  return snapChangedKeys(a, b).every(k => exclude.includes(k));
+}
+// Simpan cadangan ke localStorage — ditunda (tidak tiap klik) & dilewati kalau data sudah terlalu besar
+// (localStorage cuma muat ±5 MB; dulu tetap di-JSON-kan tiap kali lalu gagal -> buang waktu + data
+// cadangan basi). Sumber utama data tetap Supabase.
+let _persistLocalTimer = null;
+function persistLocalSoon() {
+  clearTimeout(_persistLocalTimer);
+  _persistLocalTimer = setTimeout(() => {
+    const snap = undoHistory[undoIndex];
+    if (!snap) return;
+    let total = 0;
+    Object.keys(snap).forEach(k => { total += snap[k].length; });
+    try {
+      if (total > LOCAL_MAX_CHARS) { localStorage.removeItem(STORAGE_KEY); return; }
+      const parts = Object.keys(snap).map(k => JSON.stringify(k) + ':' + snap[k]);
+      parts.push('"lastEditedBy":' + JSON.stringify(state.lastEditedBy || null), '"lastEditedAt":' + JSON.stringify(state.lastEditedAt || null));
+      localStorage.setItem(STORAGE_KEY, '{' + parts.join(',') + '}');
+    } catch (e) { try { localStorage.removeItem(STORAGE_KEY); } catch (e2) {} }
+  }, 2000);
+}
+// Perubahan yang DATANG DARI DEVICE LAIN: masukkan ke snapshot "sekarang" tanpa dianggap edit kita
+// (dulu: saveState berkala menganggapnya edit kita -> riwayat edit palsu + kirim ulang semua tabel).
+const gsjRemoteTouchedKeys = new Set();
+function snapAbsorbRemote() {
+  const cur = undoHistory[undoIndex];
+  if (!cur || !gsjRemoteTouchedKeys.size) return;
+  gsjRemoteTouchedKeys.forEach(k => {
+    if (k === '*') { Object.assign(cur, snapTake(cur)); return; }
+    if (state[k] === undefined) return;
+    const str = JSON.stringify(state[k]);
+    if (cur[k] !== str) cur[k] = str;
+  });
+  gsjRemoteTouchedKeys.clear();
+  persistLocalSoon();
+}
+function snapResetHistory() {
+  undoHistory = [snapTake(null)];
+  undoIndex = 0;
+  gsjRemoteTouchedKeys.clear();
+  if (typeof updateUndoRedoButtons === 'function') updateUndoRedoButtons();
 }
 
-let undoHistory = [JSON.stringify(state)];
-let undoComparisonHistory = [snapshotForComparison(state)];
+let undoHistory = [snapTake(null)];
 let undoIndex = 0;
 const MAX_UNDO_HISTORY = 50;
 let isRestoringHistory = false;
 
 function saveState() {
-  const comparisonSnap = snapshotForComparison(state);
-  const isRealChange = !isRestoringHistory && comparisonSnap !== undoComparisonHistory[undoIndex];
+  if (gsjRemoteTouchedKeys.size) snapAbsorbRemote();
+  const prev = undoHistory[undoIndex];
+  const snap = snapTake(prev);
+  const changed = isRestoringHistory ? [] : snapChangedKeys(prev, snap);
+  const isRealChange = changed.length > 0;
   if (isRealChange) {
     state.lastEditedBy = getUserName() || 'Tanpa nama';
     state.lastEditedAt = new Date().toISOString();
     if (typeof logAuditEntry === 'function') logAuditEntry();
   }
-  if (isRealChange && !isRestoringHistory && typeof gsjIsApplyingRemoteChange !== 'undefined' && !gsjIsApplyingRemoteChange) {
-    // Kirim perubahan ke Supabase per-tabel (di-diff per record) — TIDAK dikirim saat lagi
-    // menerapkan perubahan yang BARU SAJA datang dari server (gsjIsApplyingRemoteChange),
-    // supaya tidak jadi kirim balik/loop.
+  if (isRealChange && typeof gsjIsApplyingRemoteChange !== 'undefined' && !gsjIsApplyingRemoteChange) {
+    // Kirim ke Supabase HANYA tabel yang benar-benar berubah (dulu: semua tabel tiap kali simpan).
     if (typeof gsjScheduleSync === 'function') {
-      Object.keys(GSJ_SYNC_TABLES).forEach(gsjScheduleSync);
-      gsjScheduleSettingsSync();
+      changed.forEach(k => { if (GSJ_SYNC_TABLES[k]) gsjScheduleSync(k); });
+      if (changed.includes('settings') || changed.includes('hargaModalOverride')) gsjScheduleSettingsSync();
     }
   }
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    if (isRealChange) pushUndoSnapshot();
-    if (typeof updateUndoRedoButtons === 'function') updateUndoRedoButtons();
-    if (isRealChange && typeof updateLastEditedDisplay === 'function') updateLastEditedDisplay();
-    return true;
-  } catch (e) {
-    console.warn('Gagal auto-save ke localStorage:', e);
-    if (isRealChange) pushUndoSnapshot();
-    if (typeof updateUndoRedoButtons === 'function') updateUndoRedoButtons();
-    if (isRealChange && typeof updateLastEditedDisplay === 'function') updateLastEditedDisplay();
-    return false;
-  }
+  if (isRealChange) pushUndoSnapshot(snap);
+  else if (!isRestoringHistory) undoHistory[undoIndex] = snap;
+  if (isRealChange) persistLocalSoon();
+  if (typeof updateUndoRedoButtons === 'function') updateUndoRedoButtons();
+  if (isRealChange && typeof updateLastEditedDisplay === 'function') updateLastEditedDisplay();
+  return true;
 }
 
-function pushUndoSnapshot() {
-  const snap = JSON.stringify(state);
-  const compSnap = snapshotForComparison(state);
-  if (compSnap === undoComparisonHistory[undoIndex]) return; // no actual change, skip
-  undoHistory = undoHistory.slice(0, undoIndex + 1); // drop any redo-able future
-  undoComparisonHistory = undoComparisonHistory.slice(0, undoIndex + 1);
+function pushUndoSnapshot(snap) {
+  snap = snap || snapTake(undoHistory[undoIndex]);
+  if (snapChangedKeys(undoHistory[undoIndex], snap).length === 0) return;
+  undoHistory = undoHistory.slice(0, undoIndex + 1); // buang langkah Redo
   undoHistory.push(snap);
-  undoComparisonHistory.push(compSnap);
-  if (undoHistory.length > MAX_UNDO_HISTORY) { undoHistory.shift(); undoComparisonHistory.shift(); }
+  // Batasi jumlah langkah DAN total memori (teks yang dipakai bersama dihitung sekali).
+  const trim = () => {
+    if (undoHistory.length > MAX_UNDO_HISTORY) return true;
+    if (undoHistory.length <= 3) return false;
+    const seen = new Set(); let total = 0;
+    undoHistory.forEach(sn => Object.keys(sn).forEach(k => { const v = sn[k]; if (!seen.has(v)) { seen.add(v); total += v.length; } }));
+    return total > UNDO_MAX_CHARS;
+  };
+  while (trim()) undoHistory.shift();
   undoIndex = undoHistory.length - 1;
 }
 
@@ -1074,44 +1165,41 @@ function canRedo() { return undoIndex < undoHistory.length - 1; }
 // Invoice Masuk (dan hasil simpanan Invoice ke Glomed / Omset Bulanan) TIDAK ikut Undo/Redo:
 // Undo hanya mengembalikan data lain; data-data ini selalu tetap seperti sekarang.
 const GSJ_UNDO_EXCLUDE = ['invoices', 'salesInvoices', 'omsetBulanan'];
-function gsjUndoSig(obj) {
-  const c = Object.assign({}, obj);
-  GSJ_UNDO_EXCLUDE.forEach(k => { delete c[k]; });
-  delete c.lastEditedBy;
-  delete c.lastEditedAt;
-  return JSON.stringify(c);
-}
 function gsjApplyHistoryAt(idx) {
-  const target = JSON.parse(undoHistory[idx]);
+  const target = snapToState(undoHistory[idx]);
   GSJ_UNDO_EXCLUDE.forEach(k => { if (state[k] !== undefined) target[k] = state[k]; }); // pertahankan yang sekarang
+  target.lastEditedBy = state.lastEditedBy; target.lastEditedAt = state.lastEditedAt;
+  const before = undoHistory[undoIndex];
   isRestoringHistory = true;
   state = target;
   undoIndex = idx;
-  undoHistory[idx] = JSON.stringify(state);            // samakan riwayat dengan state yang baru
-  undoComparisonHistory[idx] = snapshotForComparison(state);
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) {}
+  undoHistory[idx] = snapTake(undoHistory[idx]); // samakan riwayat dengan state yang baru
   isRestoringHistory = false;
+  persistLocalSoon();
   if (typeof renderAllTabs === 'function') renderAllTabs();
   if (typeof updateLastEditedDisplay === 'function') updateLastEditedDisplay();
-  // Supaya hasil Undo/Redo ikut tersimpan di server (bukan hanya di browser ini) — dikirim per-record seperti biasa.
+  if (typeof updateUndoRedoButtons === 'function') updateUndoRedoButtons();
+  // Hasil Undo/Redo ikut tersimpan di server — cukup tabel yang berubah.
   if (typeof gsjScheduleSync === 'function' && typeof GSJ_SYNC_TABLES !== 'undefined') {
-    Object.keys(GSJ_SYNC_TABLES).forEach(gsjScheduleSync);
-    if (typeof gsjScheduleSettingsSync === 'function') gsjScheduleSettingsSync();
+    const changed = snapChangedKeys(before, undoHistory[idx]);
+    changed.forEach(k => { if (GSJ_SYNC_TABLES[k]) gsjScheduleSync(k); });
+    if ((changed.includes('settings') || changed.includes('hargaModalOverride')) && typeof gsjScheduleSettingsSync === 'function') gsjScheduleSettingsSync();
   }
 }
 function undoLastChange() {
   if (!canUndo()) return false;
-  const cur = gsjUndoSig(state);
+  if (gsjRemoteTouchedKeys.size) snapAbsorbRemote();
+  const cur = snapTake(undoHistory[undoIndex]);
   for (let i = undoIndex - 1; i >= 0; i--) {
-    if (gsjUndoSig(JSON.parse(undoHistory[i])) !== cur) { gsjApplyHistoryAt(i); return true; }
+    if (!snapSameExcept(undoHistory[i], cur, GSJ_UNDO_EXCLUDE)) { gsjApplyHistoryAt(i); return true; }
   }
   return false; // sisa langkah sebelumnya cuma Invoice Masuk (yang memang tidak ikut Undo)
 }
 function redoLastUndo() {
   if (!canRedo()) return false;
-  const cur = gsjUndoSig(state);
+  const cur = snapTake(undoHistory[undoIndex]);
   for (let i = undoIndex + 1; i < undoHistory.length; i++) {
-    if (gsjUndoSig(JSON.parse(undoHistory[i])) !== cur) { gsjApplyHistoryAt(i); return true; }
+    if (!snapSameExcept(undoHistory[i], cur, GSJ_UNDO_EXCLUDE)) { gsjApplyHistoryAt(i); return true; }
   }
   return false;
 }
@@ -1182,8 +1270,7 @@ function loadState() {
   } catch (e) {
     console.warn('Gagal load dari localStorage:', e);
   }
-  undoHistory = [JSON.stringify(state)];
-  undoComparisonHistory = [snapshotForComparison(state)];
+  undoHistory = [snapTake(null)];
   undoIndex = 0;
   // Simpan hasil pembersihan flag "Belum Dirapikan" yang basi (lihat cleanupStaleBelumDirapikanFlags)
   // SETELAH riwayat undo diinisialisasi di atas, karena saveState() butuh undoComparisonHistory/undoIndex
@@ -1249,8 +1336,28 @@ function todayISO() {
   const d = new Date();
   return d.toISOString().slice(0, 10);
 }
+// Dipanggil ratusan ribu kali per render (nama yang sama berulang-ulang) -> hasil disimpan.
+const _normNameCache = new Map();
 function normalizeName(s) {
-  return String(s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+  if (s === null || s === undefined || s === '') return '';
+  const key = typeof s === 'string' ? s : String(s);
+  let v = _normNameCache.get(key);
+  if (v === undefined) {
+    v = key.toLowerCase().trim().replace(/\s+/g, ' ');
+    if (_normNameCache.size > 300000) _normNameCache.clear();
+    _normNameCache.set(key, v);
+  }
+  return v;
+}
+// Cache yang hanya hidup selama 1 putaran kerja (otomatis dibuang begitu browser lanjut ke
+// event berikutnya) — aman dari data basi, tapi menghindari hitung ulang ribuan kali per render.
+const _taskCaches = {};
+function taskCache(name, build) {
+  if (_taskCaches[name]) return _taskCaches[name];
+  const v = build();
+  _taskCaches[name] = v;
+  Promise.resolve().then(() => { delete _taskCaches[name]; });
+  return v;
 }
 
 // Sorts product names alphabetically by their first actual LETTER/DIGIT, ignoring any
@@ -1766,12 +1873,27 @@ function searchInternalProductNames(query, limit) {
 
 // below the auto-match threshold, so the UI can show "closest match found, but not close
 // enough" — turns an invisible near-miss into something visible without needing raw data access.
+// Kandidat fuzzy: cuma entri katalog yang punya minimal 1 kata bermakna (>=4 huruf, bukan angka)
+// yang sama — entri lain PASTI ditolak hasNoMeaningfulWordOverlap, jadi tidak perlu dicek satu-satu.
+// Urutan katalog dipertahankan supaya hasil (termasuk saat skor seri) sama persis seperti dulu.
+function fuzzyCandidates(catalog, rawTokens) {
+  if (!catalog._inv) {
+    const inv = new Map();
+    catalog.forEach((entry, i) => entry.tokens.forEach(t => {
+      if (t.length >= 4 && !/^\d+(\.\d+)?$/.test(t)) { let a = inv.get(t); if (!a) inv.set(t, a = []); a.push(i); }
+    }));
+    catalog._inv = inv;
+  }
+  const idx = new Set();
+  rawTokens.forEach(t => { const a = catalog._inv.get(t); if (a) a.forEach(i => idx.add(i)); });
+  return [...idx].sort((a, b) => a - b).map(i => catalog[i]);
+}
 function fuzzyMatchCatalogDebug(rawNama) {
   const catalog = ensureFuzzyCatalog();
   const rawTokens = tokenize(rawNama);
   if (!rawTokens.size) return null;
   let best = null;
-  for (const entry of catalog) {
+  for (const entry of fuzzyCandidates(catalog, rawTokens)) {
     if (entry.tokens.size < 2) continue;
     if (isLikelyJustSizeVariant(rawTokens, entry.tokens) || hasNegationDifference(rawTokens, entry.tokens) || hasNoMeaningfulWordOverlap(rawTokens, entry.tokens)) continue; // beda cuma di angka/ukuran, ada kata negasi, atau cuma kebetulan sama angka -> bukan typo
     const score = overlapCoefficient(rawTokens, entry.tokens);
@@ -1789,11 +1911,19 @@ function fuzzyMatchCatalogDebug(rawNama) {
 // itself" and block the real, different canonical name from ever being found.
 function fuzzyMatchCatalog(rawNama, excludeName) {
   const catalog = ensureFuzzyCatalog();
+  const memoKey = normalizeName(rawNama) + '\u0001' + (excludeName ? normalizeName(excludeName) : '');
+  if (!catalog._memo) catalog._memo = new Map();
+  if (catalog._memo.has(memoKey)) { const m = catalog._memo.get(memoKey); return m ? Object.assign({}, m) : null; }
+  const res = fuzzyMatchCatalogRaw(catalog, rawNama, excludeName);
+  catalog._memo.set(memoKey, res);
+  return res ? Object.assign({}, res) : null;
+}
+function fuzzyMatchCatalogRaw(catalog, rawNama, excludeName) {
   const rawTokens = tokenize(rawNama);
   if (!rawTokens.size) return null;
   const excludeKey = excludeName ? normalizeName(excludeName) : null;
   let best = null;
-  for (const entry of catalog) {
+  for (const entry of fuzzyCandidates(catalog, rawTokens)) {
     if (entry.tokens.size < 2) continue;
     if (excludeKey && normalizeName(entry.nama) === excludeKey) continue;
     if (isLikelyJustSizeVariant(rawTokens, entry.tokens) || hasNegationDifference(rawTokens, entry.tokens) || hasNoMeaningfulWordOverlap(rawTokens, entry.tokens)) continue; // beda cuma di angka/ukuran, ada kata negasi, atau cuma kebetulan sama angka -> bukan produk yang sama
@@ -1805,7 +1935,115 @@ function fuzzyMatchCatalog(rawNama, excludeName) {
   return best;
 }
 
+const _resolveMemo = { idx: null, cat: null, map: new Map() };
+// Hasil pencocokan disimpan (selama Master Produk tidak berubah): 8rb baris penjualan biasanya cuma ±1–2rb
+// nama unik, jadi pencarian berat (substring + fuzzy ke 18rb Master Produk) tidak diulang-ulang.
 function resolveInternalName(namaMarketplace, variasiMarketplace) {
+  ensureMasterProdukIndex();
+  const cat = ensureFuzzyCatalog();
+  // Disimpan selama Master Produk & katalog nama tidak berubah (indeks/katalog dibangun ulang = memo direset).
+  if (_resolveMemo.idx !== _mpIndexByMarketplaceName || _resolveMemo.cat !== cat) {
+    _resolveMemo.idx = _mpIndexByMarketplaceName; _resolveMemo.cat = cat; _resolveMemo.map = new Map();
+  }
+  const memo = _resolveMemo.map;
+  const mk = normalizeName(namaMarketplace) + '\u0001' + normalizeName(variasiMarketplace);
+  let hit = memo.get(mk);
+  if (hit === undefined) { hit = resolveInternalNameRaw(namaMarketplace, variasiMarketplace); memo.set(mk, hit); }
+  return Object.assign({}, hit);
+}
+// Cari Master Produk yang nama marketplace-nya mengandung / terkandung di namaKey.
+// Dulu: cek 18rb entri satu-satu untuk tiap nama. Sekarang: (1) "mk mengandung namaKey" dicari
+// dengan indexOf di satu teks gabungan, (2) "namaKey mengandung mk" dicari dengan mencoba semua
+// potongan namaKey ke indeks nama (Map). Urutan hasil = urutan Master Produk, seperti dulu.
+let _mpSubCache = null;
+function mpSubstringCandidates(namaKey) {
+  ensureMasterProdukIndex();
+  const idxMap = _mpIndexByMarketplaceName;
+  // Indeks bantu (teks gabungan, 3-huruf, awalan) hanya bergantung pada NAMA MARKETPLACE. Kalau
+  // indeks Master dibangun ulang tapi nama-nama marketplace & entrinya sama (mis. habis gabung nama
+  // internal), pakai lagi indeks bantu yang lama — tidak perlu bangun ulang.
+  if (!idxMap._big && _mpSubCache && _mpSubCache.mapSize === idxMap.size) {
+    const prevArr = _mpSubCache.big.arr;
+    let k = 0, same = true;
+    for (const m of state.masterProduk) {
+      if (!m._normNamaMarketplace) continue;
+      if (prevArr[k] !== m || m._mpIdx !== k || _mpSubCache.mks[k] !== m._normNamaMarketplace) { same = false; break; }
+      k++;
+    }
+    if (same && k === prevArr.length) { idxMap._big = _mpSubCache.big; idxMap._tri = _mpSubCache.tri; idxMap._pre3 = _mpSubCache.pre3; idxMap._short = _mpSubCache.short; }
+  }
+  if (!idxMap._big) {
+    const arr = [], starts = [];
+    let str = '';
+    const parts = [];
+    let off = 0;
+    state.masterProduk.forEach(m => {
+      const mk = m._normNamaMarketplace;
+      if (!mk) return;
+      m._mpIdx = arr.length;
+      arr.push(m); starts.push(off + 1);
+      parts.push('\u0001' + mk);
+      off += 1 + mk.length;
+    });
+    str = parts.join('');
+    idxMap._big = { arr, starts, str };
+  }
+  const { arr, starts, str } = idxMap._big;
+  const hit = new Set();
+  const saveSubCache = () => { _mpSubCache = { mapSize: idxMap.size, big: idxMap._big, tri: idxMap._tri, pre3: idxMap._pre3, short: idxMap._short, mks: arr.map(m => m._normNamaMarketplace) }; };
+  // (1) mk.includes(namaKey) — lewat indeks 3-huruf: cukup cek entri yang memuat potongan 3 huruf
+  // paling jarang dari namaKey (kalau satu potongan saja tidak ada, pasti tidak ada yang cocok).
+  if (namaKey.length >= 3) {
+    if (!idxMap._tri) {
+      const tri = new Map();
+      arr.forEach((m, i) => {
+        const mk = m._normNamaMarketplace;
+        const seen = new Set();
+        for (let k = 0; k + 3 <= mk.length; k++) {
+          const g = mk.substr(k, 3);
+          if (seen.has(g)) continue; seen.add(g);
+          let a = tri.get(g); if (!a) tri.set(g, a = []); a.push(i);
+        }
+      });
+      idxMap._tri = tri;
+    }
+    let best = null;
+    for (let k = 0; k + 3 <= namaKey.length; k++) {
+      const a = idxMap._tri.get(namaKey.substr(k, 3));
+      if (!a) { best = []; break; }
+      if (!best || a.length < best.length) best = a;
+    }
+    (best || []).forEach(i => { if (arr[i]._normNamaMarketplace.includes(namaKey)) hit.add(i); });
+  } else {
+    let pos = str.indexOf(namaKey);
+    while (pos !== -1) {
+      let lo = 0, hi = starts.length - 1;
+      while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (starts[mid] <= pos) lo = mid; else hi = mid - 1; }
+      hit.add(lo);
+      pos = str.indexOf(namaKey, pos + 1);
+    }
+  }
+  // (2) namaKey.includes(mk) — hanya posisi yang 3 huruf awalnya cocok dengan awalan suatu mk
+  if (!idxMap._pre3) {
+    const pre3 = new Set(), shortKeys = [];
+    idxMap.forEach((list, k) => { if (k.length >= 3) pre3.add(k.slice(0, 3)); else shortKeys.push(k); });
+    idxMap._pre3 = pre3; idxMap._short = shortKeys;
+  }
+  idxMap._short.forEach(k => {
+    if (namaKey.includes(k)) idxMap.get(k).forEach(m => { if (m._mpIdx !== undefined && arr[m._mpIdx] === m) hit.add(m._mpIdx); });
+  });
+  const L = namaKey.length;
+  for (let i = 0; i + 3 <= L; i++) {
+    if (!idxMap._pre3.has(namaKey.substr(i, 3))) continue;
+    for (let j = i + 3; j <= L; j++) {
+      const list = idxMap.get(namaKey.slice(i, j));
+      if (list) list.forEach(m => { if (m._mpIdx !== undefined && arr[m._mpIdx] === m) hit.add(m._mpIdx); });
+    }
+  }
+  if (!_mpSubCache || _mpSubCache.big !== idxMap._big || _mpSubCache.tri !== idxMap._tri || _mpSubCache.pre3 !== idxMap._pre3) saveSubCache();
+  return [...hit].sort((a, b) => a - b).map(i => arr[i]);
+}
+function resolveInternalNameRaw(namaMarketplace, variasiMarketplace) {
   const namaKey = normalizeName(namaMarketplace);
   const variasiKey = normalizeName(variasiMarketplace);
   if (!namaKey) return { matched: false, namaInternal: namaMarketplace, entitasTetap: '', catatan: '' };
@@ -1818,10 +2056,7 @@ function resolveInternalName(namaMarketplace, variasiMarketplace) {
   // SPECIFIC (longest) marketplace text — a short generic entry like "Altamed" must not
   // hijack every "Altamed Glove S/M/L/XS" lookup just because it's a substring of all of them.
   if (!candidates.length) {
-    candidates = state.masterProduk.filter(m => {
-      const mk = m._normNamaMarketplace;
-      return mk && (namaKey.includes(mk) || mk.includes(namaKey));
-    });
+    candidates = mpSubstringCandidates(namaKey); // hasil & urutan sama persis dengan filter lama, tapi jauh lebih cepat
     candidates.sort((a, b) => (b._normNamaMarketplace.length) - (a._normNamaMarketplace.length));
   }
 
@@ -1990,7 +2225,7 @@ function iuActiveGeneration(entitas, dateISO) {
 // Generasi yang berlaku untuk "sekarang" (dipakai Sisa Stok Real-Time) = generasi terbaru yang sudah efektif hari ini.
 function iuLatestGeneration(entitas) {
   const todayISO = new Date().toISOString().slice(0, 10);
-  const gens = iuGetGenerations(entitas).filter(g => g.tanggal <= todayISO);
+  const gens = iuGetGenerations(entitas).filter(g => g.tanggal < todayISO); // berlaku mulai tanggal efektif (= tersimpan + 1 hari)
   return gens.length ? gens[gens.length - 1] : (function () { const all = iuGetGenerations(entitas); return all.length ? all[all.length - 1] : null; })();
 }
 
@@ -2023,10 +2258,10 @@ function computeAllStock(excludeCheckerIds) {
     // Untuk Faktur: relevansi terhadap baseline Stok Awal ditentukan tanggal barang DITERIMA (fisik),
     // bukan tanggal dokumen -- supaya faktur berdokumen lama tapi barangnya baru fisik masuk sesudah
     // cutoff TETAP terhitung (cuma tertunda ke tanggal fisiknya), tidak hilang.
-    if (bound !== null && inv.jenisDokumen !== 'Faktur' && tglStok < bound) return;
+    if (bound !== null && inv.jenisDokumen !== 'Faktur' && tglStok <= bound) return;
     // Faktur yang barangnya sudah fisik diterima SEBELUM cutoff (meski dokumennya baru terbit sesudahnya) --
     // dianggap sudah termasuk baseline fisik generasi ini, jangan dihitung dobel di sini.
-    if (bound !== null && inv.jenisDokumen === 'Faktur' && inv.tanggal < bound) return;
+    if (bound !== null && inv.jenisDokumen === 'Faktur' && inv.tanggal <= bound) return;
     (inv.items || []).forEach(item => {
       const rec = ensure(inv.entitas, item.nama);
       const qty = Number(item.qty) || 0;
@@ -2042,7 +2277,7 @@ function computeAllStock(excludeCheckerIds) {
     if (genRowsById[r.id]) { const rec = ensure(r.entitas, r.nama); rec.qty += Number(r.qty) || 0; return; } // baris generasi aktif: selalu ikut
     if (r.keterangan === 'Stok Awal (import)') return; // generasi LAMA (bukan yang aktif) -- jangan ikut dihitung
     const bound = genBound[r.entitas];
-    if (bound !== null && r.tanggal < bound) return;
+    if (bound !== null && r.tanggal <= bound) return;
     const rec = ensure(r.entitas, r.nama);
     rec.qty += Number(r.qty) || 0;
   });
@@ -2052,7 +2287,7 @@ function computeAllStock(excludeCheckerIds) {
     if (excludeCheckerIds.has(r.id)) return;
     if (!ENTITIES.includes(r.entitas)) return;
     const bound = genBound[r.entitas];
-    if (bound !== null && r.tanggal < bound) return;
+    if (bound !== null && r.tanggal <= bound) return;
     const rec = ensure(r.entitas, r.nama);
     rec.qty -= Number(r.qty) || 0;
   });
@@ -2860,22 +3095,22 @@ function computeStockAsOfDate(entitas, dateISO) {
     // Untuk Faktur: relevansi terhadap baseline Stok Awal ditentukan tanggal barang DITERIMA (fisik),
     // bukan tanggal dokumen -- supaya faktur berdokumen lama tapi barangnya baru fisik masuk sesudah
     // cutoff TETAP terhitung (cuma tertunda ke tanggal fisiknya), tidak hilang.
-    if (bound !== null && inv.jenisDokumen !== 'Faktur' && tglStok < bound) return;
+    if (bound !== null && inv.jenisDokumen !== 'Faktur' && tglStok <= bound) return;
     // Faktur yang barangnya sudah fisik diterima SEBELUM cutoff (meski dokumennya baru terbit sesudahnya) --
     // dianggap sudah termasuk baseline fisik generasi ini, jangan dihitung dobel di sini.
-    if (bound !== null && inv.jenisDokumen === 'Faktur' && inv.tanggal < bound) return;
+    if (bound !== null && inv.jenisDokumen === 'Faktur' && inv.tanggal <= bound) return;
     (inv.items || []).forEach(item => { ensure(item.nama).qty += Number(item.qty) || 0; });
   });
   state.adjustments.forEach(a => {
     if (a.entitas !== entitas || a.tanggal >= dateISO) return;
     if (activeGenRowIds[a.id]) return; // sudah dihitung di atas (baris generasi aktif)
     if (a.keterangan === 'Stok Awal (import)') return; // generasi LAMA (bukan yang aktif untuk tanggal ini) -- dilewati
-    if (bound !== null && a.tanggal < bound) return;
+    if (bound !== null && a.tanggal <= bound) return;
     ensure(a.nama).qty += Number(a.qty) || 0;
   });
   state.checkerRows.forEach(r => {
     if (r.entitas !== entitas || r.tanggal >= dateISO) return;
-    if (bound !== null && r.tanggal < bound) return;
+    if (bound !== null && r.tanggal <= bound) return;
     ensure(r.nama).qty -= Number(r.qty) || 0;
   });
   return result;
@@ -5430,15 +5665,16 @@ function renderTab2DateFilter() {
   const modeChip = `<span class="filter-chip ${tab2DateFilter==='Semua'?'active':''}" data-d="Semua">Semua Tanggal</span>`;
 
   const monthNav = `
-    <span class="tag-row" style="display:inline-flex;align-items:center;gap:4px;margin:0 6px 0 2px;padding:0;">
+    <span class="t2-monthnav">
       <button class="icon-btn" id="t2-month-prev" title="Bulan sebelumnya (yang ada datanya)" ${browseIdx<=0?'disabled style="opacity:.35;cursor:not-allowed;"':''}>◀</button>
-      <span style="font-size:12.5px;font-weight:700;color:var(--ink);white-space:nowrap;padding:0 2px;">${bulanLabelID(tab2BrowseMonth+'-01')}</span>
+      <span style="font-size:12px;font-weight:700;color:var(--ink);white-space:nowrap;padding:0 2px;">${bulanLabelID(tab2BrowseMonth+'-01')}</span>
       <button class="icon-btn" id="t2-month-next" title="Bulan berikutnya (yang ada datanya)" ${browseIdx>=allMonths.length-1?'disabled style="opacity:.35;cursor:not-allowed;"':''}>▶</button>
     </span>`;
 
   const dateChips = datesInBrowseMonth.map(o => {
     const isSelected = tab2SelectedDates.has(o);
-    return `<span class="filter-chip date-chip ${o===tab2DateFilter?'active':''} ${isSelected?'multi-selected':''}" data-d="${o}" title="Klik = pilih tanggal ini. Shift+Klik = pilih beberapa tanggal sekaligus (gaya spreadsheet), lalu hapus bareng.">${dateLabelID(o)}<span class="date-chip-delete" data-deldate="${o}" title="Hapus semua baris tanggal ini">✕</span></span>`;
+    const isSun = new Date(o + 'T00:00:00').getDay() === 0;
+    return `<span class="filter-chip date-chip t2-daychip ${isSun?'t2-sun':''} ${o===tab2DateFilter?'active':''} ${isSelected?'multi-selected':''}" data-d="${o}" title="${dateLabelID(o)} — Klik = pilih tanggal ini. Shift+Klik = pilih beberapa tanggal sekaligus, lalu hapus bareng. Arahkan mouse lalu klik ✕ kecil = hapus semua baris tanggal ini.">${Number(o.slice(8, 10))}<span class="date-chip-delete" data-deldate="${o}" title="Hapus semua baris ${dateLabelID(o)}">✕</span></span>`;
   }).join('');
 
   const bulkDeleteBar = tab2SelectedDates.size > 1 ? `
@@ -5593,7 +5829,9 @@ function renderTab2Table() {
   countLabel.textContent = hasMore
     ? `Menampilkan ${fmtNum(visibleRows.length)} dari ${fmtNum(rows.length)} baris — scroll ke bawah untuk memuat lebih banyak`
     : `Menampilkan semua ${fmtNum(rows.length)} baris`;
-  container.insertAdjacentElement('afterbegin', countLabel);
+  const countSlot = document.getElementById('t2-countlabel');
+  if (countSlot) countSlot.textContent = countLabel.textContent; // satu baris dengan tombol "+ Tambah Baris" (hemat tempat)
+  else container.insertAdjacentElement('afterbegin', countLabel);
 
   const wrap = document.getElementById('t2-tablewrap');
   if (wrap) {
@@ -5688,7 +5926,8 @@ function renderTab2RichTable(container, rows, mpKey) {
   const colsAfterQty = cols.slice(qtyCol + 1);
 
   container.innerHTML = `
-    <div style="display:flex; justify-content:flex-end; margin-bottom:6px; gap:8px;">
+    <div class="t2-toolbar" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; gap:8px;">
+      <span id="t2-countlabel" style="font-size:12px;color:var(--muted);"></span>
       <button class="btn secondary small" id="t2-addrow">+ Tambah Baris</button>
     </div>
     <div class="table-wrap" id="t2-tablewrap">
@@ -5898,7 +6137,8 @@ function handleTab2FullscreenEsc(e) {
 
 function renderTab2SimpleTable(container, rows) {
   container.innerHTML = `
-    <div style="display:flex; justify-content:flex-end; margin-bottom:6px; gap:8px;">
+    <div class="t2-toolbar" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; gap:8px;">
+      <span id="t2-countlabel" style="font-size:12px;color:var(--muted);"></span>
       <button class="btn secondary small" id="t2-addrow">+ Tambah Baris</button>
     </div>
     <div class="table-wrap" id="t2-tablewrap">
@@ -6586,18 +6826,21 @@ function setNamaCustomer(entitas, tanggal, nama, value) {
 function avgModalFromInvoice(entitas, nama) {
   const override = state.hargaModalOverride && state.hargaModalOverride[entitas + '||' + normalizeName(nama)];
   if (override !== undefined && override !== null) return override;
-  let qtySum = 0, modalSum = 0;
-  state.invoices.forEach(inv => {
-    if (inv.entitas !== entitas) return;
-    (inv.items || []).forEach(item => {
-      if (normalizeName(item.nama) === normalizeName(nama)) {
+  const idx = taskCache('avgModal', () => {
+    const m = new Map();
+    state.invoices.forEach(inv => {
+      (inv.items || []).forEach(item => {
+        const k = inv.entitas + '||' + normalizeName(item.nama);
         const q = Number(item.qty) || 0;
-        qtySum += q;
-        modalSum += q * (Number(item.harga) || 0);
-      }
+        const rec = m.get(k) || { q: 0, m: 0 };
+        rec.q += q; rec.m += q * (Number(item.harga) || 0);
+        m.set(k, rec);
+      });
     });
+    return m;
   });
-  return qtySum > 0 ? modalSum / qtySum : 0;
+  const rec = idx.get(entitas + '||' + normalizeName(nama));
+  return rec && rec.q > 0 ? rec.m / rec.q : 0;
 }
 
 // Classifies one checker row into the pivot bucket it contributes to, matching the
@@ -7800,7 +8043,7 @@ function renderTab4() {
     <div class="card">
       <h2>📂 Import Data Awal</h2>
       <p class="desc">Untuk data yang sudah Anda siapkan sebelumnya: pemetaan nama marketplace↔internal (Master Mapping) dan saldo stok pembuka (Stok Awal).</p>
-      <div class="msg warn" style="margin-bottom:10px;">⚠ Penting: "Tanggal Efektif Stok Awal" harus LEBIH AWAL dari tanggal penjualan paling lama yang sudah/akan Anda import. Kalau tanggalnya sama atau lebih baru dari data penjualan, stok akan terhitung 0 di hari-hari itu.</div>
+      <div class="msg warn" style="margin-bottom:10px;">📅 <b>Tanggal Efektif Stok Awal</b> = tanggal stok fisik di file itu berlaku, yaitu stok per <b>AWAL hari</b> itu (sebelum barang penjualan hari itu dikirim). Penjualan, faktur, dan penyesuaian bertanggal <b>sebelum</b> tanggal ini diabaikan (dianggap sudah termasuk angka fisik); yang bertanggal <b>sama atau sesudahnya</b> tetap dihitung. Contoh: stok dihitung 1 Sep pagi → isi <b>1 September</b>, lalu import penjualan tanggal 1 Sep dst seperti biasa.</div>
       <div class="form-grid">
         <div class="field">
           <label>1. Import Master Mapping (.xlsx)</label>
@@ -7957,7 +8200,8 @@ function renderTab5() {
       <div class="tag-row" style="margin-top:6px;">
         <input type="text" id="t4m-search" placeholder="🔎 Cari nama produk..." style="flex:1;min-width:200px;padding:7px 10px;border:1px solid #c9c5b8;border-radius:6px;font-size:13px;">
       </div>
-      <div class="table-wrap" style="margin-top:8px;">
+      <div id="t4m-count" style="font-size:12px;color:var(--muted);margin-top:6px;"></div>
+      <div class="table-wrap" style="margin-top:4px;">
         <table class="dtable">
           <thead><tr>
             <th>Nama di Marketplace</th>
@@ -8004,7 +8248,7 @@ function renderTab5() {
   bindGenericAutocomplete(document.getElementById('t4m-namaint'), (q) => searchInternalProductNames(q, 40));
   document.getElementById('t4-scan-dupes').addEventListener('click', scanForDuplicateProducts);
   document.getElementById('t4-bulk-multiplier').addEventListener('click', openBulkMultiplierTool);
-  document.getElementById('t4m-search').addEventListener('input', renderTab4MasterTable);
+  document.getElementById('t4m-search').addEventListener('input', debounce(renderTab4MasterTable, 250));
 
   document.getElementById('t4h-toggle').addEventListener('click', () => {
     const body = document.getElementById('t4h-body');
@@ -8013,7 +8257,7 @@ function renderTab5() {
     document.getElementById('t4h-toggle').textContent = isHidden ? 'Sembunyikan' : 'Tampilkan';
     if (isHidden) renderTab4History();
   });
-  document.getElementById('t4h-search').addEventListener('input', renderTab4History);
+  document.getElementById('t4h-search').addEventListener('input', debounce(renderTab4History, 250));
 
   renderTab4ComboFilter();
   renderTab4MasterTable();
@@ -8210,12 +8454,11 @@ function commitStokAwalImport(result, possibleTypos) {
   // langsung tutup/reload tab, penghapusan batch lama tetap kepastian tersimpan di server.
   const iuFlushP = (typeof gsjFlushSyncNow === 'function') ? gsjFlushSyncNow('adjustments') : Promise.resolve();
   iuVerifyStokAwalOnServer(iuFlushP, entitasImport, added); // cek: benar-benar tersimpan lengkap di server?
-  const earliestSale = state.checkerRows.length ? [...state.checkerRows].sort((a, b) => a.tanggal < b.tanggal ? -1 : 1)[0].tanggal : null;
-  const dateWarning = earliestSale && tanggal >= earliestSale
-    ? `\n⚠ Tanggal efektif (${tanggalDipilih}) sama/lebih baru dari penjualan tertua yang sudah tercatat (${earliestSale}) — stok mungkin masih terhitung 0 untuk tanggal itu. Ganti "Tanggal Efektif Stok Awal" ke tanggal yang lebih awal lalu import ulang.`
-    : '';
+  const nSalesBefore = state.checkerRows.filter(r => r.entitas === entitasImport && r.tanggal <= tanggal).length;
+  const dateWarning = '';
+  const beforeNote = nSalesBefore ? `\nℹ️ ${nSalesBefore} baris penjualan ${entLabel} bertanggal sebelum ${tanggalDipilih} tidak dikurangkan lagi (dianggap sudah termasuk stok fisik).` : '';
   iuAutoCheckAfterImport(entitasImport, tanggal); // cek otomatis: ada barang yang kemungkinan sudah kehitung 2x?
-  showImportMsg(dateWarning ? 'warn' : 'ok', `Stok awal berhasil dimuat (saldo per ${tanggalDipilih}): ${added} baris untuk ${entLabel} ditambahkan sebagai saldo pembuka (entitas lain tidak berubah).\nPotongan stok penjualan yang sudah diimport otomatis dihitung ulang.${dateWarning}`);
+  showImportMsg(dateWarning ? 'warn' : 'ok', `Stok awal berhasil dimuat (saldo per ${tanggalDipilih}): ${added} baris untuk ${entLabel} ditambahkan sebagai saldo pembuka (entitas lain tidak berubah).\nPenjualan mulai ${tanggalDipilih} dikurangkan dari saldo ini.${beforeNote}${dateWarning}`);
   renderTab4Stock();
   if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
 }
@@ -8629,7 +8872,10 @@ function renderTab4MasterTable() {
     tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:20px;">Belum ada Master Produk untuk kombinasi ini. Tambahkan manual di atas kalau sudah ada penjualannya, atau pilih chip lain di atas.</td></tr>`;
     return;
   }
-  tbody.innerHTML = rows.map(r => `
+  // Tabel bisa 18rb+ baris: dirender bertahap (300 baris dulu, sisanya menyusul saat di-scroll)
+  // — dulu semua baris + ±160rb kolom input dibuat sekaligus dan bikin browser "Page Unresponsive".
+  const T4M_CHUNK = 300;
+  const rowHtml = r => `
     <tr data-id="${r.id}">
       <td class="editable-cell">
         <input type="text" data-field="namaMarketplace" value="${escapeAttr(r.namaMarketplace)}">
@@ -8649,9 +8895,8 @@ function renderTab4MasterTable() {
       <td class="editable-cell"><input type="text" data-field="catatan" value="${escapeAttr(r.catatan)}"></td>
       <td><button class="btn danger small" data-action="delete">✕</button></td>
     </tr>
-  `).join('');
-
-  tbody.querySelectorAll('tr').forEach(tr => {
+`;
+  const bindRow = (tr) => {
     const id = tr.dataset.id;
     const clearPerluMappingPill = tr.querySelector('[data-action="clear-perlu-mapping"]');
     if (clearPerluMappingPill) {
@@ -8716,7 +8961,28 @@ function renderTab4MasterTable() {
       refreshMasterProdukDatalist();
       if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
     });
-  });
+  };
+  let shown = 0;
+  const countEl = document.getElementById('t4m-count');
+  const appendChunk = () => {
+    const next = rows.slice(shown, shown + T4M_CHUNK);
+    if (!next.length) return;
+    const tmp = document.createElement('tbody');
+    tmp.innerHTML = next.map(rowHtml).join('');
+    const trs = [...tmp.children];
+    trs.forEach(tr => { tbody.appendChild(tr); bindRow(tr); });
+    shown += next.length;
+    if (countEl) countEl.textContent = shown < rows.length ? `Menampilkan ${shown.toLocaleString('id-ID')} dari ${rows.length.toLocaleString('id-ID')} baris — scroll ke bawah untuk memuat lebih banyak, atau pakai kolom cari.` : `${rows.length.toLocaleString('id-ID')} baris`;
+  };
+  tbody.innerHTML = '';
+  appendChunk();
+  const wrapEl = tbody.closest('.table-wrap');
+  if (wrapEl) {
+    wrapEl.onscroll = () => {
+      if (shown >= rows.length) return;
+      if (wrapEl.scrollTop + wrapEl.clientHeight >= wrapEl.scrollHeight - 300) appendChunk();
+    };
+  }
 }
 
 // Shows Master Produk entries that carry a createdAt timestamp (added via the manual form or
@@ -8730,6 +8996,8 @@ function renderTab4History() {
   let rows = state.masterProduk.filter(r => r.createdAt);
   if (q) rows = rows.filter(r => normalizeName(r.namaMarketplace).includes(q) || normalizeName(r.namaInternal).includes(q));
   rows = [...rows].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  const histTotal = rows.length;
+  if (rows.length > 300) rows = rows.slice(0, 300); // cukup 300 terbaru (pakai kolom cari untuk yang lebih lama)
 
   if (!rows.length) {
     tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:16px;">Belum ada riwayat — ini cuma mencatat pemetaan yang ditambahkan SETELAH fitur ini ada, jadi Master Produk lama (yang sudah ada sebelumnya) tidak tercatat di sini.</td></tr>`;
@@ -8751,6 +9019,11 @@ function refreshMasterProdukDatalist() {
   const names = new Set();
   state.masterProduk.forEach(m => names.add(m.namaInternal));
   state.invoices.forEach(inv => (inv.items || []).forEach(item => names.add(item.nama)));
+  const joined = [...names].join('\u0001');
+  let h = 5381; for (let i = 0; i < joined.length; i++) h = ((h << 5) + h + joined.charCodeAt(i)) | 0;
+  const sig = names.size + '|' + h;
+  if (dl._sig === sig) return;
+  dl._sig = sig;
   dl.innerHTML = [...names].map(n => `<option value="${escapeAttr(n)}">`).join('');
 }
 
@@ -8966,15 +9239,15 @@ function loadSampleData() {
 // MAIN.JS — App bootstrap, tab navigation, cross-tab sync
 // ============================================================
 
+// Dulu SEMUA tab (termasuk tabel Master Produk 18rb baris) dibangun ulang sekaligus -> browser
+// "Page Unresponsive". Sekarang cuma tab yang sedang dibuka; tab lain ditandai kotor dan baru
+// dibangun saat dibuka.
 function renderAllTabs() {
-  renderTab1();
-  renderTab2();
-  renderTab3();
-  renderTab4();
-  renderTab5();
-  renderTab6();
-  renderTab8();
-  renderTab9();
+  const activeBtn = document.querySelector('.tab-btn.active');
+  const activeTab = activeBtn ? activeBtn.dataset.tab : 'tab1';
+  Object.keys(dirtyTabs).forEach(t => { dirtyTabs[t] = (t !== activeTab); });
+  if (dirtyTabs.hasOwnProperty(activeTab)) renderTabByKey(activeTab);
+  else renderTab1();
 }
 
 // Tabs that aren't currently visible are marked "dirty" instead of eagerly re-rendered —
@@ -11428,10 +11701,10 @@ function iuDobelCandidatesForGen(entitas, gen, windowDays) {
   state.invoices.forEach(inv => {
     if (inv.entitas !== entitas) return;
     const t = (typeof getInvoiceTanggalStok === 'function') ? getInvoiceTanggalStok(inv) : inv.tanggal;
-    if (t < E || t > untilISO) return; // hanya faktur tak lama SETELAH cut-off generasi ini
+    if (t <= E || t > untilISO) return; // hanya faktur tak lama SETELAH cut-off generasi ini
     // Kalau Tanggal Barang Diterima-nya SUDAH < E (fisik diterima sebelum cutoff), sistem SUDAH otomatis
     // tidak menghitungnya dobel (lihat computeStockAsOfDate) -- tak perlu ditandai manual lagi di sini.
-    if (inv.jenisDokumen === 'Faktur' && inv.tanggal && inv.tanggal < E) return;
+    if (inv.jenisDokumen === 'Faktur' && inv.tanggal && inv.tanggal <= E) return;
     (inv.items || []).forEach(it => {
       const nk = normalizeName(it.nama);
       if (!(genQty[nk] > 0)) return; // Stok Awal produk ini tak ada / 0 -- tak ada apa pun buat "ditumpuk", jadi bukan kandidat dobel
@@ -11910,8 +12183,9 @@ async function gsjInitialSyncFromSupabase() {
     gsjSettingsBaselineJSON = JSON.stringify({ settings: state.settings, hargaModalOverride: state.hargaModalOverride || {} });
     // Data yang cuma ada di lokal dianggap BELUM tersinkron, supaya ikut terkirim ke Supabase.
     Object.keys(optLocalOnly).forEach(k => optLocalOnly[k].forEach(rec => { delete gsjSyncBaseline[k][rec.id]; }));
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) {}
     gsjIsApplyingRemoteChange = false;
+    snapResetHistory(); // data dari server = titik awal baru (bukan "edit" kita)
+    persistLocalSoon();
     gsjSupabaseOnline = true;
     Object.keys(optLocalOnly).forEach(k => { if (optLocalOnly[k].length) gsjScheduleSync(k); });
     gsjUpdateSyncIndicator();
@@ -11968,7 +12242,7 @@ function gsjScheduleRemoteRerender() {
     // Kalau ada kolom yang lagi fokus (tapi tidak sedang diketik), kembalikan fokusnya setelah render.
     const focusId = active && active.id && active !== document.body ? active.id : null;
     const selStart = isTextField ? active.selectionStart : null, selEnd = isTextField ? active.selectionEnd : null;
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) {}
+    snapAbsorbRemote();
     if (!gsjCurrentUser) return;
     // Cuma render ulang TAB YANG SEDANG DIBUKA — tab lain ditandai "dirty" dan baru dibangun
     // ulang nanti pas user pindah ke situ (pola yang sama dipakai onGlobalDataChange). Ini
@@ -12038,6 +12312,7 @@ async function gsjReconcileWithServer(onlyKeys, force) {
       if (res.error || !res.data) continue;
       if (gsjSyncDebounceTimers[key] || gsjSyncRetryTimers[key] || gsjPushInFlight[key]) continue; // user sempat edit selama fetch
       gsjIsApplyingRemoteChange = true;
+      gsjRemoteTouchedKeys.add(key);
       state[key] = res.data.map(r => r.data).filter(Boolean);
       gsjSyncBaseline[key] = {};
       state[key].forEach(rec => { if (rec && rec.id) gsjSyncBaseline[key][rec.id] = JSON.stringify(rec); });
@@ -12093,6 +12368,7 @@ function gsjOnRemoteBulkStart(p) {
   gsjBulkIncoming[key] = { by: p.by, name: p.name || '', since: Date.now(),
     timer: setTimeout(() => { delete gsjBulkIncoming[key]; gsjUpdateSyncIndicator(); gsjReconcileWithServer([key], true); }, 120000) };
   if (Array.isArray(p.where) && p.where.length && Array.isArray(state[key])) {
+    gsjRemoteTouchedKeys.add(key);
     gsjIsApplyingRemoteChange = true;
     const before = state[key].length;
     state[key] = state[key].filter(rec => {
@@ -12114,6 +12390,7 @@ window.addEventListener('focus', gsjReconcileIfStale);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') gsjReconcileIfStale(); });
 
 function gsjApplyRemoteRowChange(key, payload) {
+  gsjRemoteTouchedKeys.add(key);
   gsjIsApplyingRemoteChange = true;
   if (!Array.isArray(state[key])) state[key] = [];
   const arr = state[key];
@@ -12151,6 +12428,7 @@ function gsjApplyRemoteSettingsChange(payload) {
     return;
   }
   gsjIsApplyingRemoteChange = true;
+  gsjRemoteTouchedKeys.add('settings'); gsjRemoteTouchedKeys.add('hargaModalOverride');
   state.settings = Object.assign({}, state.settings, data.settings || {});
   state.hargaModalOverride = data.hargaModalOverride || state.hargaModalOverride || {};
   gsjSettingsBaselineJSON = JSON.stringify(data);
@@ -12588,7 +12866,7 @@ function gsjBootMainApp() {
       iuRemoteInit();
     }
   });
-  setInterval(saveState, 20000);
+  setInterval(() => { if (document.visibilityState !== 'hidden') saveState(); }, 20000);
   window.addEventListener('beforeunload', () => {
     saveState();
     // Jaring pengaman terakhir: paksa kirim SEKARANG semua perubahan yang masih menunggu
@@ -12646,6 +12924,33 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
 
+
+// ---- Tab yang belum pernah dibuka belum punya isi (lihat renderAllTabs): kalau ada kode lain yang
+// minta "segarkan tabel tab X" sebelum tab X pernah dibuka, cukup tandai tab itu kotor (nanti dibangun
+// saat dibuka) — jangan error.
+(function gsjInstallRenderGuards() {
+  const tabOf = {
+    tab2: ['renderTab2MarketplaceFilter', 'renderTab2StatusFilter', 'renderTab2DateFilter', 'renderTab2Table', 'renderTab2TableKeepScroll', 'renderTab2ChannelFilter', 'renderTab2RichTable'],
+    tab3: ['renderTab3EntityTabs', 'renderTab3RekapTable', 'renderTab3TableKeepScroll', 'renderTab3Table'],
+    tab4: ['renderTab4StockEntityTabs', 'renderTab4Stock'],
+    tab5: ['renderTab4MasterTable', 'renderTab4ComboFilter', 'renderTab4History'],
+  };
+  ['tab1', 'tab2', 'tab3', 'tab4', 'tab5', 'tab6', 'tab8', 'tab9'].forEach(t => {
+    const fn = 'renderTab' + t.slice(3);
+    const orig = window[fn];
+    if (typeof orig !== 'function') return;
+    window[fn] = function () { const p = document.getElementById(t); if (p) p.dataset.rendered = '1'; return orig.apply(this, arguments); };
+  });
+  Object.keys(tabOf).forEach(t => tabOf[t].forEach(fn => {
+    const orig = window[fn];
+    if (typeof orig !== 'function') return;
+    window[fn] = function () {
+      const p = document.getElementById(t);
+      if (p && !p.dataset.rendered) { if (typeof dirtyTabs !== 'undefined') dirtyTabs[t] = true; return; }
+      return orig.apply(this, arguments);
+    };
+  }));
+})();
 </script>
 </body>
 </html>
