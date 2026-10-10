@@ -481,6 +481,14 @@ footer.appfoot{text-align:center; color:var(--muted); font-size:10.5px; margin:2
 #t3-date-tabs .filter-chip.t3-rekapchip{ padding:4px 10px; border-radius:8px; font-size:12px; line-height:1.3; flex-shrink:0; border-style:dashed; }
 #t3-fs-target.fullscreen-table #t3-date-tabs.t3-datetabs-bottom{ gap:4px; padding:5px 6px; }
 
+
+/* Keterangan kecil di kolom Status Import Marketplace */
+.row-note{ display:block; margin-top:4px; padding:3px 6px; border-radius:5px; border-left:3px solid; background:#F8FAFC; line-height:1.25; max-width:130px; }
+.row-note .rn-label{ display:block; font-size:9px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; color:#64748B; }
+.row-note .rn-val{ display:block; font-size:11px; font-weight:700; color:#0F172A; white-space:nowrap; }
+.row-note .rn-sub{ display:block; font-size:10px; color:#64748B; }
+.row-note-split{ border-left-color:#3B82F6; }
+.row-note-topup{ border-left-color:#F59E0B; }
 /* Tabel Checker lebih tinggi: area filter di atasnya dipadatkan */
 #tab2 .table-wrap#t2-tablewrap{ max-height:calc(100vh - 150px); }
 #t2-fs-target.fullscreen-table{ padding:10px 14px 8px; }
@@ -825,7 +833,7 @@ table.dtable td input, table.dtable td select, table.dtable td textarea{
       <button class="tab-btn" data-tab="tab8"><span class="ico">📤</span><span class="lbl">Invoice ke Glomed</span></button>
       <button class="tab-btn" data-tab="tab9"><span class="ico">📈</span><span class="lbl">Total Omset</span></button>
     </nav>
-    <div class="sidebar-foot">Data tersimpan otomatis<br>di browser ini.</div>
+    <div class="sidebar-foot">Data tersimpan otomatis<br>di server.<br><span id="app-version" style="opacity:.75;">Versi v2026.10.10-l</span> · <a href="#" id="diag-open" style="color:inherit;text-decoration:underline;">⏱️ Cek lag</a><br><a href="#" id="moves-open" style="color:inherit;text-decoration:underline;">🔀 Pindah entitas <span id="moves-badge"></span></a></div>
   </aside>
 
   <div class="content-col">
@@ -905,6 +913,9 @@ table.dtable td input, table.dtable td select, table.dtable td textarea{
 const ENTITIES = ['Gracia', 'HNH', 'Glomed'];
 const ENTITY_LABEL = { Gracia: 'GSM (Gracia)', HNH: 'HNH', Glomed: 'GSJ (Glomed)' };
 const WATERFALL_ORDER = ['Gracia', 'HNH', 'Glomed']; // cutting priority
+// Barang tetap dipotong dari entitas yang sedang dipakai/di-set sampai stoknya HABIS, baru pindah:
+// GSM habis -> HNH, HNH habis -> GSJ, GSJ habis -> balik ke HNH. (Tidak loncat balik ke GSM.)
+const WATERFALL_NEXT = { Gracia: ['Gracia', 'HNH', 'Glomed'], HNH: ['HNH', 'Glomed'], Glomed: ['Glomed', 'HNH'] };
 
 const STORAGE_KEY = 'stokapp_gsm_v1';
 const USERNAME_STORAGE_KEY = 'stokapp_gsm_username';
@@ -1046,6 +1057,8 @@ function uid() {
 // teks lama (memori dibagi antar langkah Undo), yang dikirim ke server cuma tabel yang berubah,
 // dan total memori riwayat Undo dibatasi.
 const SNAP_SKIP_KEYS = { lastEditedBy: 1, lastEditedAt: 1 };
+const GSJ_SETTINGS_KEYS = ['settings', 'hargaModalOverride']; // disimpan di gsj_settings 'main'
+const GSJ_LIST_KEYS = ['hiddenProducts', 'dobelResolutions', 'entityMoves', 'entityMovesDone'];    // disimpan di gsj_settings 'lists' (digabung)
 const UNDO_MAX_CHARS = 60e6; // ±120 MB teks unik untuk seluruh riwayat Undo
 const LOCAL_MAX_CHARS = 4.5e6; // batas aman localStorage (±5 juta karakter)
 function snapTake(prev) {
@@ -1131,7 +1144,8 @@ function saveState() {
     // Kirim ke Supabase HANYA tabel yang benar-benar berubah (dulu: semua tabel tiap kali simpan).
     if (typeof gsjScheduleSync === 'function') {
       changed.forEach(k => { if (GSJ_SYNC_TABLES[k]) gsjScheduleSync(k); });
-      if (changed.includes('settings') || changed.includes('hargaModalOverride')) gsjScheduleSettingsSync();
+      if (changed.some(k => GSJ_SETTINGS_KEYS.includes(k))) gsjScheduleSettingsSync();
+      if (changed.some(k => GSJ_LIST_KEYS.includes(k)) && typeof gsjScheduleListsSync === 'function') gsjScheduleListsSync();
     }
   }
   if (isRealChange) pushUndoSnapshot(snap);
@@ -1183,7 +1197,7 @@ function gsjApplyHistoryAt(idx) {
   if (typeof gsjScheduleSync === 'function' && typeof GSJ_SYNC_TABLES !== 'undefined') {
     const changed = snapChangedKeys(before, undoHistory[idx]);
     changed.forEach(k => { if (GSJ_SYNC_TABLES[k]) gsjScheduleSync(k); });
-    if ((changed.includes('settings') || changed.includes('hargaModalOverride')) && typeof gsjScheduleSettingsSync === 'function') gsjScheduleSettingsSync();
+    if (changed.some(k => GSJ_SETTINGS_KEYS.includes(k)) && typeof gsjScheduleSettingsSync === 'function') gsjScheduleSettingsSync();
   }
 }
 function undoLastChange() {
@@ -1391,6 +1405,25 @@ function sortProductNames(names) {
 // underlying array actually changes (tracked via reference + length, cheap to check).
 let _mpIndexByMarketplaceName = null;
 let _mpIndexByInternalName = null;
+let _mpTetapByInternal = new Map();
+// Cuma Entitas Tetap yang berubah -> perbarui peta Entitas Tetap saja (murah), TANPA membangun ulang
+// seluruh indeks Master Produk + hasil pencocokan nama (itu yang bikin tiap klik entitas terasa lambat).
+function refreshTetapIndex() {
+  ensureMasterProdukIndex();
+  const map = new Map();
+  state.masterProduk.forEach(m => {
+    if (!m || !m.entitasTetap || !ENTITIES.includes(m.entitasTetap)) return;
+    const k = normalizeName(m.namaInternal); if (!k) return;
+    const prev = map.get(k); const at = m.tetapAt || '';
+    if (!prev || at > prev.at) map.set(k, { ent: m.entitasTetap, at });
+  });
+  _mpTetapByInternal = map;
+}
+function getProductEntitasTetap(namaInternal) {
+  ensureMasterProdukIndex();
+  const t = _mpTetapByInternal.get(normalizeName(namaInternal));
+  return t ? t.ent : '';
+}
 let _mpIndexSourceRef = null;
 let _mpIndexSourceLen = -1;
 
@@ -1398,6 +1431,7 @@ function ensureMasterProdukIndex() {
   if (_mpIndexSourceRef === state.masterProduk && _mpIndexSourceLen === state.masterProduk.length) return;
   _mpIndexByMarketplaceName = new Map();
   _mpIndexByInternalName = new Map();
+  _mpTetapByInternal = new Map();
   state.masterProduk.forEach(m => {
     const normMp = normalizeName(m.namaMarketplace);
     const normVar = normalizeName(m.variasiMarketplace);
@@ -1409,6 +1443,13 @@ function ensureMasterProdukIndex() {
       _mpIndexByMarketplaceName.get(normMp).push(m);
     }
     if (normInt && !_mpIndexByInternalName.has(normInt)) _mpIndexByInternalName.set(normInt, m);
+    // Entitas Tetap berlaku per PRODUK (nama internal): satu produk bisa punya banyak listing di
+    // Master Produk — dulu cuma listing pertama yang dibaca, jadi set di listing lain tidak ngefek.
+    if (normInt && m.entitasTetap && ENTITIES.includes(m.entitasTetap)) {
+      const prev = _mpTetapByInternal.get(normInt);
+      const at = m.tetapAt || '';
+      if (!prev || at > prev.at) _mpTetapByInternal.set(normInt, { ent: m.entitasTetap, at });
+    }
   });
   _mpIndexSourceRef = state.masterProduk;
   _mpIndexSourceLen = state.masterProduk.length;
@@ -1495,6 +1536,44 @@ function mergeProductNamesBulk(renameMap) {
 // Tokopedia/TikTok product name would keep showing "Perlu Konfirmasi" on every future import,
 // even after being manually confirmed once. Only fires for rows that were genuinely unmapped —
 // never touches or duplicates an existing Master Produk entry.
+// Dipanggil saat entitas baris yang SUDAH OK diganti manual di Import Marketplace:
+// produk itu di-set ke entitas tsb untuk SEMUA tanggal (Entitas Tetap di Master Produk ikut
+// diisi otomatis). Kalau stok entitas itu habis, ikut rantai: GSJ -> HNH, HNH -> GSJ, GSM -> HNH -> GSJ.
+function setProductEntitasFromRow(row, ent, prodOverride) {
+  const res = resolveInternalName(row.namaAsli || row.nama, row.variasi);
+  const prod = prodOverride || (res.matched ? res.namaInternal : (row.namaCanonical || row.nama));
+  const prodKey = normalizeName(prod);
+  const now = new Date().toISOString();
+  let nMaster = 0;
+  state.masterProduk.forEach(m => {
+    const sameProduct = normalizeName(m.namaInternal) === prodKey;
+    const sameListing = row.namaAsli && normalizeName(m.namaMarketplace) === normalizeName(row.namaAsli) && normalizeName(m.variasiMarketplace || '') === normalizeName(row.variasi || '');
+    if (sameProduct || sameListing) { m.entitasTetap = ent; m.tetapAt = now; nMaster++; }
+  });
+  if (!nMaster) {
+    state.masterProduk.push({
+      id: uid(), namaMarketplace: row.namaAsli || row.nama, variasiMarketplace: row.variasi || '',
+      namaInternal: prod, namaGracia: '', namaHNH: '', namaGlomed: '', entitasTetap: ent, tetapAt: now, catatan: '',
+      sumber: row.sumber || '', channel: row.channel || '', createdAt: now, createdSource: 'Entitas di-set dari Import Marketplace',
+    });
+    nMaster = 1;
+    invalidateMasterProdukIndex(); // ada listing baru -> indeks nama perlu dibangun ulang
+  } else {
+    refreshTetapIndex(); // cuma Entitas Tetap yang berubah -> cukup perbarui petanya
+  }
+  // Semua penjualan produk ini (semua tanggal) ikut aturan baru — kunci manual/otomatis lama dilepas.
+  let nRows = 0;
+  state.checkerRows.forEach(r => {
+    const rr = resolveInternalName(r.namaAsli || r.nama, r.variasi);
+    const p = rr.matched ? rr.namaInternal : (r.namaCanonical || r.nama);
+    if (normalizeName(p) !== prodKey && normalizeName(r.nama) !== prodKey) return;
+    if (r.id !== row.id && r.status === 'OK' && r.entitas === 'Gracia') return; // sudah klop di GSM -> jangan diubah
+    if (r.id !== row.id && r.entitasManual) return; // sudah pernah diklik manual -> jangan diubah
+    delete r.entitasManual; r.autoEnt = (r.status === 'OK' && r.entitas === 'Gracia' && r.id !== row.id) ? r.autoEnt : undefined; nRows++;
+  });
+  return { prod, nMaster, nRows };
+}
+
 function offerToSaveMasterProdukMapping(row) {
   if (!row.namaAsli) return;
   // Find any EXISTING Master Produk entry for this exact raw name+variasi — whether it's
@@ -1520,7 +1599,7 @@ function offerToSaveMasterProdukMapping(row) {
     (isChangingExisting ? `Nama internal SEBELUMNYA: "${existing.namaInternal}"\n` : '') +
     `Nama internal ${isChangingExisting ? 'BARU' : ''}: "${row.nama}"\n` +
     `Marketplace: ${row.sumber || '-'} · Channel: ${row.channel || '-'}\n` +
-    `Entitas: ${ENTITY_LABEL[row.entitas] || row.entitas}\n\n` +
+    `(Entitas baris ini: ${ENTITY_LABEL[row.entitas] || row.entitas} — hanya untuk baris yang dikonfirmasi, tidak dijadikan Entitas Tetap)\n\n` +
     `Kalau disimpan, produk yang sama di import Tokopedia/TikTok/Shopee berikutnya akan langsung dikenali otomatis — tidak perlu konfirmasi ulang lagi.`
   );
   if (!ok) return;
@@ -1529,14 +1608,15 @@ function offerToSaveMasterProdukMapping(row) {
     // a previous genuine mapping with the person's new deliberate choice.
     existing.namaInternal = row.nama;
     existing.belumDirapikan = false;
-    existing.entitasTetap = row.entitas;
+    // Entitas Tetap TIDAK diisi dari konfirmasi 1 baris (dulu: konfirmasi HNH -> semua penjualan
+    // produk ini ikut pindah ke HNH). Entitas Tetap hanya diatur sengaja di tab Master Produk.
     existing.createdAt = new Date().toISOString();
     existing.createdSource = isChangingExisting ? 'Diganti manual dari Tab 2' : 'Dirapikan dari konfirmasi "Perlu Konfirmasi" (Tab 2)';
   } else {
     state.masterProduk.push({
       id: uid(), namaMarketplace: row.namaAsli, variasiMarketplace: row.variasi || '',
       namaInternal: row.nama, namaGracia: '', namaHNH: '', namaGlomed: '',
-      entitasTetap: row.entitas, catatan: '', sumber: row.sumber || '', channel: row.channel || '',
+      entitasTetap: '', catatan: '', sumber: row.sumber || '', channel: row.channel || '',
       createdAt: new Date().toISOString(), createdSource: 'Auto dari konfirmasi "Perlu Konfirmasi" (Tab 2)',
     });
   }
@@ -1839,14 +1919,22 @@ function bindGenericAutocomplete(input, getMatches, onSelect) {
 }
 
 function ensureFuzzyCatalog() {
-  const lens = `${state.masterProduk.length}|${state.invoices.length}|${state.adjustments.length}`;
+  // Penambahan otomatis (top-up) dibuat ulang setiap hitung ulang & namanya pasti sudah ada di
+  // katalog -> tidak dihitung, supaya katalog + hasil pencocokan tidak dibangun ulang tiap kali.
+  let nAdj = 0;
+  for (const a of state.adjustments) if (a.keterangan !== 'Auto top-up (catatan Master Produk)') nAdj++;
+  const lens = `${state.masterProduk.length}|${state.invoices.length}|${nAdj}`;
   if (_fuzzyCatalogSourceLens === lens) return _fuzzyCatalogCache;
   const names = new Set();
   state.masterProduk.forEach(m => { if (m.namaInternal && !isStillRawMapping(m)) names.add(m.namaInternal); });
   state.invoices.forEach(inv => (inv.items || []).forEach(it => { if (it.nama) names.add(it.nama); }));
-  state.adjustments.forEach(a => { if (a.nama) names.add(a.nama); });
-  _fuzzyCatalogCache = [...names].map(nama => ({ nama, tokens: tokenize(nama) }));
+  state.adjustments.forEach(a => { if (a.nama && a.keterangan !== 'Auto top-up (catatan Master Produk)') names.add(a.nama); });
   _fuzzyCatalogSourceLens = lens;
+  // Isi katalog sama persis dengan sebelumnya -> pakai objek lama (hasil pencocokan yang tersimpan tetap berlaku).
+  const sig = [...names].join('\u0001');
+  if (_fuzzyCatalogCache && _fuzzyCatalogCache._sig === sig) return _fuzzyCatalogCache;
+  _fuzzyCatalogCache = [...names].map(nama => ({ nama, tokens: tokenize(nama) }));
+  _fuzzyCatalogCache._sig = sig;
   return _fuzzyCatalogCache;
 }
 
@@ -2339,7 +2427,7 @@ function classifyCatatanBehavior(catatan) {
   return null;
 }
 
-function waterfallDecide(nama, qty, stockSnapshot) {
+function waterfallDecide(nama, qty, stockSnapshot, prefer, lockedEnt, known) {
   const master = findMasterProdukByInternalName(nama);
   const catatanMaster = master ? master.catatan : '';
   const behavior = classifyCatatanBehavior(catatanMaster);
@@ -2361,24 +2449,35 @@ function waterfallDecide(nama, qty, stockSnapshot) {
     return { entitas: bestGuess, status: 'PERLU_KONFIRMASI', catatanMaster, alasan: 'Sesuai catatan Master Produk — produk ini perlu dikonfirmasi manual setiap terjual', namaUntukEntitas: nameIn(bestGuess) };
   }
 
-  // 1) Fixed-entity PREFERENCE from Master Produk, if set and it actually has enough stock.
-  if (master && master.entitasTetap && ENTITIES.includes(master.entitasTetap)) {
-    const avail = getStockQty(stockSnapshot, master.entitasTetap, nameIn(master.entitasTetap));
-    if (avail >= qty) {
-      return { entitas: master.entitasTetap, status: 'OK', catatanMaster, alasan: 'Sesuai aturan tetap di Master Produk' };
-    }
-    // Fixed entity doesn't have enough stock right now — DON'T get stuck here. Fall through
-    // to the normal Gracia>HNH>Glomed check below first (the product may genuinely also be
-    // stocked elsewhere, possibly under a different name there), and only give up with
-    // "Perlu Konfirmasi" if nowhere has stock either.
+  // ATURAN POTONG STOK (otomatis):
+  //  a) Penjualan yang sudah klop di GSM -> tetap GSM (dikunci, tidak pernah pindah otomatis).
+  //  b) Penjualan yang sudah pernah diputuskan di HNH/GSJ -> tetap di situ selama stoknya cukup
+  //     (jadi angka yang sudah klop tidak pindah-pindah tiap ada edit/import lain).
+  //  c) Entitas Tetap di Master Produk (mis. hasil klik manual "set produk") -> dipakai kalau
+  //     stoknya cukup.
+  //  d) Selain itu: GSM dulu -> GSM habis ke HNH -> HNH habis ke GSJ ->
+  //  e) GSJ habis balik ke HNH dan stok HNH ditambah sesuai yang terjual di tanggal itu.
+  const tetap = getProductEntitasTetap(nama) || (master && master.entitasTetap && ENTITIES.includes(master.entitasTetap) ? master.entitasTetap : '');
+  if (lockedEnt === 'Gracia') {
+    return { entitas: 'Gracia', status: 'OK', catatanMaster, alasan: 'Sudah klop di GSM (dikunci)', namaUntukEntitas: nameIn('Gracia') };
   }
-
-  // 2) Standard waterfall: Gracia -> HNH -> Glomed, each checked under ITS OWN name for this product.
-  for (const ent of WATERFALL_ORDER) {
-    const avail = getStockQty(stockSnapshot, ent, nameIn(ent));
-    if (avail >= qty) {
-      return { entitas: ent, status: 'OK', catatanMaster, alasan: `Stok tersedia di ${ent}`, namaUntukEntitas: nameIn(ent) };
+  const has = ent => getStockQty(stockSnapshot, ent, nameIn(ent)) >= qty;
+  if (lockedEnt && ENTITIES.includes(lockedEnt) && has(lockedEnt)) {
+    return { entitas: lockedEnt, status: 'OK', catatanMaster, alasan: `Tetap di ${ENTITY_LABEL[lockedEnt]} (sudah diputuskan sebelumnya)`, namaUntukEntitas: nameIn(lockedEnt) };
+  }
+  if (tetap && has(tetap)) {
+    return { entitas: tetap, status: 'OK', catatanMaster, alasan: 'Sesuai Entitas Tetap di Master Produk', namaUntukEntitas: nameIn(tetap) };
+  }
+  for (const ent of WATERFALL_ORDER) { // GSM -> HNH -> GSJ
+    if (has(ent)) {
+      return { entitas: ent, status: 'OK', catatanMaster, alasan: ent === 'Gracia' ? 'Stok tersedia di GSM' : `Stok sebelumnya habis — dipotong dari ${ENTITY_LABEL[ent]}`, namaUntukEntitas: nameIn(ent) };
     }
+  }
+  // Semua entitas kurang -> balik ke HNH + tambah stok HNH sebanyak yang kurang (produk dikenal).
+  if (tetap || known) {
+    const availHNH = getStockQty(stockSnapshot, 'HNH', nameIn('HNH'));
+    const deficit = qty - Math.max(0, availHNH);
+    return { entitas: 'HNH', status: 'OK', catatanMaster, alasan: 'Stok GSM, HNH & GSJ habis — dipotong dari HNH, stok HNH ditambah sesuai yang terjual', namaUntukEntitas: nameIn('HNH'), autoTopUp: deficit > 0 ? deficit : 0 };
   }
 
   // 3) Nowhere has enough stock. If catatan explicitly says "potong di HNH, kalau kosong
@@ -2417,11 +2516,41 @@ function recomputeAllCheckerRows() {
   // below based on the CURRENT stock situation, so stale ones don't pile up across recomputes.
   state.adjustments = state.adjustments.filter(a => a.keterangan !== 'Auto top-up (catatan Master Produk)');
 
+  // PESANAN DIPECAH (stok sebagian di GSJ, sisanya HNH + tambah stok): gabungkan dulu pecahan dari
+  // hitungan sebelumnya, lalu dipecah ulang di bawah sesuai stok terbaru. Pecahan yang sudah diklik
+  // manual (atau induknya) dibekukan jadi baris biasa — tidak diutak-atik lagi.
+  {
+    const byId = new Map(state.checkerRows.map(r => [r.id, r]));
+    const frozen = new Set();
+    state.checkerRows.forEach(r => {
+      if (!r.splitOf) return;
+      const p = byId.get(r.splitOf);
+      if (!p || p.entitasManual || r.entitasManual || p.splitTotalQty == null) frozen.add(r.splitOf);
+    });
+    const keep = [];
+    state.checkerRows.forEach(r => {
+      if (r.splitOf) {
+        if (frozen.has(r.splitOf)) { delete r.splitOf; keep.push(r); }
+        return; // pecahan otomatis -> dibuat ulang
+      }
+      if (r.splitTotalQty != null) {
+        if (!frozen.has(r.id)) { r.qty = r.splitTotalQty; delete r.splitInfo; }
+        delete r.splitTotalQty;
+      }
+      keep.push(r);
+    });
+    state.checkerRows = keep;
+  }
+  const splitChildren = [];
+
   const sorted = [...state.checkerRows].sort((a, b) => {
     if (a.tanggal !== b.tanggal) return a.tanggal < b.tanggal ? -1 : 1;
     return 0;
   });
   const runningStock = computeAllStock(new Set(state.checkerRows.map(r => r.id))); // stock WITHOUT any checker deductions
+  const productCursor = {}; // produk -> entitas yang sedang dipakai (lengket sampai habis)
+  const beforeEnt = new Map();
+  state.checkerRows.forEach(r => { if (r && r.status === 'OK' && ENTITIES.includes(r.entitas) && (r.autoEnt === r.entitas || r.entitasManual)) beforeEnt.set(r.id, r.entitas); }); // hanya yang SUDAH pernah diputuskan (baris baru diimport tidak dihitung pindah)
   sorted.forEach(row => {
     const qtyOrder = Number(row.qty) || 0; // the ORIGINAL marketplace order qty — never modified, Checker/Excel always show this
     // Always re-resolve from the STABLE marketplace name (namaAsli) rather than the row's
@@ -2461,8 +2590,69 @@ function recomputeAllCheckerRows() {
       return;
     }
 
-    const decision = waterfallDecide(genericNama, qty, runningStock);
+    // Kunci baris: baris yang sebelumnya sudah OK otomatis di entitas X tetap di X selama stok X
+    // masih cukup (jadi baris yang sudah klop tidak pindah-pindah tiap ada edit di baris lain).
+    const curKey = normalizeName(genericNama);
+    const lockedEnt = (row.status === 'OK' && ENTITIES.includes(row.entitas) && row.autoEnt === row.entitas) ? row.entitas : null;
+    const known = !!(resolved.matched || resolved.fuzzy || ENTITIES.some(e => runningStock[e] && runningStock[e][curKey]));
+    const decision = waterfallDecide(genericNama, qty, runningStock, null, lockedEnt, known);
+    row.autoTopUpQty = decision.autoTopUp > 0 ? decision.autoTopUp : undefined; // utk tanda "stok kurang" di tabel
+    if (decision.status === 'OK') { productCursor[curKey] = decision.entitas; row.autoEnt = decision.entitas; }
+    else row.autoEnt = undefined;
     const finalNama = decision.namaUntukEntitas || genericNama;
+
+    // Stok tidak ada yang cukup utuh tapi ada SEBAGIAN (mis. GSJ 14, terjual 15) -> pecah pesanan:
+    // potong yang ada di GSM/HNH/GSJ (urut), sisanya ke HNH + tambah stok HNH. Baris tambahan
+    // dibuat otomatis (format sama, harga satuan sama). Hanya untuk qty biasa (tanpa pengali isi).
+    if (decision.status === 'OK' && decision.autoTopUp > 0 && multiplier === 1) {
+      const parts = []; let rem = qty;
+      for (const ent of WATERFALL_ORDER) {
+        const nm = nameForEntity(resolved, ent) || genericNama;
+        const av = getStockQty(runningStock, ent, nm);
+        if (av > 0 && rem > 0) { const take = Math.min(av, rem); parts.push({ ent, q: take, nm, top: 0 }); rem -= take; }
+      }
+      if (parts.length && rem > 0) {
+        const hp = parts.find(x => x.ent === 'HNH');
+        if (hp) { hp.q += rem; hp.top = rem; }
+        else parts.push({ ent: 'HNH', q: rem, nm: nameForEntity(resolved, 'HNH') || genericNama, top: rem });
+      }
+      if (parts.length > 1) {
+        const info = parts.map(x => `${ENTITY_LABEL[x.ent] || x.ent} ${x.q}`).join(' + ') + ` (pesanan ${qty})`;
+        const base = JSON.parse(JSON.stringify(row));
+        parts.forEach((x, i) => {
+          let target;
+          if (i === 0) { target = row; row.splitTotalQty = qty; }
+          else {
+            target = JSON.parse(JSON.stringify(base));
+            target.id = row.id + '~' + x.ent;
+            target.splitOf = row.id;
+            delete target.splitTotalQty; delete target.entitasManual;
+            // biaya/voucher per pesanan cukup dihitung sekali (di baris induk)
+            if (target.rawRow && typeof target.rawRow === 'object') {
+              Object.keys(target.rawRow).forEach(k => { if (/voucher|cashback|discount|diskon|subtotal|ongkir|fee|biaya|total/i.test(k) && !/unit original price/i.test(k)) target.rawRow[k] = '0'; });
+            }
+            splitChildren.push(target);
+          }
+          target.qty = x.q; target.qtyInternal = x.q;
+          target.nama = x.nm; target.namaCanonical = genericNama;
+          target.entitas = x.ent; target.status = 'OK'; target.autoEnt = undefined;
+          target.autoTopUpQty = x.top || undefined;
+          target.splitInfo = info;
+          target.catatan = decision.catatanMaster || resolved.catatan || row.catatanManual || '';
+          target.fuzzyMatched = !!resolved.fuzzy;
+          target.fuzzyScore = resolved.fuzzy ? resolved.fuzzyScore : undefined;
+          const k2 = normalizeName(x.nm);
+          if (!runningStock[x.ent][k2]) runningStock[x.ent][k2] = { nama: x.nm, qty: 0, totalModal: 0 };
+          if (x.top > 0) {
+            state.adjustments.push({ id: 'autotopup_' + target.id, tanggal: row.tanggal, entitas: x.ent, nama: x.nm, qty: x.top, keterangan: 'Auto top-up (catatan Master Produk)' });
+            runningStock[x.ent][k2].qty += x.top;
+          }
+          runningStock[x.ent][k2].qty -= x.q;
+        });
+        return;
+      }
+    }
+    row.splitInfo = undefined;
 
     row.nama = finalNama;
     row.namaCanonical = genericNama;
@@ -2479,7 +2669,8 @@ function recomputeAllCheckerRows() {
     // adjustment now so this and subsequent rows see accurate stock (lands at 0, not negative).
     if (decision.autoTopUp > 0) {
       state.adjustments.push({
-        id: uid(), tanggal: row.tanggal, entitas: decision.entitas, nama: finalNama, qty: decision.autoTopUp,
+        id: 'autotopup_' + row.id, // id tetap per baris -> hitung ulang tidak membuat & menghapus data berulang-ulang
+        tanggal: row.tanggal, entitas: decision.entitas, nama: finalNama, qty: decision.autoTopUp,
         keterangan: 'Auto top-up (catatan Master Produk)',
       });
       runningStock[decision.entitas][key].qty += decision.autoTopUp;
@@ -2489,6 +2680,20 @@ function recomputeAllCheckerRows() {
     // used in the decision so later rows see an accurate remaining balance.
     runningStock[decision.entitas][key].qty -= qty;
   });
+  if (splitChildren.length) state.checkerRows = state.checkerRows.concat(splitChildren);
+  // Catat penjualan yang PINDAH entitas (mis. dari GSM ke HNH) supaya bisa dicek & dikembalikan.
+  const moves = [];
+  state.checkerRows.forEach(r => {
+    const from = beforeEnt.get(r.id);
+    if (!from) return;
+    const to = r.status === 'OK' ? r.entitas : 'PERLU_KONFIRMASI';
+    if (to === from) return;
+    moves.push({ id: r.id + '@' + Date.now(), rowId: r.id, tanggal: r.tanggal, nama: r.nama, qty: r.qty, from, to, at: new Date().toISOString(), by: (typeof gsjCurrentUser !== 'undefined' && gsjCurrentUser && gsjCurrentUser.name) || '' });
+  });
+  if (moves.length) {
+    state.entityMoves = (state.entityMoves || []).concat(moves).slice(-400);
+    if (typeof gsjUpdateMovesBadge === 'function') setTimeout(gsjUpdateMovesBadge, 0);
+  }
 }
 
 // ---------- Multi-marketplace parsing (Shopee / Tokopedia / TikTok Shop) ----------
@@ -5041,6 +5246,20 @@ function renderGsheetBox() {
   }
 }
 
+// Sekali saja setelah update aturan potong "lengket": semua keputusan penjualan yang SUDAH ADA
+// dikunci apa adanya, supaya Stok Terjual yang sudah klop tidak berubah gara-gara aturan baru.
+function gsjAdoptWaterfallLocks() {
+  if (state.settings && state.settings.waterfallV2) return 0;
+  let n = 0;
+  (state.checkerRows || []).forEach(r => {
+    if (r && r.status === 'OK' && !r.entitasManual && ENTITIES.includes(r.entitas) && r.autoEnt === undefined) { r.autoEnt = r.entitas; n++; }
+  });
+  state.settings = state.settings || {};
+  state.settings.waterfallV2 = true;
+  saveState();
+  return n;
+}
+
 // Perbaikan data sekali jalan: faktur beli di marketplace yang terlanjur "Surat Jalan" -> "Nota".
 // Aman untuk stok: Nota & Surat Jalan sama-sama pakai Tanggal Barang Diterima.
 function gsjFixMarketplaceSuratJalan() {
@@ -6002,7 +6221,7 @@ function renderTab2RichTable(container, rows, mpKey) {
         </td>
         ${cellsBeforeQty}
         <td class="editable-cell"><select data-field="entitas">${ENTITIES.map(e => `<option value="${e}" ${e===r.entitas?'selected':''}>${ENTITY_LABEL[e]}</option>`).join('')}</select></td>
-        <td data-role="statuscell">${statusPillHTML(r.status)}${r.status === 'PERLU_KONFIRMASI' ? `<button class="btn secondary small" data-action="markok" style="margin-top:3px;display:block;">✓ Tandai OK</button>` : ''}</td>
+        <td data-role="statuscell">${statusPillHTML(r.status)}${(r.splitInfo || r.autoTopUpQty) ? gsjRowNoteHTML(r) : ''}${r.status === 'PERLU_KONFIRMASI' ? `<button class="btn secondary small" data-action="markok" style="margin-top:3px;display:block;">✓ Tandai OK</button>` : ''}</td>
         ${cellsAfterQty}
       </tr>`;
     }).join('');
@@ -6307,7 +6526,43 @@ function bindTab2RowActions(tbody) {
         if (!row) return;
         const field = input.dataset.field;
         const oldVal = input.dataset.oldValue || '';
+        const prevStatus = row.status;
         row[field] = (field === 'qty') ? Number(input.value)||0 : input.value;
+        if (field === 'entitas' && ENTITIES.includes(row.entitas)) {
+          // Pilih entitas manual (baris OK maupun "Perlu Konfirmasi") = "set produk ini ke entitas X":
+          // semua penjualan produk ini ikut (kecuali yang sudah klop di GSM), Entitas Tetap Master
+          // Produk ikut terisi, dan kalau stoknya kosong, HNH otomatis ditambah sesuai yang terjual.
+          const chosen = row.entitas;
+          const r = setProductEntitasFromRow(row, chosen);
+          gsjDetailedAudit(`men-set produk <b>${escapeAttr(r.prod)}</b> ke <b>${escapeAttr(ENTITY_LABEL[chosen] || chosen)}</b> dari Import Marketplace (Entitas Tetap Master Produk ikut diisi, ${r.nRows} baris penjualan dihitung ulang)`);
+          recomputeAllCheckerRows();
+          if (row.entitas !== chosen) {
+            // Stok entitas pilihan tidak cukup -> sesuai aturan dipindah. Tawarkan paksa.
+            const sisaTxt = ENTITIES.map(e => {
+              const nm = nameForEntity(resolveInternalName(row.namaAsli || row.nama, row.variasi), e) || r.prod;
+              const q = ((computeStockAsOfDate(e, row.tanggal) || {})[normalizeName(nm)] || {}).qty || 0;
+              return `• ${ENTITY_LABEL[e]}: sisa ${fmtNum(q)}`;
+            }).join('\n');
+            if (confirm(`Stok "${r.prod}" per ${row.tanggal} (terjual ${row.qty}):\n${sisaTxt}\n\nStok ${ENTITY_LABEL[chosen]} tidak cukup, jadi sesuai aturan dipotong dari ${ENTITY_LABEL[row.entitas] || row.entitas}.\n\nTetap PAKSA penjualan produk ini dipotong dari ${ENTITY_LABEL[chosen]}? (stok ${ENTITY_LABEL[chosen]} bisa jadi minus)`)) {
+              const prodKey = normalizeName(r.prod);
+              state.checkerRows.forEach(x => {
+                const rr = resolveInternalName(x.namaAsli || x.nama, x.variasi);
+                const pk = normalizeName(rr.matched ? rr.namaInternal : (x.namaCanonical || x.nama));
+                if (pk !== prodKey && normalizeName(x.nama) !== prodKey) return;
+                if (x.id !== row.id && x.status === 'OK' && x.entitas === 'Gracia' && chosen !== 'Gracia') return;
+                if (x.id !== row.id && x.entitasManual) return; // yang sudah diklik manual tidak diubah
+                x.entitas = chosen; x.status = 'OK'; x.entitasManual = true;
+              });
+              gsjDetailedAudit(`memaksa semua penjualan <b>${escapeAttr(r.prod)}</b> dipotong dari <b>${escapeAttr(ENTITY_LABEL[chosen])}</b> walaupun stoknya tidak cukup`);
+              recomputeAllCheckerRows();
+            }
+          }
+          saveState();
+          refreshMasterProdukDatalist();
+          renderTab2TableKeepScroll();
+          if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+          return;
+        }
         if (field === 'entitas') {
           const wasUnconfirmed = row.status === 'PERLU_KONFIRMASI';
           row.entitasManual = true; // this is now a deliberate choice — recompute must not overwrite it
@@ -6384,6 +6639,10 @@ function bindTab2RowActions(tbody) {
         state.checkerRows.forEach(other => {
           if (other.id === row.id) return;
           if (`${normalizeName(other.namaAsli)}||${normalizeName(other.variasi)}` !== propagateKey) return;
+          // Baris lain yang SUDAH OK (mis. tgl 1–15 sudah klop di GSM) TIDAK disentuh — dulu ikut
+          // dipindah ke entitas baris yang dikonfirmasi (mis. HNH), bikin Stok Terjual GSM berubah.
+          // Nama barunya tetap ikut lewat Master Produk saat dihitung ulang di bawah.
+          if (other.status !== 'PERLU_KONFIRMASI') return;
           other.nama = row.nama;
           other.namaCanonical = row.nama;
           other.entitas = row.entitas;
@@ -6393,6 +6652,8 @@ function bindTab2RowActions(tbody) {
           other.fuzzyScore = undefined;
         });
 
+        // Konfirmasi sekali = set produk ini (nama internal yang dipilih) ke entitas baris ini.
+        if (ENTITIES.includes(row.entitas)) setProductEntitasFromRow(row, row.entitas, row.nama);
         // Recompute EVERY row, not just the ones just propagated above — other DIFFERENT
         // aliases of the same physical product (different raw text, not caught by the exact
         // key above) may now also resolve via the freshly-saved/updated Master Produk entry.
@@ -6410,7 +6671,14 @@ function bindTab2RowActions(tbody) {
       if (!confirm('Hapus baris penjualan ini?')) return;
       const row = state.checkerRows.find(x => x.id === id);
       gsjDetailedAudit(`menghapus baris Import Marketplace <b>${escapeAttr(row ? (row.nama || row.namaAsli || '') : id)}</b>`);
-      state.checkerRows = state.checkerRows.filter(x => x.id !== id);
+      // Pesanan yang dipecah: hapus induk = hapus pecahannya juga; hapus pecahan = pesanan dihitung utuh lagi.
+      const parentId = row && row.splitOf ? row.splitOf : id;
+      if (row && (row.splitOf || row.splitTotalQty != null)) {
+        if (!confirm('Baris ini bagian dari pesanan yang dipecah otomatis (' + (row.splitInfo || '') + '). Hapus SELURUH pesanan ini (semua pecahannya)?')) return;
+        state.checkerRows = state.checkerRows.filter(x => x.id !== parentId && x.splitOf !== parentId);
+      } else {
+        state.checkerRows = state.checkerRows.filter(x => x.id !== id);
+      }
       recomputeAllCheckerRows(); // deleting this row may free up stock that other rows' waterfall decisions should now reflect
       saveState();
       renderTab2DateFilter();
@@ -6425,7 +6693,9 @@ function bindTab2RowActions(tbody) {
       row.status = 'OK';
       row.entitasManual = true; // confirming a flagged row is also a deliberate choice — protect it from recompute
       offerToSaveMasterProdukMapping(row);
-      gsjDetailedAudit(`menandai OK baris <b>${escapeAttr(row.nama || row.namaAsli || '')}</b> di Import Marketplace`);
+      // Konfirmasi sekali = set produk ini ke entitas baris ini untuk semua penjualannya.
+      if (ENTITIES.includes(row.entitas)) { setProductEntitasFromRow(row, row.entitas); recomputeAllCheckerRows(); }
+      gsjDetailedAudit(`menandai OK baris <b>${escapeAttr(row.nama || row.namaAsli || '')}</b> di Import Marketplace (produk di-set ke ${escapeAttr(ENTITY_LABEL[row.entitas] || row.entitas)})`);
       saveState();
       renderTab2TableKeepScroll();
       if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
@@ -7033,7 +7303,13 @@ function computeStokTerjualRekap(entitas, start, end) {
     if (cls === 'wa') a.wa += q;
     else if (cls !== 'fakturPajak') a.mp += q; // Faktur Pajak tidak ada di rekap (sama seperti file Excel)
   });
-  return getProductCatalogForEntity(entitas).map(nama => {
+  const catalog = getProductCatalogForEntity(entitas);
+  const inCat = new Set(catalog.map(n => normalizeName(n)));
+  // Penjualan produk yang DISEMBUNYIKAN tidak ikut rekap -> dicatat supaya kelihatan kenapa total beda.
+  const hiddenSold = [];
+  agg.forEach((a, k) => { if (!inCat.has(k) && (a.mp || a.wa)) hiddenSold.push({ k, mp: a.mp, wa: a.wa }); });
+  computeStokTerjualRekap._hidden = hiddenSold;
+  return catalog.map(nama => {
     const a = agg.get(normalizeName(nama)) || { mp: 0, wa: 0 };
     const hargaModal = avgModalFromInvoice(entitas, nama);
     return {
@@ -7062,6 +7338,7 @@ function renderTab3RekapTable() {
     <div class="stat-box"><div class="label">Terjual Tokped/Shopee/TikTok</div><div class="value">${fmtNum(tot.mp)}</div></div>
     <div class="stat-box"><div class="label">Terjual WA</div><div class="value">${fmtNum(tot.wa)}</div></div>
     <div class="stat-box"><div class="label">Total Pembayaran</div><div class="value">${fmtMoney(Math.round(tot.bayar))}</div></div>
+    ${(computeStokTerjualRekap._hidden || []).length ? `<div style="grid-column:1/-1;font-size:12px;color:#92400E;background:#FEF3C7;border:1px solid #FDE68A;border-radius:8px;padding:6px 10px;">⚠️ Tidak ikut dihitung karena produknya disembunyikan dari daftar: ${(computeStokTerjualRekap._hidden).map(h => `${escapeAttr(h.k)} (${fmtNum(h.mp + h.wa)})`).join(', ')}</div>` : ''}
   `;
   const d = `${String(rg.d1).padStart(2, '0')}-${rg.d2}`;
   wrap.innerHTML = `
@@ -7069,6 +7346,7 @@ function renderTab3RekapTable() {
       <label style="font-size:12.5px;display:flex;align-items:center;gap:5px;cursor:pointer;">
         <input type="checkbox" id="t3-rekap-onlysold" ${tab3RekapOnlySold ? 'checked' : ''}> Hanya produk yang terjual
       </label>
+      <button type="button" class="btn secondary small" id="t3-rekap-selisih" title="Total beda dari yang seharusnya? Cari penjualan yang tercatat di entitas lain tapi barangnya ada di ${escapeAttr(ENTITY_LABEL[entitas] || entitas)}, lalu kembalikan.">🔍 Cari selisih</button>
       <span style="font-size:11.5px;color:var(--muted);">Total Pembayaran = Terjual Tokped/Shopee/TikTok × (Harga Modal + Rp${fmtNum(state.settings.markupPerUnit || 0)}) — WA tidak ikut dihitung.</span>
     </div>
     <div class="table-wrap" id="t3-scrollwrap">
@@ -7111,6 +7389,126 @@ function renderTab3RekapTable() {
   `;
   const cb = document.getElementById('t3-rekap-onlysold');
   if (cb) cb.addEventListener('change', () => { tab3RekapOnlySold = cb.checked; renderTab3Table(); });
+  const sb = document.getElementById('t3-rekap-selisih');
+  if (sb) sb.addEventListener('click', () => gsjRekapSelisih(entitas, rg, label, tot));
+}
+
+// ---------- Cari selisih rekap ----------
+// Kalau total rekap beda dari angka yang seharusnya (mis. 1.177 jadi 1.173), cari penjualan di
+// periode itu yang sekarang tercatat di entitas LAIN tapi produknya punya stok/daftar di entitas
+// ini — itu kandidat yang "pindah". Kelompok yang pas dengan selisih ditandai, lalu bisa
+// dikembalikan dengan satu klik (dikunci manual, tidak akan pindah lagi).
+function gsjRekapCandidates(entitas, rg) {
+  const markup = state.settings.markupPerUnit || 0;
+  const cat = new Set(getProductCatalogForEntity(entitas).map(n => normalizeName(n)));
+  const groups = new Map();
+  state.checkerRows.forEach(r => {
+    if (!r.tanggal || r.tanggal < rg.start || r.tanggal > rg.end) return;
+    if (r.entitas === entitas || r.status !== 'OK') return;
+    const cls = classifyRowForPivot(r);
+    if (cls === 'wa' || cls === 'fakturPajak') return;
+    const res = resolveInternalName(r.namaAsli || r.nama, r.variasi);
+    const nm = nameForEntity(res, entitas) || (res.matched ? res.namaInternal : (r.namaCanonical || r.nama));
+    const k = normalizeName(nm);
+    if (!cat.has(k)) return;
+    let g = groups.get(k);
+    if (!g) { g = { nama: nm, rows: [], qty: 0 }; groups.set(k, g); }
+    const q = Number(r.qtyInternal != null ? r.qtyInternal : r.qty) || 0;
+    g.rows.push(r); g.qty += q;
+  });
+  [...groups.values()].forEach(g => { g.modal = avgModalFromInvoice(entitas, g.nama); g.nilai = g.qty * (g.modal + markup); });
+  return groups;
+}
+function gsjRekapTotals(entitas, rg) {
+  return computeStokTerjualRekap(entitas, rg.start, rg.end).reduce((a, x) => { a.mp += x.terjualMP; a.bayar += x.totalPembayaran; return a; }, { mp: 0, bayar: 0 });
+}
+function gsjRekapSelisih(entitas, rg, label, tot, prefill) {
+  const markup = state.settings.markupPerUnit || 0;
+  const groups = gsjRekapCandidates(entitas, rg);
+  const list = [...groups.values()];
+  const draw = () => {
+    const tq = Number((document.getElementById('sel-tq') || {}).value) || 0;
+    const tr = Number(String((document.getElementById('sel-tr') || {}).value || '').replace(/[^0-9]/g, '')) || 0;
+    const dq = tq ? tq - tot.mp : 0, dr = tr ? tr - Math.round(tot.bayar) : 0;
+    const unitPrice = dq > 0 && dr > 0 ? dr / dq : 0;
+    const isMatch = g => (dq > 0 && g.qty === dq) || (dr > 0 && Math.abs(g.nilai - dr) < 2) || (unitPrice && Math.abs((g.modal + markup) - unitPrice) < 2);
+    const sorted = list.slice().sort((a, b) => (isMatch(b) - isMatch(a)) || (b.qty - a.qty));
+    const info = (dq || dr) ? `<p style="margin:6px 0;"><b>Selisih:</b> ${dq ? fmtNum(dq) + ' pcs' : ''}${dq && dr ? ' · ' : ''}${dr ? fmtMoney(dr) : ''}${unitPrice ? ` (±${fmtMoney(Math.round(unitPrice))}/pcs → Harga Modal ±${fmtMoney(Math.round(unitPrice - markup))})` : ''}</p>` : '';
+    const body = sorted.slice(0, 80).map((g, gi) => `<tr style="${isMatch(g) ? 'background:#ECFDF5;' : ''}">
+        <td>${isMatch(g) ? '✅ ' : ''}<b>${escapeAttr(g.nama)}</b><div style="font-size:10.5px;color:var(--muted);">${g.rows.slice(0, 6).map(r => `${escapeAttr(r.tanggal.slice(8))}: ${fmtNum(r.qty)} di ${escapeAttr(ENTITY_LABEL[r.entitas] || r.entitas)}${r.entitasManual ? ' (manual)' : ''}`).join(' · ')}${g.rows.length > 6 ? ' …' : ''}</div></td>
+        <td style="text-align:right;">${fmtNum(g.qty)}</td><td style="text-align:right;">${fmtMoney(Math.round(g.modal))}</td><td style="text-align:right;">${fmtMoney(Math.round(g.nilai))}</td>
+        <td><button class="btn secondary small" data-gk="${escapeAttr(normalizeName(g.nama))}">↩ Pindah ke ${escapeAttr(ENTITY_LABEL[entitas] || entitas)}</button></td></tr>`).join('');
+    document.getElementById('sel-body').innerHTML = info + `<div style="max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:8px;"><table class="dtable" style="font-size:11.5px;"><thead><tr><th>Produk (sekarang tercatat di entitas lain)</th><th>Qty</th><th>Harga Modal</th><th>Nilai</th><th></th></tr></thead><tbody>${body || '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:12px;">Tidak ada kandidat — semua penjualan produk di daftar ' + escapeAttr(ENTITY_LABEL[entitas] || entitas) + ' periode ini memang tercatat di ' + escapeAttr(ENTITY_LABEL[entitas] || entitas) + '.</td></tr>'}</tbody></table></div>`;
+    document.querySelectorAll('#sel-body [data-gk]').forEach(btn => btn.addEventListener('click', () => {
+      const g = groups.get(btn.dataset.gk); if (!g) return;
+      if (!confirm(`Pindahkan ${g.rows.length} penjualan "${g.nama}" (${fmtNum(g.qty)} pcs, ${label}) ke ${ENTITY_LABEL[entitas]}?\nPenjualan ini akan dikunci manual di ${ENTITY_LABEL[entitas]} dan tidak akan pindah lagi.`)) return;
+      g.rows.forEach(r => { r.entitas = entitas; r.status = 'OK'; r.entitasManual = true; r.nama = g.nama; });
+      gsjDetailedAudit(`mengembalikan ${g.rows.length} penjualan <b>${escapeAttr(g.nama)}</b> (${fmtNum(g.qty)} pcs, ${escapeAttr(label)}) ke <b>${escapeAttr(ENTITY_LABEL[entitas])}</b> lewat "Cari selisih"`);
+      recomputeAllCheckerRows(); saveState();
+      groups.delete(btn.dataset.gk); list.splice(list.indexOf(g), 1);
+      const nt = computeStokTerjualRekap(entitas, rg.start, rg.end).reduce((a, x) => { a.mp += x.terjualMP; a.bayar += x.totalPembayaran; return a; }, { mp: 0, bayar: 0 });
+      tot.mp = nt.mp; tot.bayar = nt.bayar;
+      document.getElementById('sel-now').textContent = `${fmtNum(tot.mp)} pcs · ${fmtMoney(Math.round(tot.bayar))}`;
+      draw();
+      if (typeof renderTab3Table === 'function') renderTab3Table();
+    }));
+  };
+  showConfirmModal('🔍 Cari Selisih Rekap ' + (ENTITY_LABEL[entitas] || entitas) + ' — ' + label, `<div style="font-size:12px;">
+    <p style="margin:0 0 6px;">Sekarang: <b id="sel-now">${fmtNum(tot.mp)} pcs · ${fmtMoney(Math.round(tot.bayar))}</b>. Isi angka yang <b>seharusnya</b>, kandidat yang pas akan ditandai ✅.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+      <label>Terjual seharusnya <input id="sel-tq" type="number" style="width:90px;padding:4px 6px;border:1px solid var(--line);border-radius:6px;"></label>
+      <label>Total Pembayaran seharusnya <input id="sel-tr" type="text" placeholder="22749090" style="width:130px;padding:4px 6px;border:1px solid var(--line);border-radius:6px;"></label>
+    </div>
+    <div id="sel-body"></div></div>`);
+  ['sel-tq', 'sel-tr'].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener('input', draw); });
+  if (prefill) { const a = document.getElementById('sel-tq'), b = document.getElementById('sel-tr'); if (a) a.value = prefill.qty; if (b) b.value = prefill.rp; }
+  draw();
+}
+
+// ---------- Perbaikan sekali jalan: Rekap GSM 1–15 Sep 2026 balik ke 1.177 / Rp22.749.090 ----------
+// Ada 4 pcs (Rp151.680) penjualan GSM yang terlanjur pindah ke entitas lain di versi sebelumnya.
+// Dicari otomatis: penjualan 1–15 Sep yang sekarang di HNH/GSJ, produknya ada di daftar GSM, dan
+// jumlah + nilainya PAS dengan selisih. Kalau ketemu tepat satu kemungkinan -> langsung dikembalikan
+// ke GSM (dikunci manual). Kalau tidak pasti -> jendela "Cari selisih" dibuka dengan angka terisi.
+function gsjRestoreGsmRekapSep2026() {
+  const KEY = 'fixRekapGsmSep2026';
+  if (!state.settings || state.settings[KEY]) return;
+  const ent = 'Gracia', rg = { start: '2026-09-01', end: '2026-09-15' };
+  const T_QTY = 1177, T_RP = 22749090;
+  const cur = gsjRekapTotals(ent, rg);
+  const dq = T_QTY - cur.mp, dr = T_RP - Math.round(cur.bayar);
+  if (dq === 0 && Math.abs(dr) < 2) { state.settings[KEY] = 'ok'; saveState(); return; }
+  if (dq <= 0 || dr <= 0) return; // angkanya sudah berubah ke arah lain — jangan diutak-atik otomatis
+  const groups = [...gsjRekapCandidates(ent, rg).values()];
+  // cari kombinasi 1–3 kelompok produk yang qty & nilainya pas
+  const hits = [];
+  const n = groups.length;
+  for (let i = 0; i < n; i++) {
+    const a = groups[i];
+    if (a.qty === dq && Math.abs(a.nilai - dr) < 2) hits.push([a]);
+    for (let j = i + 1; j < n && hits.length < 3; j++) {
+      const b = groups[j];
+      if (a.qty + b.qty === dq && Math.abs(a.nilai + b.nilai - dr) < 2) hits.push([a, b]);
+      for (let k = j + 1; k < n && hits.length < 3; k++) {
+        const c = groups[k];
+        if (a.qty + b.qty + c.qty === dq && Math.abs(a.nilai + b.nilai + c.nilai - dr) < 2) hits.push([a, b, c]);
+      }
+    }
+    if (hits.length >= 3) break;
+  }
+  if (hits.length === 1) {
+    const names = hits[0].map(g => g.nama);
+    hits[0].forEach(g => g.rows.forEach(r => { r.entitas = ent; r.status = 'OK'; r.entitasManual = true; r.nama = g.nama; }));
+    recomputeAllCheckerRows();
+    const after = gsjRekapTotals(ent, rg);
+    state.settings[KEY] = 'restored';
+    gsjDetailedAudit(`mengembalikan otomatis penjualan <b>${names.map(escapeAttr).join(', ')}</b> (${fmtNum(dq)} pcs) ke <b>GSM</b> — Rekap GSM 1–15 Sep 2026 kembali ke ${fmtNum(after.mp)} / ${fmtMoney(Math.round(after.bayar))}`);
+    saveState();
+    if (typeof gsjScheduleRemoteRerender === 'function') gsjScheduleRemoteRerender();
+    setTimeout(() => alert(`✅ Rekap GSM 1–15 September 2026 sudah dikembalikan:\n${fmtNum(after.mp)} pcs · ${fmtMoney(Math.round(after.bayar))}\n\nPenjualan yang dikembalikan ke GSM: ${names.join(', ')} (${fmtNum(dq)} pcs). Sudah dikunci, tidak akan pindah lagi.`), 300);
+    return;
+  }
+  // Tidak pasti -> jangan menebak & jangan memunculkan jendela; tombol "Cari selisih" tetap ada.
 }
 
 let tab3BrowseMonth = null; // bulan yang sedang di-browse untuk daftar chip tanggal — mirip tab2BrowseMonth
@@ -8918,6 +9316,7 @@ function renderTab4MasterTable() {
         if (!row) return;
         const oldVal = input.dataset.oldValue || '';
         row[input.dataset.field] = input.value;
+        if (input.dataset.field === 'entitasTetap') row.tetapAt = new Date().toISOString();
         if (input.dataset.field === 'namaInternal' && row.belumDirapikan && normalizeName(row.namaInternal) !== normalizeName(row.namaMarketplace)) {
           row.belumDirapikan = false; // sudah dirapikan manual dari sini juga, nggak lagi dianggap "mentah"
         }
@@ -8927,7 +9326,10 @@ function renderTab4MasterTable() {
         if (String(oldVal) !== String(input.value)) {
           gsjDetailedAudit(`mengubah <b>${escapeAttr(input.dataset.field)}</b> Master Produk (${escapeAttr(row.namaInternal || row.namaMarketplace || '')}) dari "${escapeAttr(oldVal)}" menjadi "${escapeAttr(input.value)}"`);
         }
-        invalidateMasterProdukIndex();
+        // Ganti Entitas Tetap / catatan saja tidak mengubah pencocokan nama -> jangan bangun ulang
+        // seluruh indeks (berat); cukup perbarui peta Entitas Tetap.
+        if (input.dataset.field === 'entitasTetap') refreshTetapIndex();
+        else invalidateMasterProdukIndex();
         saveState();
         refreshMasterProdukDatalist();
         renderTab4ComboFilter();
@@ -9433,12 +9835,24 @@ function initModal() {
 }
 
 function initQuickSave() {
-  document.getElementById('btnQuickSave').addEventListener('click', () => {
-    const ok = saveState();
-    const btn = document.getElementById('btnQuickSave');
-    const original = btn.textContent;
-    btn.textContent = ok ? '✓ Tersimpan' : '✗ Gagal simpan';
-    setTimeout(() => { btn.textContent = original; }, 1500);
+  // Data sebenarnya tersimpan & terkirim otomatis. Tombol ini = "kirim SEKARANG juga" (tidak
+  // menunggu jeda otomatis) — berguna sebelum menutup aplikasi / pindah laptop.
+  const btnQS = document.getElementById('btnQuickSave');
+  btnQS.title = 'Data tersimpan otomatis. Klik ini untuk memaksa semua perubahan langsung terkirim ke server sekarang (mis. sebelum tutup aplikasi / pindah laptop).';
+  btnQS.addEventListener('click', async () => {
+    const btn = btnQS;
+    const original = '💾 Simpan';
+    saveState();
+    btn.textContent = '⏳ Mengirim…';
+    try {
+      if (typeof GSJ_SYNC_TABLES !== 'undefined' && typeof gsjFlushSyncNow === 'function') {
+        Object.keys(GSJ_SYNC_TABLES).forEach(k => { try { gsjFlushSyncNow(k); } catch (e) {} });
+      }
+      if (typeof gsjPushSettings === 'function') { clearTimeout(gsjSyncDebounceTimers.settings); await gsjPushSettings(); }
+      if (typeof gsjPushLists === 'function') { clearTimeout(gsjSyncDebounceTimers.lists); await gsjPushLists(); }
+      btn.textContent = '✓ Terkirim ke server';
+    } catch (e) { btn.textContent = '✗ Gagal kirim'; }
+    setTimeout(() => { btn.textContent = original; }, 2000);
   });
 }
 
@@ -11963,6 +12377,7 @@ function gsjUpdateSyncIndicator() {
 
 async function gsjDiffAndPushTable(key) {
   if (!gsjSupabase || gsjIsApplyingRemoteChange) return;
+  const pushSince = new Date(Date.now() - 5000).toISOString(); // device lain cukup ambil baris yang berubah sejak ini
   if (GSJ_OPTIONAL_TABLES[key] && window.__gsjMissing[key]) return; // tabelnya belum dibuat — data tetap aman di lokal
   const table = GSJ_SYNC_TABLES[key];
   const arr = Array.isArray(state[key]) ? state[key] : [];
@@ -11977,6 +12392,7 @@ async function gsjDiffAndPushTable(key) {
     }
   });
   let deletedIds = Object.keys(gsjSyncBaseline[key]).filter(id => !currentIds.has(id));
+  const deletedAll = deletedIds.slice();
   const delHints = gsjServerDeleteHints[key] || [];
   gsjServerDeleteHints[key] = [];
   if (!upserts.length && !deletedIds.length) return;
@@ -12032,7 +12448,7 @@ async function gsjDiffAndPushTable(key) {
     await runBatches(upserts, UPSERT_BATCH, c => { c.__done = upChunksDone; return gsjSupabase.from(table).upsert(c); });
     await runBatches(deletedIds, DELETE_BATCH, c => { c.__done = delChunksDone; return gsjSupabase.from(table).delete().in('id', c); });
     // Perubahan massal: kabari device lain supaya langsung ambil ulang tabel ini (event per baris bisa hilang).
-    if (isBulk) gsjBroadcastBulk(key);
+    if (isBulk) gsjBroadcastBulk(key, { since: pushSince, deleted: deletedAll.length <= 3000 ? deletedAll : null });
     if (gsAffected && gsAffected.size && typeof gsheetQueue === 'function') gsheetQueue(gsAffected);
     gsjSupabaseOnline = true;
     clearTimeout(gsjSyncRetryTimers[key]);
@@ -12070,9 +12486,81 @@ function gsjFlushSyncNow(key) {
   gsjSyncDebounceTimers[key] = null;
   return gsjDiffAndPushTable(key);
 }
+// "Hapus dari daftar Stok Terjual" (hiddenProducts) & keputusan dobel DULU tidak ikut tersimpan
+// ke server — cuma di browser, dan cadangan browser itu gagal tersimpan kalau data sudah besar.
+// Akibatnya produk yang sudah dihapus (mis. Bubble Wrap) muncul lagi. Sekarang ikut disimpan di server.
+function gsjSettingsPayload() {
+  return { settings: state.settings, hargaModalOverride: state.hargaModalOverride || {} };
+}
+// Daftar "produk disembunyikan" & keputusan dobel disimpan di baris TERSENDIRI (gsj_settings id
+// 'lists') dan selalu DIGABUNG (bukan ditimpa) — dulu ikut baris 'main', jadi laptop yang masih
+// pakai versi lama menimpanya dengan data tanpa daftar ini -> Bubble Wrap muncul lagi.
+const GSJ_LISTS_ID = 'lists';
+const gsjHiddenKey = h => (h.entitas || '') + '||' + normalizeName(h.nama);
+function gsjMergeLists(a, b) {
+  return {
+    hiddenProducts: gsjMergeByKey((a && a.hiddenProducts) || [], (b && b.hiddenProducts) || [], gsjHiddenKey),
+    dobelResolutions: gsjMergeByKey((a && a.dobelResolutions) || [], (b && b.dobelResolutions) || [], x => x.key),
+    entityMoves: gsjMergeByKey((a && a.entityMoves) || [], (b && b.entityMoves) || [], x => x.id)
+      .filter(x => !(((a && a.entityMovesDone) || []).concat((b && b.entityMovesDone) || [])).includes(x.id))
+      .sort((x, y) => String(x.at).localeCompare(String(y.at))).slice(-400),
+    entityMovesDone: [...new Set(((a && a.entityMovesDone) || []).concat((b && b.entityMovesDone) || []))].slice(-800),
+  };
+}
+function gsjListsLocal() { return { hiddenProducts: state.hiddenProducts || [], dobelResolutions: state.dobelResolutions || [], entityMoves: state.entityMoves || [], entityMovesDone: state.entityMovesDone || [] }; }
+let gsjListsBaselineJSON = null;
+function gsjApplyLists(merged) {
+  const before = JSON.stringify(gsjListsLocal());
+  state.hiddenProducts = merged.hiddenProducts;
+  state.dobelResolutions = merged.dobelResolutions;
+  state.entityMoves = merged.entityMoves;
+  state.entityMovesDone = merged.entityMovesDone;
+  if (JSON.stringify(gsjListsLocal()) !== before) {
+    gsjRemoteTouchedKeys.add('hiddenProducts'); gsjRemoteTouchedKeys.add('dobelResolutions');
+    gsjRemoteTouchedKeys.add('entityMoves'); gsjRemoteTouchedKeys.add('entityMovesDone');
+    if (typeof gsjUpdateMovesBadge === 'function') setTimeout(gsjUpdateMovesBadge, 0);
+    return true;
+  }
+  return false;
+}
+async function gsjPushLists() {
+  if (!gsjSupabase) return;
+  try {
+    const cur = await gsjSupabase.from('gsj_settings').select('data').eq('id', GSJ_LISTS_ID).maybeSingle();
+    if (cur.error) throw cur.error;
+    const merged = gsjMergeLists((cur.data && cur.data.data) || {}, gsjListsLocal());
+    gsjIsApplyingRemoteChange = true; const changedLocal = gsjApplyLists(merged); gsjIsApplyingRemoteChange = false;
+    const json = JSON.stringify(merged);
+    if (json !== JSON.stringify((cur.data && cur.data.data) || {})) {
+      const up = await gsjSupabase.from('gsj_settings').upsert({ id: GSJ_LISTS_ID, data: merged, updated_at: new Date().toISOString(), updated_by: GSJ_SESSION_ID });
+      if (up.error) throw up.error;
+    }
+    gsjListsBaselineJSON = json;
+    if (changedLocal) gsjScheduleRemoteRerender();
+  } catch (e) { gsjIsApplyingRemoteChange = false; console.warn('Gagal simpan daftar produk tersembunyi:', e); }
+}
+function gsjScheduleListsSync() {
+  if (!gsjSupabase) return;
+  clearTimeout(gsjSyncDebounceTimers.lists);
+  gsjSyncDebounceTimers.lists = setTimeout(gsjPushLists, 500);
+}
+function gsjOnRemoteLists(payload) {
+  const data = payload && payload.new && payload.new.data;
+  if (!data) { gsjPushLists(); return; }
+  gsjIsApplyingRemoteChange = true;
+  const changed = gsjApplyLists(gsjMergeLists(gsjListsLocal(), data));
+  gsjIsApplyingRemoteChange = false;
+  if (changed) gsjScheduleRemoteRerender();
+}
+function gsjMergeByKey(a, b, keyFn) {
+  const m = new Map();
+  (a || []).forEach(x => { if (x) m.set(keyFn(x), x); });
+  (b || []).forEach(x => { if (x) m.set(keyFn(x), x); });
+  return [...m.values()];
+}
 async function gsjPushSettings() {
   if (!gsjSupabase || gsjIsApplyingRemoteChange) return;
-  const payload = { settings: state.settings, hargaModalOverride: state.hargaModalOverride || {} };
+  const payload = gsjSettingsPayload();
   const json = JSON.stringify(payload);
   if (json === gsjSettingsBaselineJSON) return;
   try {
@@ -12172,15 +12660,23 @@ async function gsjInitialSyncFromSupabase() {
       }
       state[k] = remote.concat(optLocalOnly[k]);
     });
+    let gsjSettingsNeedPush = false;
     if (setRes.data && setRes.data.data) {
-      state.settings = Object.assign({}, state.settings, setRes.data.data.settings || {});
-      state.hargaModalOverride = setRes.data.data.hargaModalOverride || state.hargaModalOverride || {};
+      const sd = setRes.data.data;
+      state.settings = Object.assign({}, state.settings, sd.settings || {});
+      state.hargaModalOverride = sd.hargaModalOverride || state.hargaModalOverride || {};
+      // Sisa dari versi sebelumnya yang sempat menaruh daftar ini di baris 'main' -> ikut digabung.
+      if (Array.isArray(sd.hiddenProducts) || Array.isArray(sd.dobelResolutions)) {
+        const m = gsjMergeLists(gsjListsLocal(), sd); state.hiddenProducts = m.hiddenProducts; state.dobelResolutions = m.dobelResolutions;
+      }
     }
+    setTimeout(() => { if (typeof gsjPushLists === 'function') gsjPushLists(); }, 300); // ambil + gabung + simpan daftar tersembunyi
     ['invoices', 'checkerRows', 'masterProduk', 'adjustments', 'salesInvoices', 'omsetBulanan'].forEach(key => {
       gsjSyncBaseline[key] = {};
       (state[key] || []).forEach(rec => { if (rec && rec.id) gsjSyncBaseline[key][rec.id] = JSON.stringify(rec); });
     });
-    gsjSettingsBaselineJSON = JSON.stringify({ settings: state.settings, hargaModalOverride: state.hargaModalOverride || {} });
+    gsjSettingsBaselineJSON = gsjSettingsNeedPush ? '' : JSON.stringify(gsjSettingsPayload());
+    if (gsjSettingsNeedPush) setTimeout(() => { if (typeof gsjPushSettings === 'function') gsjPushSettings(); }, 1500);
     // Data yang cuma ada di lokal dianggap BELUM tersinkron, supaya ikut terkirim ke Supabase.
     Object.keys(optLocalOnly).forEach(k => optLocalOnly[k].forEach(rec => { delete gsjSyncBaseline[k][rec.id]; }));
     gsjIsApplyingRemoteChange = false;
@@ -12212,8 +12708,8 @@ function gsjScheduleRemoteRerender() {
   // ada event beruntun malah terus mundur). Sekarang throttle: perubahan pertama tampil ~0,15 detik,
   // event berikutnya digabung dan dirender maksimal 1x per detik (2 dtk saat import/hapus massal).
   if (gsjRemoteRenderTimer) return; // sudah terjadwal — nanti otomatis pakai state terbaru
-  const gap = gsjRemoteBurst >= 50 ? 2000 : 1000;
-  const delay = Math.max(150, gap - (Date.now() - gsjLastRemoteRenderAt));
+  const gap = gsjRemoteBurst >= 50 ? 1200 : 600;
+  const delay = Math.max(80, gap - (Date.now() - gsjLastRemoteRenderAt));
   // Debounce dinaikkan dari 500ms -> 1500ms: kalau ada banyak perubahan beruntun (misal orang
   // lain lagi mengetik/edit terus-menerus, atau import ratusan baris), ini menampung SEMUANYA
   // dan cuma render ulang SEKALI setiap 1,5 detik, bukan berkali-kali dalam hitungan detik yang
@@ -12344,7 +12840,13 @@ function gsjSetupBulkChannel() {
       if (gsjBulkIncoming[payload.key]) { clearTimeout(gsjBulkIncoming[payload.key].timer); delete gsjBulkIncoming[payload.key]; gsjUpdateSyncIndicator(); }
       // Langsung ambil ulang tabel itu dari server (tidak menunggu ribuan event per baris).
       clearTimeout(gsjSetupBulkChannel['_t' + payload.key]);
-      gsjSetupBulkChannel['_t' + payload.key] = setTimeout(() => gsjReconcileWithServer([payload.key], true), 200);
+      const pk = payload.key, since = payload.since, del = payload.deleted;
+      gsjSetupBulkChannel['_t' + pk] = setTimeout(async () => {
+        let ok = false;
+        try { ok = (since && (Array.isArray(del) || del === undefined)) ? await gsjApplyBulkIncremental(pk, since, del || []) : false; } catch (e) { ok = false; }
+        if (!ok) gsjReconcileWithServer([pk], true); // cadangan: ambil ulang seluruh tabel
+        else setTimeout(() => gsjReconcileWithServer([pk], false), 4000); // cek jumlah baris saja (ringan)
+      }, 100);
     })
     .subscribe();
 }
@@ -12381,14 +12883,64 @@ function gsjOnRemoteBulkStart(p) {
   }
   gsjUpdateSyncIndicator();
 }
-function gsjBroadcastBulk(key) {
+function gsjBroadcastBulk(key, extra) {
   if (!gsjBulkChannel) return;
-  try { gsjBulkChannel.send({ type: 'broadcast', event: 'bulk', payload: { key, by: GSJ_SESSION_ID } }); } catch (e) {}
+  try { gsjBulkChannel.send({ type: 'broadcast', event: 'bulk', payload: Object.assign({ key, by: GSJ_SESSION_ID }, extra || {}) }); } catch (e) {}
+}
+// Device lain selesai upload massal: ambil HANYA baris yang berubah (kolom updated_at) + hapus id
+// yang dikirim di sinyal — jauh lebih cepat daripada mengunduh ulang seluruh tabel (belasan MB).
+async function gsjApplyBulkIncremental(key, since, deletedIds) {
+  if (!gsjSupabase || !since) return false;
+  if (gsjSyncDebounceTimers[key] || gsjSyncRetryTimers[key] || gsjPushInFlight[key]) return false;
+  const table = GSJ_SYNC_TABLES[key];
+  const PAGE = 1000;
+  const got = [];
+  for (let from = 0; ; from += PAGE) {
+    const r = await gsjSupabase.from(table).select('id,data').gte('updated_at', since).order('id', { ascending: true }).range(from, from + PAGE - 1);
+    if (r.error) return false;
+    (r.data || []).forEach(x => got.push(x));
+    if (!r.data || r.data.length < PAGE) break;
+  }
+  if (gsjSyncDebounceTimers[key] || gsjSyncRetryTimers[key] || gsjPushInFlight[key]) return false; // user sempat edit
+  gsjIsApplyingRemoteChange = true;
+  gsjRemoteTouchedKeys.add(key);
+  if (!Array.isArray(state[key])) state[key] = [];
+  let arr = state[key];
+  if (Array.isArray(deletedIds) && deletedIds.length) {
+    const del = new Set(deletedIds);
+    arr = arr.filter(rec => !(rec && del.has(rec.id)));
+    deletedIds.forEach(id => { delete gsjSyncBaseline[key][id]; });
+  }
+  const pos = new Map(); arr.forEach((rec, i) => { if (rec && rec.id) pos.set(rec.id, i); });
+  got.forEach(x => {
+    const rec = x.data; if (!rec || !rec.id) return;
+    const i = pos.get(rec.id);
+    if (i !== undefined) arr[i] = rec; else { pos.set(rec.id, arr.length); arr.push(rec); }
+    gsjSyncBaseline[key][rec.id] = JSON.stringify(rec);
+  });
+  state[key] = arr;
+  gsjIdxCache[key] = null;
+  gsjIsApplyingRemoteChange = false;
+  gsjScheduleRemoteRerender();
+  return true;
 }
 function gsjReconcileIfStale() { if (Date.now() - gsjLastReconcileAt > 30000) gsjScheduleReconcile(300); }
 window.addEventListener('focus', gsjReconcileIfStale);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') gsjReconcileIfStale(); });
 
+const gsjIdxCache = {};
+function gsjFindIdx(key, arr, id) {
+  let c = gsjIdxCache[key];
+  if (!c || c.arr !== arr || c.len !== arr.length) {
+    const map = new Map(); arr.forEach((r, i) => { if (r && r.id) map.set(r.id, i); });
+    c = gsjIdxCache[key] = { arr, len: arr.length, map };
+  }
+  const i = c.map.get(id);
+  if (i !== undefined && arr[i] && arr[i].id === id) return i;
+  const j = arr.findIndex(r => r && r.id === id); // indeks basi -> cari manual sekali, lalu bangun ulang
+  gsjIdxCache[key] = null;
+  return j;
+}
 function gsjApplyRemoteRowChange(key, payload) {
   gsjRemoteTouchedKeys.add(key);
   gsjIsApplyingRemoteChange = true;
@@ -12397,15 +12949,15 @@ function gsjApplyRemoteRowChange(key, payload) {
   if (payload.eventType === 'DELETE') {
     const id = payload.old && payload.old.id;
     if (id) {
-      const idx = arr.findIndex(r => r && r.id === id);
-      if (idx !== -1) arr.splice(idx, 1);
+      const idx = gsjFindIdx(key, arr, id);
+      if (idx !== -1) { arr.splice(idx, 1); gsjIdxCache[key] = null; }
       delete gsjSyncBaseline[key][id];
     }
   } else {
     const rec = payload.new && payload.new.data;
     if (rec && rec.id) {
-      const idx = arr.findIndex(r => r && r.id === rec.id);
-      if (idx !== -1) arr[idx] = rec; else arr.push(rec);
+      const idx = gsjFindIdx(key, arr, rec.id);
+      if (idx !== -1) arr[idx] = rec; else { arr.push(rec); const c = gsjIdxCache[key]; if (c && c.arr === arr) { c.map.set(rec.id, arr.length - 1); c.len = arr.length; } }
       gsjSyncBaseline[key][rec.id] = JSON.stringify(rec);
     }
   }
@@ -12431,7 +12983,7 @@ function gsjApplyRemoteSettingsChange(payload) {
   gsjRemoteTouchedKeys.add('settings'); gsjRemoteTouchedKeys.add('hargaModalOverride');
   state.settings = Object.assign({}, state.settings, data.settings || {});
   state.hargaModalOverride = data.hargaModalOverride || state.hargaModalOverride || {};
-  gsjSettingsBaselineJSON = JSON.stringify(data);
+  gsjSettingsBaselineJSON = JSON.stringify(gsjSettingsPayload());
   gsjIsApplyingRemoteChange = false;
   gsjScheduleRemoteRerender();
 }
@@ -12475,6 +13027,13 @@ function gsjSetupRealtimeSubscriptions() {
       if (payload.new && payload.new.id && payload.new.id !== 'main') return;
       if (payload.new && payload.new.updated_by === GSJ_SESSION_ID) return;
       gsjApplyRemoteSettingsChange(payload);
+    })
+    .subscribe();
+  gsjSupabase.channel('gsj_ch_lists')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'gsj_settings', filter: 'id=eq.' + GSJ_LISTS_ID }, (payload) => {
+      if (payload.eventType === 'DELETE' || !payload.new || payload.new.id !== GSJ_LISTS_ID) return;
+      if (payload.new.updated_by === GSJ_SESSION_ID) return;
+      gsjOnRemoteLists(payload);
     })
     .subscribe();
   // Riwayat "Batalkan Import" ikut realtime ke semua device.
@@ -12863,6 +13422,16 @@ function gsjBootMainApp() {
     gsjSetupRealtimeSubscriptions();
     if (ok) {
       try { gsjFixMarketplaceSuratJalan(); } catch (e) { console.warn(e); }
+      try { gsjAdoptWaterfallLocks(); } catch (e) { console.warn(e); }
+      setTimeout(() => {
+        // Sekali jalan setelah perbaikan aturan "GSM dicek dulu sebelum tambah stok HNH":
+        // hitung ulang semua penjualan supaya yang terlanjur pindah (mis. Surgical Gown M
+        // 4 pcs tgl 7 Sep) kembali ke GSM.
+        try {
+          if (!state.settings.rulesV3) { recomputeAllCheckerRows(); state.settings.rulesV3 = true; saveState(); if (typeof gsjScheduleRemoteRerender === 'function') gsjScheduleRemoteRerender(); }
+        } catch (e) { console.warn(e); }
+        try { gsjRestoreGsmRekapSep2026(); } catch (e) { console.warn(e); }
+      }, 1500);
       iuRemoteInit();
     }
   });
@@ -12951,6 +13520,128 @@ document.addEventListener('DOMContentLoaded', () => {
     };
   }));
 })();
+
+// ================= DIAGNOSA LAG =================
+// Mencatat aksi yang bikin layar macet (>150 ms) — fungsi apa, berapa lama, kapan — supaya kalau
+// masih terasa lemot, cukup buka "⏱️ Cek lag" (pojok kiri bawah, atau Ctrl+Shift+L) lalu screenshot.
+(function gsjInstallLagDiag() {
+  const LOG = [];
+  window.__lagLog = LOG;
+  let depth = 0, stack = [];
+  const fns = ['recomputeAllCheckerRows', 'saveState', 'renderTab1', 'renderTab2', 'renderTab3', 'renderTab4', 'renderTab5', 'renderTab6', 'renderTab8', 'renderTab9',
+    'renderTab2Table', 'renderTab2TableKeepScroll', 'renderTab3Table', 'renderTab3TableKeepScroll', 'renderTab4MasterTable', 'renderTab4Stock',
+    'onGlobalDataChange', 'computeAllStock', 'computeStokTerjualPivot', 'gsjReconcileWithServer', 'gsjFetchAll', 'gsjDiffAndPushTable', 'gsjApplyRemoteRowChange',
+    'setProductEntitasFromRow', 'mergeProductNames', 'mergeProductNamesBulk', 'gsjAdoptWaterfallLocks', 'refreshMasterProdukDatalist', 'updateTab6BadgeCount',
+    'iuUndo', 'gsheetFlush', 'renderAllTabs', 'renderTabByKey'];
+  const add = (name, ms, note) => {
+    LOG.push({ at: new Date(), name, ms: Math.round(ms), note: note || '' });
+    if (LOG.length > 300) LOG.shift();
+  };
+  fns.forEach(fn => {
+    const orig = window[fn];
+    if (typeof orig !== 'function' || orig.__lagWrapped) return;
+    const w = function () {
+      const t0 = performance.now(); stack.push(fn); depth++;
+      let r;
+      try { r = orig.apply(this, arguments); }
+      finally {
+        depth--; stack.pop();
+        const ms = performance.now() - t0;
+        if (ms > 150 && !(r && typeof r.then === 'function')) add(fn, ms, stack.length ? 'di dalam ' + stack[stack.length - 1] : '');
+      }
+      if (r && typeof r.then === 'function') r.then(() => { const ms = performance.now() - t0; if (ms > 1500) add(fn + ' (server)', ms, 'menunggu jaringan'); }, () => {});
+      return r;
+    };
+    w.__lagWrapped = true;
+    window[fn] = w;
+  });
+  // Macet yang tidak tertangkap fungsi di atas (browser "Long Task").
+  try {
+    new PerformanceObserver(list => list.getEntries().forEach(e => { if (e.duration > 300) add('(layar macet)', e.duration, 'tugas panjang browser'); }))
+      .observe({ entryTypes: ['longtask'] });
+  } catch (e) {}
+  function sizes() {
+    const n = k => (Array.isArray(state[k]) ? state[k].length : 0).toLocaleString('id-ID');
+    let mem = '';
+    try { if (performance.memory) mem = ` · memori tab ${Math.round(performance.memory.usedJSHeapSize / 1e6)} MB`; } catch (e) {}
+    return `Master ${n('masterProduk')} · Penjualan ${n('checkerRows')} · Penyesuaian ${n('adjustments')} · Faktur ${n('invoices')}${mem}`;
+  }
+  function show() {
+    const rows = LOG.slice().reverse().slice(0, 40).map(x => `<tr><td style="white-space:nowrap;">${x.at.toLocaleTimeString('id-ID')}</td><td>${x.name}</td><td style="text-align:right;font-weight:700;color:${x.ms > 1000 ? 'var(--red)' : x.ms > 400 ? '#b45309' : 'inherit'};">${x.ms.toLocaleString('id-ID')} ms</td><td style="color:var(--muted);">${x.note}</td></tr>`).join('');
+    const worst = LOG.slice().sort((a, b) => b.ms - a.ms).slice(0, 5).map(x => `${x.name} ${x.ms.toLocaleString('id-ID')} ms`).join(' · ');
+    const html = `<div style="font-size:12px;">
+      <p style="margin:0 0 6px;"><b>Versi aplikasi:</b> ${(document.getElementById('app-version') || {}).textContent || '-'}<br><b>Data:</b> ${sizes()}</p>
+      <p style="margin:0 0 6px;"><b>Paling lama:</b> ${worst || 'belum ada aksi yang lambat (&gt;150 ms) 👍'}</p>
+      <div style="max-height:320px;overflow:auto;border:1px solid var(--line);border-radius:8px;"><table class="dtable" style="font-size:11.5px;"><thead><tr><th>Jam</th><th>Proses</th><th>Lama</th><th>Keterangan</th></tr></thead><tbody>${rows || '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:12px;">Belum ada catatan.</td></tr>'}</tbody></table></div>
+      <p style="margin:8px 0 0;color:var(--muted);">Screenshot jendela ini lalu kirim ke Claude kalau masih terasa lemot.</p></div>`;
+    if (typeof showConfirmModal === 'function') showConfirmModal('⏱️ Cek Lag', html); else alert(LOG.map(x => x.name + ' ' + x.ms + 'ms').join('\n'));
+  }
+  window.gsjShowLagDiag = show;
+  document.addEventListener('click', e => { const a = e.target.closest && e.target.closest('#diag-open'); if (a) { e.preventDefault(); show(); } });
+  document.addEventListener('keydown', e => { if (e.ctrlKey && e.shiftKey && (e.key === 'L' || e.key === 'l')) { e.preventDefault(); show(); } });
+})();
+
+// ================= RIWAYAT PINDAH ENTITAS =================
+
+// Keterangan kecil di kolom Status (Import Marketplace) — tampilan ringkas & formal.
+const GSJ_ENT_SHORT = { Gracia: 'GSM', HNH: 'HNH', Glomed: 'GSJ' };
+function gsjRowNoteHTML(r) {
+  let html = '';
+  if (r.splitInfo) {
+    // splitInfo: "GSJ (Glomed) 14 + HNH 1 (pesanan 15)" -> "GSJ 14 · HNH 1", total 15
+    const m = String(r.splitInfo).match(/\(pesanan (\d+)\)/);
+    const parts = String(r.splitInfo).replace(/\s*\(pesanan \d+\)\s*$/, '').split(' + ').map(x => x.replace(/^GSM \(Gracia\)/, 'GSM').replace(/^GSJ \(Glomed\)/, 'GSJ'));
+    html += `<div class="row-note row-note-split" title="Stok satu entitas tidak mencukupi, sehingga pesanan ini dibagi otomatis ke beberapa entitas. Harga satuan sama; total pembayaran tetap sama.">
+      <span class="rn-label">Pesanan dibagi</span><span class="rn-val">${escapeAttr(parts.join(' · '))}</span>${m ? `<span class="rn-sub">dari ${escapeAttr(m[1])} pcs</span>` : ''}</div>`;
+  }
+  if (r.autoTopUpQty) {
+    html += `<div class="row-note row-note-topup" title="Stok di semua entitas tidak mencukupi. Kekurangan ditambahkan otomatis ke stok HNH (kolom Penambahan di Stok Terjual HNH).">
+      <span class="rn-label">Stok ditambahkan</span><span class="rn-val">+${fmtNum(r.autoTopUpQty)} ke ${escapeAttr(GSJ_ENT_SHORT[r.entitas] || r.entitas)}</span></div>`;
+  }
+  return html;
+}
+function gsjUpdateMovesBadge() {
+  const el = document.getElementById('moves-badge');
+  if (el) { const n = (state.entityMoves || []).length; el.textContent = n ? '(' + n + ')' : ''; }
+}
+function gsjShowMoves() {
+  const moves = (state.entityMoves || []).slice().reverse();
+  const lbl = e => e === 'PERLU_KONFIRMASI' ? 'Perlu Konfirmasi' : (ENTITY_LABEL[e] || e);
+  const rows = moves.slice(0, 200).map(m => `<tr data-mid="${escapeAttr(m.id)}">
+      <td style="white-space:nowrap;">${escapeAttr(m.tanggal || '')}</td><td>${escapeAttr(m.nama || '')}</td><td style="text-align:right;">${escapeAttr(String(m.qty || ''))}</td>
+      <td style="white-space:nowrap;"><b>${escapeAttr(lbl(m.from))}</b> → ${escapeAttr(lbl(m.to))}</td>
+      <td style="white-space:nowrap;color:var(--muted);">${new Date(m.at).toLocaleString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</td>
+      <td style="white-space:nowrap;"><button class="btn secondary small" data-act="back">↩ Kembalikan</button> <button class="btn secondary small" data-act="ok" title="Perpindahan ini memang benar">✓</button></td></tr>`).join('');
+  const html = `<div style="font-size:12px;">
+    <p style="margin:0 0 6px;">Penjualan yang <b>pindah entitas otomatis</b> saat dihitung ulang (mis. dari GSM ke HNH). <b>↩ Kembalikan</b> = kunci lagi ke entitas sebelumnya. <b>✓</b> = memang benar, hapus dari daftar.</p>
+    <div style="max-height:360px;overflow:auto;border:1px solid var(--line);border-radius:8px;"><table class="dtable" style="font-size:11.5px;"><thead><tr><th>Tgl</th><th>Produk</th><th>Qty</th><th>Pindah</th><th>Kapan</th><th></th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:12px;">Belum ada penjualan yang pindah entitas.</td></tr>'}</tbody></table></div></div>`;
+  showConfirmModal('🔀 Penjualan yang Pindah Entitas', html);
+  const modal = document.getElementById('confirmModal');
+  if (!modal) return;
+  modal.querySelectorAll('tr[data-mid] button').forEach(btn => btn.addEventListener('click', () => {
+    const tr = btn.closest('tr'); const mid = tr.dataset.mid;
+    const m = (state.entityMoves || []).find(x => x.id === mid);
+    if (!m) return;
+    if (btn.dataset.act === 'back') {
+      const row = state.checkerRows.find(x => x.id === m.rowId);
+      if (row && ENTITIES.includes(m.from)) {
+        row.entitas = m.from; row.status = 'OK'; row.entitasManual = true;
+        gsjDetailedAudit(`mengembalikan penjualan <b>${escapeAttr(m.nama)}</b> tgl ${escapeAttr(m.tanggal)} ke <b>${escapeAttr(ENTITY_LABEL[m.from])}</b>`);
+        recomputeAllCheckerRows();
+      }
+    }
+    state.entityMoves = (state.entityMoves || []).filter(x => x.id !== mid);
+    state.entityMovesDone = (state.entityMovesDone || []).concat([mid]).slice(-800);
+    saveState();
+    tr.remove();
+    gsjUpdateMovesBadge();
+    if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+    if (typeof gsjScheduleRemoteRerender === 'function') gsjScheduleRemoteRerender();
+  }));
+}
+document.addEventListener('click', e => { const a = e.target.closest && e.target.closest('#moves-open'); if (a) { e.preventDefault(); gsjShowMoves(); } });
+setTimeout(() => { try { gsjUpdateMovesBadge(); } catch (e) {} }, 1500);
 </script>
 </body>
 </html>
