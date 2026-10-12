@@ -833,7 +833,7 @@ table.dtable td input, table.dtable td select, table.dtable td textarea{
       <button class="tab-btn" data-tab="tab8"><span class="ico">📤</span><span class="lbl">Invoice ke Glomed</span></button>
       <button class="tab-btn" data-tab="tab9"><span class="ico">📈</span><span class="lbl">Total Omset</span></button>
     </nav>
-    <div class="sidebar-foot">Data tersimpan otomatis<br>di server.<br><span id="app-version" style="opacity:.75;">Versi v2026.10.10-l</span> · <a href="#" id="diag-open" style="color:inherit;text-decoration:underline;">⏱️ Cek lag</a><br><a href="#" id="moves-open" style="color:inherit;text-decoration:underline;">🔀 Pindah entitas <span id="moves-badge"></span></a></div>
+    <div class="sidebar-foot">Data tersimpan otomatis<br>di server.<br><span id="app-version" style="opacity:.75;">Versi v2026.10.10-n</span> · <a href="#" id="diag-open" style="color:inherit;text-decoration:underline;">⏱️ Cek lag</a><br><a href="#" id="moves-open" style="color:inherit;text-decoration:underline;">🔀 Pindah entitas <span id="moves-badge"></span></a></div>
   </aside>
 
   <div class="content-col">
@@ -1921,8 +1921,13 @@ function bindGenericAutocomplete(input, getMatches, onSelect) {
 function ensureFuzzyCatalog() {
   // Penambahan otomatis (top-up) dibuat ulang setiap hitung ulang & namanya pasti sudah ada di
   // katalog -> tidak dihitung, supaya katalog + hasil pencocokan tidak dibangun ulang tiap kali.
-  let nAdj = 0;
-  for (const a of state.adjustments) if (a.keterangan !== 'Auto top-up (catatan Master Produk)') nAdj++;
+  // Hitung jumlahnya bertahap (cuma baris baru yang dicek) — dipanggil ribuan kali per hitung ulang.
+  const adjArr = state.adjustments;
+  const cc = ensureFuzzyCatalog._cnt || (ensureFuzzyCatalog._cnt = { arr: null, len: 0, n: 0 });
+  if (cc.arr !== adjArr || adjArr.length < cc.len) { cc.arr = adjArr; cc.len = 0; cc.n = 0; }
+  for (let i = cc.len; i < adjArr.length; i++) { const a = adjArr[i]; if (a && a.keterangan !== 'Auto top-up (catatan Master Produk)') cc.n++; }
+  cc.len = adjArr.length;
+  const nAdj = cc.n;
   const lens = `${state.masterProduk.length}|${state.invoices.length}|${nAdj}`;
   if (_fuzzyCatalogSourceLens === lens) return _fuzzyCatalogCache;
   const names = new Set();
@@ -2402,7 +2407,16 @@ function getStockQty(stockSnapshot, entitas, nama) {
 //                     "konfirmasi lagi ke aku..." with NO auto-resolve override — these were
 //                     deliberately left unmapped, so every sale should be flagged regardless
 //                     of whether some stock happens to be found under the guessed name.
+const _catBehaviorMemo = new Map();
 function classifyCatatanBehavior(catatan) {
+  if (!catatan) return null;
+  if (_catBehaviorMemo.has(catatan)) return _catBehaviorMemo.get(catatan);
+  const v = classifyCatatanBehaviorRaw(catatan);
+  if (_catBehaviorMemo.size > 20000) _catBehaviorMemo.clear();
+  _catBehaviorMemo.set(catatan, v);
+  return v;
+}
+function classifyCatatanBehaviorRaw(catatan) {
   if (!catatan) return null;
   const c = catatan.toLowerCase();
 
@@ -6528,6 +6542,46 @@ function bindTab2RowActions(tbody) {
         const oldVal = input.dataset.oldValue || '';
         const prevStatus = row.status;
         row[field] = (field === 'qty') ? Number(input.value)||0 : input.value;
+        if (field === 'entitas' && ENTITIES.includes(row.entitas) && (row.splitOf || row.splitTotalQty != null)) {
+          // Baris bagian dari PESANAN YANG DIBAGI: pilihan entitas berlaku untuk bagian ini saja.
+          // Kalau entitasnya sama dengan bagian lain -> digabung jadi satu baris lagi.
+          const chosen = row.entitas;
+          const pid = row.splitOf || row.id;
+          const parts = state.checkerRows.filter(x => x.id === pid || x.splitOf === pid);
+          const parent = parts.find(x => x.id === pid);
+          const same = parts.find(x => x !== row && x.entitas === chosen);
+          let keepRow = row;
+          if (same) {
+            const keep = (row === parent || same === parent) ? parent : same;
+            const other = keep === row ? same : row;
+            keep.qty = (Number(keep.qty) || 0) + (Number(other.qty) || 0);
+            keep.qtyInternal = keep.qty;
+            keep.entitas = chosen;
+            state.checkerRows = state.checkerRows.filter(x => x !== other);
+            keepRow = keep;
+          }
+          const left = state.checkerRows.filter(x => x.id === pid || x.splitOf === pid);
+          left.forEach(x => { delete x.splitOf; delete x.splitTotalQty; });
+          if (left.length === 1) { delete left[0].splitInfo; }
+          else {
+            const info = left.map(x => `${ENTITY_LABEL[x.entitas] || x.entitas} ${x.qty}`).join(' + ') + ` (pesanan ${left.reduce((a, x) => a + (Number(x.qty) || 0), 0)})`;
+            left.forEach(x => { x.splitInfo = info; });
+          }
+          left.forEach(x => { x.entitasManual = true; x.status = 'OK'; x.autoEnt = undefined; x.autoTopUpQty = undefined; });
+          keepRow.entitas = chosen;
+          gsjDetailedAudit(`mengubah bagian pesanan dibagi <b>${escapeAttr(row.nama || '')}</b> tgl ${escapeAttr(row.tanggal)} ke <b>${escapeAttr(ENTITY_LABEL[chosen])}</b>${same ? ' (digabung jadi satu baris)' : ''}`);
+          recomputeAllCheckerRows();
+          saveState();
+          renderTab2TableKeepScroll();
+          if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+          try {
+            const nm = keepRow.nama;
+            const q = ((computeStockAsOfDate(chosen, keepRow.tanggal) || {})[normalizeName(nm)] || {}).qty;
+            const after = (q || 0) - (Number(keepRow.qty) || 0);
+            if (after < 0) setTimeout(() => alert(`Tersimpan: ${nm} tgl ${keepRow.tanggal} dipotong dari ${ENTITY_LABEL[chosen]} (${keepRow.qty} pcs).\nCatatan: stok ${ENTITY_LABEL[chosen]} untuk produk ini jadi minus ${Math.abs(after)} — silakan cek/tambah stoknya.`), 50);
+          } catch (e) {}
+          return;
+        }
         if (field === 'entitas' && ENTITIES.includes(row.entitas)) {
           // Pilih entitas manual (baris OK maupun "Perlu Konfirmasi") = "set produk ini ke entitas X":
           // semua penjualan produk ini ikut (kecuali yang sudah klop di GSM), Entitas Tetap Master
@@ -9415,7 +9469,17 @@ function renderTab4History() {
   `).join('');
 }
 
+// Daftar saran nama (autocomplete) tidak perlu diperbarui seketika — dikumpulkan & dikerjakan
+// saat browser senggang, supaya tiap klik/edit tidak ikut menanggung biayanya.
+let _dlTimer = null;
 function refreshMasterProdukDatalist() {
+  clearTimeout(_dlTimer);
+  _dlTimer = setTimeout(() => {
+    const run = () => { try { refreshMasterProdukDatalistNow(); } catch (e) {} };
+    if (window.requestIdleCallback) requestIdleCallback(run, { timeout: 3000 }); else run();
+  }, 1200);
+}
+function refreshMasterProdukDatalistNow() {
   const dl = document.getElementById('masterProdukList');
   if (!dl) return;
   const names = new Set();
