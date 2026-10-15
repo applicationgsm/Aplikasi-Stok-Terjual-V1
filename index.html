@@ -2555,6 +2555,11 @@ function recomputeAllCheckerRows() {
     });
     state.checkerRows = keep;
   }
+  // PAKET: 1 listing marketplace isinya beberapa produk (mis. "Aseptic Gel Paket Pump & Refill" =
+  // Aseptic Gel Pump + Aseptic Plus Essential Refill). Isi tambahannya disimpan di Master Produk listing
+  // itu (paketIsi) dan dibuat otomatis jadi baris sendiri per pesanan (id = induk + '~pk' + urutan),
+  // jadi tiap isi bisa dipotong dari entitas yang berbeda — sama seperti di checker (Pump GSJ, Refill HNH).
+  gsjExpandPaketRows();
   const splitChildren = [];
 
   const sorted = [...state.checkerRows].sort((a, b) => {
@@ -2572,14 +2577,21 @@ function recomputeAllCheckerRows() {
     // name was used for stock accounting, and re-looking-up Master Produk from THAT would
     // fail once it no longer matches the canonical internal name.
     const sourceNama = row.namaAsli || row.nama;
-    const resolved = resolveInternalName(sourceNama, row.variasi);
+    // Baris isi paket (dibuat dari paketIsi Master Produk) sudah pasti nama produknya — jangan dicari
+    // ulang dari judul marketplace (judulnya milik produk utama paket).
+    const resolved = row.paketDari
+      ? { matched: true, namaInternal: row.namaCanonical || row.nama, entitasTetap: '', catatan: '' }
+      : resolveInternalName(sourceNama, row.variasi);
     const genericNama = resolved.matched ? resolved.namaInternal : (row.namaCanonical || row.nama);
 
     // PATCH — unit multiplication (e.g. "1 box isinya 200 pcs"): Stok Terjual gets cut by
     // (order qty × multiplier), but the Checker/Excel Quantity column must keep showing the
     // marketplace order qty as-is — so `qty` below (used for all stock math) is DELIBERATELY
     // different from `row.qty` (left untouched) from this point on.
-    const multiplier = resolved.qtyMultiplier || 1;
+    // Angka yang DIKETIK langsung di sel Stok Terjual (qtyTetap) sudah dalam satuan Stok Terjual —
+    // jangan dikali pengali lagi (dulu: ketik 4 di listing "20PCS/BOX" pengali 2 -> jadi 8 lagi
+    // begitu ada hitung ulang).
+    const multiplier = row.qtyTetap ? 1 : (resolved.qtyMultiplier || 1);
     const qty = qtyOrder * multiplier;
     row.qtyMultiplier = multiplier > 1 ? multiplier : undefined; // only stored when it actually matters, for the UI hint
     row.qtyInternal = qty; // used by Stok Terjual aggregation — row.qty itself stays as the original order qty
@@ -3353,7 +3365,13 @@ function getProductCatalogForEntity(entitas) {
   }
   state.checkerRows.forEach(r => { if (r.entitas === entitas) names.add(r.nama); });
   const hidden = new Set((state.hiddenProducts || []).filter(h => h.entitas === entitas).map(h => normalizeName(h.nama)));
-  const visible = [...names].filter(n => !hidden.has(normalizeName(n)));
+  // Nama yang cuma beda huruf besar/kecil atau spasi ("W/Cuff" vs "W/CUFF") itu PRODUK YANG SAMA —
+  // stok & penjualannya memang sudah digabung (dicocokkan tanpa beda huruf), jadi di daftar cukup
+  // tampil 1 baris. Dulu muncul 2 baris dengan angka yang sama persis (dobel di total & Excel).
+  // Tulisan yang dipakai: yang pertama ketemu (Invoice Masuk -> Stok Awal -> Master Produk -> penjualan).
+  const byKey = new Map();
+  [...names].forEach(n => { const k = normalizeName(n); if (k && !byKey.has(k)) byKey.set(k, String(n).trim().replace(/\s+/g, ' ')); });
+  const visible = [...byKey.entries()].filter(([k]) => !hidden.has(k)).map(([, n]) => n);
   return sortProductNames(visible);
 }
 
@@ -3377,7 +3395,9 @@ function getAllKnownProductNames(entitas) {
   state.adjustments.forEach(a => { if (a.entitas === entitas) names.add(a.nama); });
   state.checkerRows.forEach(r => { if (r.entitas === entitas) names.add(r.nama); });
   state.masterProduk.forEach(m => { if (!m.entitasTetap || m.entitasTetap === entitas) if (m.namaInternal) names.add(m.namaInternal); });
-  return [...names];
+  const byKey = new Map();
+  [...names].forEach(n => { const k = normalizeName(n); if (k && !byKey.has(k)) byKey.set(k, n); });
+  return [...byKey.values()];
 }
 
 // Editing a pivot cell (product x platform/channel x date x entity) replaces whichever
@@ -3396,9 +3416,11 @@ function applyPlatformCellEdit(entitas, tanggal, nama, sumber, channel, newQty) 
     const base = matching[0] || {};
     state.checkerRows.push({
       id: uid(), tanggal, nama, namaAsli: base.namaAsli || '', variasi: base.variasi || '',
-      qty: newQty, hargaModal: base.hargaModal || 0, totalModal: 0,
+      qty: newQty, qtyInternal: newQty, hargaModal: base.hargaModal || 0, totalModal: 0,
       entitas, status: 'OK', catatan: base.catatan || '',
       sumber, channel, noPesanan: base.noPesanan || '', hargaJual: base.hargaJual || 0,
+      // angka ini diketik manual di Stok Terjual: tetap segini (tanpa pengali) & tetap di entitas ini
+      qtyTetap: true, entitasManual: true, namaCanonical: nama,
     });
   }
 }
@@ -3517,7 +3539,15 @@ function bindFilterIcons(container, columnDefs, getAllRows, filterState, onApply
 function positionPopover(popover, anchorEl) {
   const rect = anchorEl.getBoundingClientRect();
   popover.style.position = 'fixed';
-  popover.style.top = `${Math.min(rect.bottom + 4, window.innerHeight - 320)}px`;
+  // Tinggi popover dibatasi sisa layar, supaya tombol Terapkan selalu kelihatan & daftar nilainya
+  // bisa di-scroll (dulu popover keluar dari bawah layar -> daftar tidak bisa di-scroll sampai bawah).
+  const below = window.innerHeight - rect.bottom - 12;
+  const above = rect.top - 12;
+  const useAbove = below < 300 && above > below;
+  const maxH = Math.max(180, Math.min(440, useAbove ? above : below));
+  popover.style.maxHeight = `${maxH}px`;
+  if (useAbove) { popover.style.top = ''; popover.style.bottom = `${window.innerHeight - rect.top + 4}px`; }
+  else { popover.style.bottom = ''; popover.style.top = `${rect.bottom + 4}px`; }
   let left = rect.left;
   if (left + 260 > window.innerWidth) left = window.innerWidth - 270;
   popover.style.left = `${Math.max(8, left)}px`;
@@ -3526,7 +3556,7 @@ function positionPopover(popover, anchorEl) {
 function buildFilterPopover(def, allRows, filterState, onApplyAndClose, sortState) {
   const pop = document.createElement('div');
   pop.className = 'colfilter-popover';
-  pop.style.cssText = 'position:fixed; z-index:500; background:#fff; border:1px solid #d1d5db; border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.15); width:250px; max-height:360px; display:flex; flex-direction:column; font-size:12.5px;';
+  pop.style.cssText = 'position:fixed; z-index:500; background:#fff; border:1px solid #d1d5db; border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.15); width:250px; max-height:360px; display:flex; flex-direction:column; font-size:12.5px; overflow:hidden;';
 
   const isThisColSorted = sortState && sortState.key === def.key;
   const sortHTML = sortState ? `
@@ -3595,7 +3625,7 @@ function buildFilterPopover(def, allRows, filterState, onApplyAndClose, sortStat
         <a href="#" id="cf-selectall" style="color:var(--accent);">Pilih Semua</a>
         <a href="#" id="cf-clearall" style="color:var(--accent);">Kosongkan</a>
       </div>
-      <div id="cf-list" style="overflow-y:auto; flex:1; padding:6px 10px; display:flex; flex-direction:column; gap:4px;"></div>
+      <div id="cf-list" style="overflow-y:auto; flex:1 1 auto; min-height:0; overscroll-behavior:contain; padding:6px 10px; display:flex; flex-direction:column; gap:4px;"></div>
       <div style="padding:8px 10px; border-top:1px solid #eee; display:flex; justify-content:space-between; gap:6px;">
         <button class="btn secondary small" id="cf-clear">Hapus Filter</button>
         <button class="btn secondary small" id="cf-apply" style="background:var(--accent-dark);color:#fff;">Terapkan</button>
@@ -5816,13 +5846,16 @@ function processMarketplaceFiles() {
         added++;
       });
 
+      let autoMapped = [];
+      try { autoMapped = gsjAutoMapRawNames({ noRecompute: true }); } catch (e) { console.warn(e); }
       recomputeAllCheckerRows();
       const spec = MARKETPLACE_SPECS[marketplaceKey];
+      if (autoMapped.length) gsjDetailedAudit(`sistem otomatis mencocokkan <b>${fmtNum(autoMapped.length)}</b> listing bernama mentah ke nama internal yang benar saat import`);
       gsjDetailedAudit(`meng-import ${added} baris dari ${escapeAttr(spec.label)} (channel ${escapeAttr(channel)})${dup ? `, ${dup} duplikat dilewati` : ''}`);
       saveState();
       const skipNote = result.skippedFiles.length ? `\nFile dilewati (format tidak cocok dengan ${spec.label}): ${result.skippedFiles.join(', ')}` : '';
       const autoCreatedNote = result.autoCreatedCount ? `\n🟠 Produk baru (belum ada nama internal): ${result.autoCreatedCount} — otomatis ditandai "Belum Dirapikan", silakan dicek & dirapikan di tab 🆕 Produk Baru. Nama internalnya sementara masih sama persis dengan nama mentah dari ${spec.label}.` : '';
-      msgEl.innerHTML = `<div class="msg ok">Marketplace: ${spec.label}\nTotal baris mentah: ${result.totalRaw}\nDibuang (dibatalkan): ${result.removedCancel}${result.removedRefund ? `\nDibuang (refund/pengembalian dana): ${result.removedRefund}` : ''}${result.removedJunk ? `\nDibuang (baris non-data): ${result.removedJunk}` : ''}\nDibuang (waktu tidak valid): ${result.removedTime}\nDitambahkan: ${added} baris${dup ? `\nDilewati (duplikat, sudah pernah diimport): ${dup}` : ''}${skipNote}${autoCreatedNote}</div>`;
+      msgEl.innerHTML = `<div class="msg ok">Marketplace: ${spec.label}\nTotal baris mentah: ${result.totalRaw}\nDibuang (dibatalkan): ${result.removedCancel}${result.removedRefund ? `\nDibuang (refund/pengembalian dana): ${result.removedRefund}` : ''}${result.removedJunk ? `\nDibuang (baris non-data): ${result.removedJunk}` : ''}\nDibuang (waktu tidak valid): ${result.removedTime}\nDitambahkan: ${added} baris${dup ? `\nDilewati (duplikat, sudah pernah diimport): ${dup}` : ''}${skipNote}${autoCreatedNote}${autoMapped.length ? `\n🔗 Otomatis dicocokkan ke nama internal yang benar: ${autoMapped.length} listing` : ''}</div>`;
       renderTab2DateFilter();
       renderTab2Table();
       refreshMasterProdukDatalist();
@@ -6777,7 +6810,9 @@ function showConfirmModal(title, bodyHTML, wide) {
   document.getElementById('modalTitle').textContent = '⚠ ' + title;
   document.getElementById('modalBody').innerHTML = bodyHTML;
   document.getElementById('confirmModal').classList.add('show');
-  document.querySelector('#confirmModal .modal-box').classList.toggle('wide', !!wide);
+  const _mb = document.querySelector('#confirmModal .modal-box');
+  _mb.classList.toggle('wide', !!wide);
+  _mb.style.maxWidth = ''; delete _mb.dataset.qe;
 }
 
 // Builds a downloadable, genuinely COLORED .xlsx of the checker table (one sheet per date),
@@ -7217,6 +7252,7 @@ function renderTab3() {
           <div class="tag-row" style="margin-top:6px;">
             <input type="text" id="t3-search" placeholder="🔎 Cari nama produk..." style="flex:1;min-width:200px;padding:7px 10px;border:1px solid #c9c5b8;border-radius:6px;font-size:13px;">
             <button class="btn secondary small" id="t3-fuzzy-filter">${tab3FuzzyOnly ? '✓ ' : ''}⚠ Perlu Dicek Saja</button>
+            <button class="btn secondary small" id="t3-pengali" title="Atur pengali stok (misal 1 box = 20 pcs) langsung dari sini — isi kata kunci dari kolom cari">🔢 Pengali Stok</button>
           </div>
         </div>
         <div id="t3-table-wrap"></div>
@@ -7245,6 +7281,7 @@ function renderTab3() {
     renderTab3Table();
   });
   document.getElementById('t3-download').addEventListener('click', downloadStokTerjualExcel);
+  document.getElementById('t3-pengali').addEventListener('click', () => openBulkMultiplierTool((document.getElementById('t3-search') || {}).value || ''));
   document.getElementById('t3-download-bulan').addEventListener('click', openTab3DownloadRangeModal);
   renderTab3Table();
   if (tab3Fullscreen) {
@@ -7565,6 +7602,77 @@ function gsjRestoreGsmRekapSep2026() {
   // Tidak pasti -> jangan menebak & jangan memunculkan jendela; tombol "Cari selisih" tetap ada.
 }
 
+// ---------- Perbaikan sekali jalan: HNH 1–15 Sep 2026 disamakan dengan Checker (baris MERAH = HNH) ----------
+// Sumber: file "Cheeker Inv GSM 01–15 September 2026" (zip SEPTEMBER). Di checker: merah = HNH,
+// hijau = GSJ, hitam = GSM. Penjualan yang di aplikasi ada di HNH tapi di checker hijau dipindah ke GSJ;
+// yang merah tapi di aplikasi di GSJ dipindah ke HNH. Semua dikunci manual (tidak dipindah lagi oleh
+// hitung otomatis). Pesanan yang sempat dipecah (GSJ + HNH) digabung lagi jadi 1 baris utuh sesuai warna
+// checker. Penjualan lain dari produk yang sama di 1–15 Sep yang SUDAH sesuai checker ikut dikunci supaya
+// tidak bergeser waktu hitung ulang. Baris GSM tidak disentuh.
+const GSJ_FIX_HNH_SEP2026 = {"simple":{"idmuusqaed5knijx":"Glomed","idmuusqaedfwlxzl":"Glomed","idmuuv8wiees1kiz":"Glomed","idmuusqal1awiqox":"Glomed","idmuusqaovqccs11":"Glomed","idmuusqag83ghfbm":"Glomed","idmuusqavbum6gqm":"Glomed","idmuusqb9j8ov73j":"HNH","idmuusqbarz3jxfd":"Glomed","idmuusqbadv5ulhi":"Glomed","idmuusqbaqnb6zp8":"Glomed","idmuusqb6x0luhls":"Glomed","idmuusqb9ic72z31":"Glomed","idmuusqbaq9f24y5":"Glomed","idmuusqbapmqyjt3":"Glomed","idmuusqbb4a4t67a":"Glomed","idmuusqbad1kc07k":"Glomed","idmuusqb4m8l7gqv":"HNH","idmuusqbar9nwnbb":"Glomed","idmuusqbar8xx0cu":"Glomed","idmuusqbapz6cqy5":"Glomed","idmuusqb9jgbj33f":"Glomed","idmuusqb9k4zq69z":"Glomed","idmuusqb9j6234e8":"Glomed","idmuusxh1lme6g1q":"Glomed","idmuusxh26d71ep0":"Glomed","idmuustwhlga9u8x":"Glomed","idmuustwnm00hcic":"Glomed","idmuustww7fldxzd":"Glomed","idmuustwmaf418c0":"Glomed","idmuustwqcmbr8dz":"Glomed","idmuustwx0sqtect":"Glomed","idmuustwfxffyb36":"Glomed","idmuustwrosjq2kk":"Glomed","idmuustxyjx5qdix":"Glomed","idmuustwu3h2qsv4":"Glomed","idmuustx6rvmthky":"Glomed","idmuxr025dh05fqe":"Glomed","idmuxr025qu95tnw":"Glomed","idmuxr025dt24xbj":"Glomed","idmuxr023psvy77r":"Glomed","idmuuv8x7uo4lsel":"Glomed","idmuuv8x8e52d179":"Glomed","idmuuv8x9tqrcpdq":"Glomed","idmuuv8x61qpb708":"HNH","idmuuv8x622mx7h9":"HNH","idmuuv8x6fgiu3dc":"Glomed","idmuuv8xa570g9h7":"Glomed","idmuuv8xadzqaws9":"Glomed","idmuuv8x8ai6siac":"Glomed","idmuusqbc3m84otv":"Glomed","idmuusqbcjw8qkyb":"Glomed","idmuusqbgfg87v8k":"HNH","idmuusqbc727l33b":"Glomed","idmuusqbez8q6xts":"Glomed","idmuusqbezaebf8h":"Glomed","idmuusqbgfrotuvn":"Glomed","idmuusqbeoyygcf4":"Glomed","idmuusqbcxoiltlr":"Glomed","idmuusqbeo6zdgxa":"Glomed","idmuusqbeokmkiqw":"Glomed","idmuusqbezyqkuaw":"Glomed","idmuusqbf0mqhb4n":"Glomed","idmuusqbfintapkv":"Glomed","idmuusqbfjuh66rn":"Glomed","idmuusqbfk0yxdch":"Glomed","idmuusqbfkayof0m":"Glomed","idmuusqbfwpdfgub":"Glomed","idmuusqbfxtc2et1":"Glomed","idmuusqbfwtplh0e":"Glomed","idmuusqbcj60fpl3":"Glomed","idmuusqbdtf65zx7":"Glomed","idmuusqbf1cih9n3":"Glomed","idmuusqbfi1f7evv":"Glomed","idmuusqbfw2viu2v":"Glomed","idmuusqbfwb5jgic":"Glomed","idmuusqbfx6mcss1":"Glomed","idmuusqbfxwajd12":"Glomed","idmuusqbjr75wary":"Glomed","idmuusqbf08xqsrp":"Glomed","idmuusqbjrq1bxcl":"Glomed","idmuusqbcjicmluo":"Glomed","idmuusqbdex45uhz":"Glomed","idmuusqbdtecj7f0":"Glomed","idmuusqbeo0b0qdb":"Glomed","idmuusqbezbxzso1":"Glomed","idmuusqbeznuuyfc":"Glomed","idmuusqbjrs418bq":"Glomed","idmuusqbc7dglr6v":"Glomed","idmuusqbeni4ets0":"Glomed","idmuusqbf12061pz":"Glomed","idmuusxgz6gjdzp5":"Glomed","idmuusxgyecbn93e":"Glomed","idmuusxh10v5y2ni":"Glomed","idmuustu4si29ql8":"Glomed","idmuusttbp6cft0q":"Glomed","idmuusts22j62jrt":"Glomed","idmuustrpfke87nr":"Glomed","idmuustrplu6jmv7":"Glomed","idmuustwaponmt7g":"Glomed","idmuustwasmb97ut":"Glomed","idmuusttqq6c11z8":"Glomed","idmuustrqlc5n86g":"Glomed","idmuustska908gw0":"Glomed","idmuusts95iudgaj":"Glomed","idmuusts8ra9yct6":"Glomed","idmuustrsf1kw1r7":"Glomed","idmuustrwp22e96j":"Glomed","idmuusts0oys80ok":"Glomed","idmuusts2xyccf66":"Glomed","idmuustsh0veuzr0":"Glomed","idmuustsho6leqof":"Glomed","idmuustsvkc57jjo":"Glomed","idmuustt7a3y5klw":"Glomed","idmuusttc2dvvlop":"Glomed","idmuustvbfq927zj":"Glomed","idmuustwbvqcx90v":"Glomed","idmuustrnymh02dj":"Glomed","idmuustrmuipcbse":"Glomed","idmuustrof55elpc":"Glomed","idmuusts8yzrh3ys":"Glomed","idmuustsrn67ohja":"Glomed","idmuustsxgw4isih":"Glomed","idmuustro4l08sui":"Glomed","idmuustroalqsosv":"Glomed","idmuustrnsyl06f9":"Glomed","idmuustrqakipqff":"Glomed","idmuustrrujpea40":"Glomed","idmuusts8l3psvp1":"Glomed","idmuustsr9fehpbk":"Glomed","idmuusttdh3si4fr":"Glomed","idmuustrmnazvw1r":"Glomed","idmuustrneim60rm":"Glomed","idmuustrs9cbmued":"Glomed","idmuustrtzrc1brn":"Glomed","idmuustrw35cz7fg":"Glomed","idmuustryjsr7sre":"Glomed","idmuusts0gnf4742":"Glomed","idmuustsgvjp7jnx":"Glomed","idmuustshj1bz2dw":"Glomed","idmuustsu7uenwco":"Glomed","idmuustsuungu6mn":"Glomed","idmuustsvx1ehxf1":"Glomed","idmuustt6wd3szva":"Glomed","idmuusttjrtpiom4":"Glomed","idmuusttrh9jugzn":"Glomed","idmuusttv5wadamf":"Glomed","idmuustvazca1ivd":"Glomed","idmuustrold83u9n":"Glomed","idmuustrtjgdhzue":"Glomed","idmuustthe0gf5x1":"Glomed","idmuusttiiupizjc":"Glomed","idmuusttcgo7im0p":"Glomed","idmuustslgl9akct":"Glomed","idmuusttvkvdvy48":"Glomed","idmuusttxyk4c58a":"Glomed","idmuustrm3g4ctm5":"Glomed","idmuustrp2467qoq":"Glomed","idmuustsl16t9tsw":"Glomed","idmuusts44jnm1gv":"Glomed","idmuustrsl2q0vix":"Glomed","idmuusts2qdl8ytb":"Glomed","idmuusts5oggzo8i":"Glomed","idmuustsaf1okfu1":"Glomed","idmuustskol35yp3":"Glomed","idmuusttrvmyxslc":"Glomed","idmuusttwq2hwfgl":"Glomed","idmuustu0cjq7ep8":"Glomed","idmuustvnjnt6aqy":"Glomed","idmuustssa5wmv9a":"Glomed","idmuuststuri4buo":"Glomed","idmuustt036dhsdp":"Glomed","idmuustrx6m9pf5z":"Glomed","idmuusttcub9nfk7":"Glomed","idmuusttt3xq48gv":"Glomed","idmuustvmcoi8hlf":"HNH","idmuustsmd2bytu3":"Glomed","idmuusttk76mb8p4":"Glomed","idmuusttaaof1o7h":"Glomed","idmuustwbdidq0od":"Glomed","idmuusts7zmribmg":"Glomed","idmuustrx2u2at41":"Glomed","idmuusttapaaanxb":"Glomed","idmuusttfq3l4bft":"Glomed","idmuxr028mqqxkx2":"Glomed","idmuxr0287kyf7ni":"Glomed","idmuxr0288qlltfi":"Glomed","idmuxr0285056o2j":"Glomed","idmuxr0288od796u":"Glomed","idmuxr0288mbp60s":"Glomed","idmuxr0289uc6u2u":"Glomed","idmuxr02892pid4j":"Glomed","idmuxr02bco2w79s":"Glomed","idmuxr02bc39ix4j":"Glomed","idmuxr0287crzo7s":"Glomed","idmuxr0289yvahtl":"Glomed","idmuxr02859hw902":"Glomed","idmuxr0289q1uwke":"Glomed","idmuxr0289szmk36":"Glomed","idmuxr0287h5hsdx":"Glomed","idmuxr0288x6bma2":"Glomed","idmuxr0288280xb7":"Glomed","idmuxr0287pldcg5":"Glomed","idmuxr0288r2kgpj":"Glomed","idmuxr0288m0j16p":"Glomed","idmuxr0289s0hj90":"Glomed","idmuxr02bbb1y983":"Glomed","idmuxr02bcd85n0j":"Glomed","idmuxr02bcowmc46":"Glomed","idmuxr02bepi5dsf":"Glomed","idmuxr0287q8aumm":"Glomed","idmuxr0288s28apz":"Glomed","idmuxr0284n685xo":"Glomed","idmuxr02au0ahlcb":"Glomed","idmuxr028aufacif":"Glomed","idmuxr5a54hu1qqp":"Glomed","idmuxr5a53ac3at1":"Glomed","idmuxr5a546yryx6":"Glomed","idmuuv8xbj66rnn8":"Glomed","idmuuv8xcq48r8w5":"Glomed","idmuxr3uxegulkgk":"Glomed","idmuxr3uxd2exafr":"Glomed","idmuxr3uxekr0yv3":"Glomed","idmuusqc6h1ru1dz":"Glomed","idmuusqc5ndt5ye2":"Glomed","idmuusqc5lofll30":"Glomed","idmuusqc61dcvp68":"HNH","idmuusqc5o7r0mdm":"Glomed","idmuusqblidr0kcr":"Glomed","idmuusqbmen7v5ct":"Glomed","idmuusqbnl8gng40":"Glomed","idmuusqbp5z4q0es":"Glomed","idmuusqbr2wqy938":"Glomed","idmuusqbrgppfsro":"Glomed","idmuusqbu5pey58q":"Glomed","idmuusqbveb1yy0r":"Glomed","idmuusqbxd916rbt":"Glomed","idmuusqbzgj20rpw":"Glomed","idmuusqbzil8x8sl":"Glomed","idmuusqbzks7hcfr":"Glomed","idmuusqbzkqnh9d3":"Glomed","idmuusqbzl10myas":"Glomed","idmuusqbzm7hetwo":"Glomed","idmuusqbzp6ypjyp":"Glomed","idmuusqbzq6iwsqp":"Glomed","idmuusqc0wi4n2c0":"Glomed","idmuusqc5bxatxzk":"Glomed","idmuusqbzly4696w":"Glomed","idmuusqbzlvcr4vg":"Glomed","idmuusqbjrbji79g":"Glomed","idmuusqbxcoclfem":"Glomed","idmuusqc5okc36bc":"Glomed","idmuusqbmsflv5d1":"HNH","idmuusqbmt67pskm":"HNH","idmuusqbmtfzhjuv":"HNH","idmuusqbn8bumdy1":"HNH","idmuusqc61s584hi":"Glomed","idmuusqc61xti30u":"Glomed","idmuusqbjrfw9kve":"Glomed","idmuusqbjriyxvie":"Glomed","idmuusqbjsrgut4i":"Glomed","idmuusqbjrqwjfrk":"Glomed","idmuusqbjsbgsy1k":"Glomed","idmuusqc62gxw56n":"Glomed","idmuusqbzl2xl9xe":"Glomed","idmuusqbxcedi9ks":"Glomed","idmuusqbnktf89ce":"Glomed","idmuusqc2ky47y6u":"Glomed","idmuusqc2j4wngau":"Glomed","idmuusqbzokwpe4q":"Glomed","idmuusqbzq5l96nh":"Glomed","idmuusqbzo7riccg":"Glomed","idmuusqbsdehjvrg":"Glomed","idmuusqbzqqw0s46":"Glomed","idmuusqc5cmh8tdv":"Glomed","idmuusqc6glmgdl2":"Glomed","idmuusqbcjrg6jwe":"Glomed","idmuusqc2k3s402v":"Glomed","idmuusxgzrhgpfv2":"Glomed","idmuusxgxkaec00x":"Glomed","idmuustqdttzq05v":"Glomed","idmuustp28dgs4xt":"Glomed","idmuustpqx6op277":"Glomed","idmuustoxb2bcr1a":"Glomed","idmuustoy603er1m":"Glomed","idmuustpy19rlys7":"Glomed","idmuustqrwv40xfj":"Glomed","idmuustrcvmmrr42":"Glomed","idmuustqod9ak7yi":"Glomed","idmuustpu1rw6709":"Glomed","idmuustrfkm2cg1k":"Glomed","idmuustrim5wqtz9":"Glomed","idmuustq1eeq65sl":"Glomed","idmuustoto364gr1":"Glomed","idmuustq00q3c2d5":"Glomed","idmuustq2xk0y4c8":"Glomed","idmuustqsj59cw71":"Glomed","idmuustqw8hk187l":"Glomed","idmuustraahacbfy":"Glomed","idmuustrjqq68vog":"Glomed","idmuustpzrl703ck":"Glomed","idmuustq2rogl9u5":"Glomed","idmuustrahq96sc5":"Glomed","idmuustp4e0pn3ue":"Glomed","idmuustq4aryw0uf":"Glomed","idmuustq9hmutqc9":"Glomed","idmuustr2h5xls11":"Glomed","idmuustq2jqqasfz":"Glomed","idmuustq4h2w3j3q":"Glomed","idmuustp69fjwj7i":"Glomed","idmuustpaove4b01":"Glomed","idmuustqb3bknnfv":"Glomed","idmuustpm6c7zks3":"Glomed","idmuustqc99stgb6":"Glomed","idmuustqht5k5rim":"Glomed","idmuustrgxgsgp0t":"Glomed","idmuustqmtmub0wu":"Glomed","idmuustqm9such36":"Glomed","idmuustpx8aaohf3":"Glomed","idmuustq9yfy4h7p":"Glomed","idmuustq5b55y0sq":"Glomed","idmuustrihkh8h1n":"Glomed","idmuustr4inss9jg":"HNH","idmuustpqa5j6aqi":"Glomed","idmuustp553f8dv6":"Glomed","idmuustpow8d0wjq":"Glomed","idmuustpyvwhoyto":"Glomed","idmuustp6dxoptiy":"Glomed","idmuustpa3f59irk":"Glomed","idmuustr25n9t2sz":"Glomed","idmuustot8xbclo9":"Glomed","idmuustot1bnzofu":"Glomed","idmuustph67vd449":"Glomed","idmuustp0skkw046":"Glomed","idmuustpn32n283f":"Glomed","idmuxr02dx2nqlo3":"Glomed","idmuxr02dxjxd4ap":"Glomed","idmuxr02dzot35a4":"Glomed","idmuxr02dzc0n7wr":"Glomed","idmuxr02du3kgwg7":"Glomed","idmuxr02drbgp19v":"Glomed","idmuxr02dt1bj1d7":"Glomed","idmuxr02dxo1hahi":"Glomed","idmuuv8xxyb0q035":"Glomed","idmuuv8xt2k7pb32":"Glomed","idmuuv8xukxzxf5o":"Glomed","idmuuv8xuzg8rsop":"Glomed","idmuuv8xvr2s576d":"Glomed","idmuuv8xwy5da1d8":"Glomed","idmuuv8xxca9npv4":"Glomed","idmuuv8xpq46du07":"Glomed","idmuuv8xr01gsnqr":"Glomed","idmuuv8xr9zf0du7":"Glomed","idmuuv8xsqpzql72":"Glomed","idmuuv8xvebt59vp":"Glomed","idmuuv8xx4gi0yq0":"Glomed","idmuuv8xp20p6vd0":"Glomed","idmuuv8xkj42rlri":"Glomed","idmuuv8xdxnf8yz7":"Glomed","idmuuv8xf2oiulww":"Glomed","idmuuv8xkhrougzi":"Glomed","idmuuv8xnph4cupo":"Glomed","idmuuv8xoqzkzzsj":"Glomed","idmuuv8xrqiimmuq":"Glomed","idmuuv8xs5nq3t49":"Glomed","idmuuv8xvk2hj2ae":"Glomed","idmuuv8xw9ms2h6k":"Glomed","idmuuv8xyicuuzm0":"Glomed","idmuuv8xojdtwuhs":"Glomed","idmuuv8xrgy6z6me":"Glomed","idmuuv8xn17m2zgx":"Glomed","idmuuv8xzh9nybo2":"Glomed","idmuuv8xzh6r3mas":"Glomed","idmuxr3uxdfq7y8z":"Glomed","idmuxr3uxcsy9h50":"Glomed","idmuxr3uxd624u72":"Glomed","idmuusqcinnz1glm":"Glomed","idmuusqciofchod7":"Glomed","idmuusqchy6wuaik":"Glomed","idmuusqchgl0gdkr":"Glomed","idmuusqcbkg801e8":"Glomed","idmuusqcf9ke9zi9":"Glomed","idmuusqcfl4udqvo":"Glomed","idmuusqcfxp9k7x4":"Glomed","idmuusqcfxpm6e57":"Glomed","idmuusqchg7shc5b":"Glomed","idmuusqciqgfk13k":"Glomed","idmuusqchg3ekajr":"Glomed","idmuusqc7qm64orl":"Glomed","idmuusqcbk2l31l3":"Glomed","idmuusqc6r33vs47":"Glomed","idmuusqcgbdqdw15":"Glomed","idmuusqc5ovah9h5":"Glomed","idmuusqcah3q8fgc":"Glomed","idmuusqc9s9brugm":"Glomed","idmuustobapvmphg":"Glomed","idmuustolqdpu4oq":"Glomed","idmuusto5r5jixc1":"Glomed","idmuustoak03s9x4":"Glomed","idmuustormsyqwlg":"Glomed","idmuustozozlf5ty":"Glomed","idmuustog0hc8xnm":"Glomed","idmuustogbipdj8v":"Glomed","idmuustofpja0zda":"Glomed","idmuustorz6tun7j":"Glomed","idmuustp00dz9pjm":"Glomed","idmuustod96m4ovl":"Glomed","idmuustohjnuoctj":"Glomed","idmuusto4emb2zld":"Glomed","idmuustoc5z7ys9d":"Glomed","idmuusto9qfyd7hc":"Glomed","idmuustolu71atsa":"Glomed","idmuusto4iw9m88p":"Glomed","idmuxr02gd34tm19":"Glomed","idmuxr02gs890ibx":"Glomed","idmuxr5a3hzxnb25":"Glomed","idmuuv8y269lw7lf":"Glomed","idmuuv8y48hv7qow":"Glomed","idmuuv8y48yyvwfz":"Glomed","idmuuv8y4ufj3qz8":"Glomed","idmuuv8y50e83arg":"Glomed","idmuuv8y508q317z":"Glomed","idmuuv8y5085mkpx":"Glomed","idmuuv8y6ho1aoyz":"Glomed","idmuuv8y6hfg2g7e":"Glomed","idmuuv8y48q7q7al":"Glomed","idmuuv8xzn53kfjf":"Glomed","idmuuv8y0gjeqixq":"Glomed","idmuuv8y0n9dad72":"Glomed","idmuuv8y12dpi8nv":"Glomed","idmuuv8y19jqibhi":"Glomed","idmuuv8y1w5cf487":"Glomed","idmuuv8y5g9p0o21":"Glomed","idmuuv8y5ocsqho8":"Glomed","idmuuv8y2r2f77az":"Glomed","idmuuv8y7ileiviv":"Glomed","idmuuv8y1aqqe5vy":"Glomed","idmuuv8y4gitqd28":"Glomed","idmuusqcnsse6cr8":"Glomed","idmuusqclilwc214":"Glomed","idmuusqcqpkldexf":"Glomed","idmuusqcsi4cymlv":"Glomed","idmuusqcnf9t1zoe":"Glomed","idmuusqcpng5ct4g":"Glomed","idmuusqcrmkk5i6a":"Glomed","idmuusqcltvqjaf5":"HNH","idmuusqcoj9i829c":"Glomed","idmuusqcnfdge3ll":"Glomed","idmuusqcnflr4p2y":"Glomed","idmuusqciotz7x6q":"Glomed","idmuusqck8hhokrg":"Glomed","idmuusqcqqrwniqt":"Glomed","idmuusqco6sex4zv":"Glomed","idmuusqcoj062hfv":"Glomed","idmuusqcpjmae18y":"Glomed","idmuusqcpj50pk6y":"Glomed","idmuusqcpjcfwc2w":"Glomed","idmuusqcpjzhji0h":"Glomed","idmuusqcpxe4lo2m":"Glomed","idmuusqcqpquv7f5":"Glomed","idmuusqcqpehq2g5":"Glomed","idmuusqcqpf2rkd8":"Glomed","idmuusqcsizdk2jg":"Glomed","idmuusqcsif9n47e":"Glomed","idmuusqcsi16ncaf":"Glomed","idmuusqcsisv3edc":"Glomed","idmuusqcsigxqoaz":"Glomed","idmuusqcsw2ldky7":"Glomed","idmuusqcrehcnzll":"Glomed","idmuusqclifbhhxs":"HNH","idmuusqcio1k7wjp":"Glomed","idmuusqclip0wuxb":"Glomed","idmuusqcml7wtwzb":"Glomed","idmuusqcnfqlbbyr":"Glomed","idmuusqcoj2e8gph":"Glomed","idmuusqcltxmxvij":"Glomed","idmuusqck8y9ndrl":"Glomed","idmuusqcpjjhnczf":"Glomed","idmuusqcli5snbag":"Glomed","idmuusqclttvmk7h":"Glomed","idmuusqcojn4d1qu":"Glomed","idmuusqcliwzl2j0":"Glomed","idmuusqcsin4s59v":"Glomed","idmuusqcm8by5rcf":"Glomed","idmuusqckt2hypfa":"Glomed","idmuusxgvthvlka2":"Glomed","idmuusxgw6y2soet":"Glomed","idmuusxguptjh176":"Glomed","idmuusxgwu80986r":"Glomed","idmuustnn34oz0c3":"Glomed","idmuustnqb9ylssf":"Glomed","idmuustnrk4kvhgc":"Glomed","idmuustnowxf6j6w":"Glomed","idmuustnomx04rna":"Glomed","idmuustnoak5eu2h":"Glomed","idmuustnxffo4ogg":"Glomed","idmuustnn9j522ge":"Glomed","idmuusto36aqh8hv":"Glomed","idmuustnjku29y3t":"Glomed","idmuustnuvcxfdp2":"Glomed","idmuxr02j31lws1h":"Glomed","idmuxr02jgcgyf84":"Glomed","idmuxr02j2jnhq12":"Glomed","idmuxr02gthe4hzb":"Glomed","idmuxr02ioh4yj2b":"Glomed","idmuuv8ygaqba7ws":"Glomed","idmuuv8yfq74bh0g":"Glomed","idmuuv8yb6gpx6k5":"Glomed","idmuuv8ya1p9h411":"Glomed","idmuuv8yenenm88p":"Glomed","idmuuv8yd0vyqmd7":"Glomed","idmuuv8yc6ekoq9u":"Glomed","idmuuv8yc6e771zm":"Glomed","idmuuv8ydygz8dzl":"Glomed","idmuuv8yc2ft7cvw":"Glomed","idmuxr3ututopsj4":"Glomed","idmuxr3uxbxuapa4":"Glomed","idmuxr3uvmpzoryz":"Glomed","idmuusqctou7h2hi":"Glomed","idmuusqcwnvhn34q":"Glomed","idmuusqcxr6ehyz2":"Glomed","idmuusqcz6hqb2dw":"Glomed","idmuusqcltis4tzb":"Glomed","idmuusqcz5ug6w88":"HNH","idmuusqcwmjn45xg":"HNH","idmuusqctz83zrfp":"Glomed","idmuusqcz5027ll3":"Glomed","idmuusqcy85a9j0c":"Glomed","idmuusqctoov14zo":"Glomed","idmuusqctzc5b696":"Glomed","idmuusqcv6ineiss":"Glomed","idmuusqcwm028ifx":"Glomed","idmuusqcxrpg2kss":"Glomed","idmuusqcz5gmwnht":"Glomed","idmuusqcz6mc4esd":"Glomed","idmuusqctz6xhq2w":"Glomed","idmuusqcvmf9llcf":"Glomed","idmuusqcz6rt396b":"Glomed","idmuusqcwmdq1m50":"Glomed","idmuusqcxqxot8y4":"Glomed","idmuusqcxrzf7uwt":"Glomed","idmuusxgtrgeo8gc":"Glomed","idmuusxgupixv8jp":"Glomed","idmuustndst3qa98":"Glomed","idmuustng2mq1712":"Glomed","idmuustnjevbtbcb":"Glomed","idmuustnnmmc9nqj":"Glomed","idmuustnbd5mxj0s":"Glomed","idmuustnarjt7som":"Glomed","idmuustni7y4gbbf":"Glomed","idmuustnil37elif":"Glomed","idmuustnixxp7cjo":"Glomed","idmuustnfyvefbym":"Glomed","idmuustn974r9pg1":"Glomed","idmuustn6va061pf":"Glomed","idmuustn6hww5gpd":"Glomed","idmuustn6o7g5kcy":"Glomed","idmuustn86uisja0":"Glomed","idmuustncv8hf7pm":"Glomed","idmuustnjybd64sj":"Glomed","idmuxr02jgfwcg3h":"Glomed","idmuxr02kssu3c6z":"Glomed","idmuxr02methbpdf":"Glomed","idmuxr02mecvm55d":"Glomed","idmuxr02mere4o1y":"Glomed","idmuuv8yj1q8xqek":"Glomed","idmuuv8yiap9x6e6":"Glomed","idmuuv8yjsi6kw4n":"Glomed","idmuuv8yhx68lqvo":"Glomed","idmuuv8yetrz86xi":"Glomed","idmuuv8yi4dn966d":"Glomed","idmuuv8yllbrlqwu":"Glomed","idmuuv8ygs56c6xq":"Glomed","idmuuv8yjn15in5b":"Glomed","idmuuv8yjnk80wi6":"Glomed","idmuuv8yfjmmupr5":"Glomed","idmuuv8ykpeqhnbk":"Glomed","idmuuv8ylfunir1b":"Glomed","idmuuv8ymtd87nun":"Glomed","idmuuv8yhnswhuzy":"Glomed","idmuuv8ygruygl3m":"Glomed","idmuxr3utt5qnq9e":"Glomed","idmuusqcyglafwls":"Glomed","idmuusqcz53onlaw":"Glomed","idmuusqczqmqnxu6":"Glomed","idmuusqd00a0jsyc":"Glomed","idmuusqd14q6imir":"Glomed","idmuusqd00obir2f":"Glomed","idmuusqd05mevw5s":"Glomed","idmuusqd06m1fj93":"Glomed","idmuusqd062lllw8":"Glomed","idmuusqd06x9bp19":"Glomed","idmuusqd00w8uyqy":"Glomed","idmuusqd151bqxi7":"Glomed","idmuusqcz6l0q2zd":"Glomed","idmuusqcz67gkamm":"Glomed","idmuusqczra5lkmd":"Glomed","idmuusqd07i49adn":"Glomed","idmuusqd0n9o0gtn":"Glomed","idmuusqd0niopjsg":"Glomed","idmuusqd0naa0oi8":"Glomed","idmuusqd06jppe5u":"Glomed","idmuusqd067r84ar":"Glomed","idmuusqd0oxp5bkw":"Glomed","idmuusqd15enpadh":"Glomed","idmuusqczalewfow":"Glomed","idmuusqd07y59fuz":"Glomed","idmuusxgrywgpj10":"Glomed","idmuusxgsrot8gh6":"Glomed","idmuustmowmq2ftu":"Glomed","idmuustn1l9tjipa":"Glomed","idmuustn1765eu9v":"Glomed","idmuustmv09ppfiw":"Glomed","idmuustn2x2i8lr9":"Glomed","idmuustmresn6o0a":"Glomed","idmuustn3oyamrnr":"Glomed","idmuustmu3jrletx":"Glomed","idmuustmm6npcwbh":"Glomed","idmuustn26rtw22q":"Glomed","idmuustn51rjhlt9":"Glomed","idmuxr02mh0q6vnj":"Glomed","idmuxr02mh533msj":"Glomed","idmuxr02mf16vj0o":"Glomed","idmuxr5a0x6c5dy2":"Glomed","idmuuv8ynnfz5pup":"Glomed","idmuuv8yoel9x0b5":"Glomed","idmuuv8ynxt4pjwm":"Glomed","idmuuv8yoy952qi6":"Glomed","idmuuv8yp9z2wqdg":"Glomed","idmuusqd29e20ah1":"Glomed","idmuusqd1jwyac4i":"Glomed","idmuusqd3jk1tbcz":"Glomed","idmuusqd3jnlnxsb":"Glomed","idmuusqd2qbzlgxv":"Glomed","idmuusqd3jxfjemn":"Glomed","idmuusqd3jzvfjsr":"HNH","idmuusqd287snv0q":"Glomed","idmuusqd2pptywp9":"Glomed","idmuusqd2q9gnjdf":"Glomed","idmuusqd2q7vuarc":"Glomed","idmuusqd2q9p3h8j":"Glomed","idmuusqd3jh8w19d":"Glomed","idmuusqd1jru8el7":"Glomed","idmuusqd15qgt8b8":"Glomed","idmuusqd27nkvajp":"Glomed","idmuusqd169f9ycj":"Glomed","idmuusqd2q9l0f6t":"Glomed","idmuusqd2pdd1zgp":"Glomed","idmuusqd154rtcap":"Glomed","idmuusqd2ry4m6wc":"Glomed","idmuusqd2rfzrgrp":"Glomed","idmuusxgoub4qey8":"Glomed","idmuusxgpniepprr":"Glomed","idmuusxgqi4ybc8r":"Glomed","idmuusxgqop8fpj9":"Glomed","idmuusxgrswywlzp":"Glomed","idmuustmbh6q08wf":"Glomed","idmuustm9w1otfl3":"Glomed","idmuustmhk2orfpk":"Glomed","idmuustmadfzynwd":"Glomed","idmuustmgnwh5nnc":"Glomed","idmuustmiqyjg8qb":"Glomed","idmuustmdz1jdwfi":"Glomed","idmuxr02mj7alu8c":"Glomed","idmuxr02mvkjndju":"Glomed","idmuuv8yqtq6i3tb":"Glomed","idmuuv8ythogx7im":"Glomed","idmuuv8yr956xgki":"Glomed","idmuuv8ys400jkf3":"Glomed","idmuuv8yqlashtkl":"Glomed","idmuuv8ysv6451hn":"Glomed","idmuuv8ytbb7fgbp":"Glomed","idmuusqd7j1gi700":"Glomed","idmuusqd5r2rs9az":"Glomed","idmuusqd6kwvmcx0":"Glomed","idmuusqd4m64zkr6":"Glomed","idmuusqd6u12crke":"Glomed","idmuusqd29zxld54":"Glomed","idmuusqd6txocujd":"Glomed","idmuusqd4mll3i8p":"HNH","idmuusqd4m2yl0ix":"Glomed","idmuusqd4mwpbc1t":"Glomed","idmuusqd4mw6x8br":"Glomed","idmuusqd4mr6rs3s":"Glomed","idmuusqd6tgobbed":"Glomed","idmuusqd2876xdaf":"Glomed","idmuusqd3w8lu4mn":"Glomed","idmuusqd3wmsw1ba":"Glomed","idmuusqd3w88i3be":"Glomed","idmuusqd64o7ezsi":"Glomed","idmuusqd6t1xrpfb":"Glomed","idmuusqd6fa2i385":"Glomed","idmuusqd7jusr3bn":"Glomed","idmuusqd3wraf3np":"HNH","idmuusqd6tuhbksh":"Glomed","idmuusqd3joa90ia":"Glomed","idmuusqd64wseufc":"Glomed","idmuusqd3jxcjjdb":"Glomed","idmuusqd6ter9k9h":"Glomed","idmuusqd4mop7369":"Glomed","idmuusqd6fxhhufz":"Glomed","idmuusqd3wr9ncw6":"Glomed","idmuustm72s0utgy":"Glomed","idmuustm887ev8g7":"Glomed","idmuustm3r2kpajy":"Glomed","idmuustm3fnbn6ci":"Glomed","idmuustm3nrt24tr":"Glomed","idmuuv8yw3tpxnd9":"Glomed","idmuuv8yw17zo0yj":"Glomed","idmuuv8yutbv2xl9":"Glomed","idmuuv8yxf2mx45x":"Glomed","idmuxr3uttbyjxwy":"Glomed","idmuxr3utt5xm2s7":"Glomed","idmuusqd7jnqw51w":"Glomed","idmuusqda1bzmpmm":"Glomed","idmuusqda2fmmbrc":"Glomed","idmuusqda3gcm4xy":"Glomed","idmuusqda24zvagg":"Glomed","idmuusqd8c4kaaa1":"HNH","idmuusqd95f8zwwx":"HNH","idmuusqd9loii478":"Glomed","idmuusqda14eiu7x":"Glomed","idmuusqd7utufptp":"Glomed","idmuusqd8bvu7dss":"Glomed","idmuusqd8cdg57jf":"Glomed","idmuusqda2dn4n07":"Glomed","idmuusqda192hkrm":"Glomed","idmuusqdbwbt7op4":"Glomed","idmuusqda14gr2mu":"Glomed","idmuusqdbc5st7r5":"Glomed","idmuusqd7ueqc609":"Glomed","idmuusqd9lhqm6t0":"Glomed","idmuusqdbcsen55t":"Glomed","idmuusqd4m7y3xdj":"Glomed","idmuusqd8ci490mj":"Glomed","idmuusqdc4zvqixc":"Glomed","idmuusqd7k2x7yx1":"HNH","idmuusqd8bvncrz4":"Glomed","idmuusqd9kf84gbk":"Glomed","idmuusqd7j2zblnk":"Glomed","idmuusxgod1yzwc2":"Glomed","idmuusxgnpmpzt4d":"Glomed","idmuustlp0408grg":"Glomed","idmuustlhy4406g6":"Glomed","idmuustm0983mou7":"Glomed","idmuustlxzbolg59":"Glomed","idmuustlzoqtsc6a":"Glomed","idmuustljhnt52h3":"Glomed","idmuustlsvsjlcgy":"Glomed","idmuustllvuvi7ps":"Glomed","idmuustliixjwezq":"Glomed","idmuustlsjea1quy":"Glomed","idmuustlqz45hvws":"Glomed","idmuustlpz9ug4i5":"Glomed","idmuustlimx33hji":"Glomed","idmuustlz36qa2jy":"Glomed","idmuustlnumsw9pr":"Glomed","idmuustly6fexks3":"Glomed","idmuxr02njwog8n2":"Glomed","idmuxr02n6lxqhvv":"Glomed","idmuxr02nkeh8o39":"Glomed","idmuxr02pkfnuikc":"Glomed","idmuxr02mw84wfta":"Glomed","idmuuv8yytmvlfdz":"Glomed","idmuuv8yz1qq484r":"HNH","idmuuv8yxlbprugv":"Glomed","idmuuv8yxwx17rpj":"Glomed","idmuuv8yxtsjvp3r":"Glomed","idmuuv8yyxvtsf84":"Glomed","idmuuv8yz1x6jqdr":"Glomed","idmuuv8yz6ahbcow":"Glomed","idmuuv8yzby5jn63":"Glomed","idmuuv8yzltrw7jp":"Glomed","idmuuv8yxlf6wntn":"Glomed","idmuuv8yxtedlpbq":"Glomed","idmuuv8yzrukr5rk":"Glomed","idmuuv8yz6guoc6w":"Glomed","idmuuv8yz6dqs06d":"Glomed","idmuusqdg1yr2rgi":"Glomed","idmuusqdggr8tsez":"Glomed","idmuusqdgg7fvulk":"Glomed","idmuusqdc5310n83":"Glomed","idmuusqdcx5pmodr":"Glomed","idmuusqdc5dc8seq":"HNH","idmuusqdcyd5zcnx":"Glomed","idmuusqdef8557bs":"Glomed","idmuusqdicka3kj9":"Glomed","idmuusqd8dq3if1u":"Glomed","idmuusqdc5agg20e":"Glomed","idmuusqdcxcwnxcw":"Glomed","idmuusqdefg3b5zd":"Glomed","idmuusqdiq90i4pl":"Glomed","idmuusqdefod7abs":"Glomed","idmuusqdevg4mddm":"Glomed","idmuusqdg2redolk":"Glomed","idmuusqdi0snqedu":"Glomed","idmuusqdi079gz8k":"Glomed","idmuusqdicrw5ggy":"Glomed","idmuusqdic5dkbiq":"Glomed","idmuusqdcyqpqilm":"Glomed","idmuusqdi0xi830u":"Glomed","idmuusqdcxgmpmph":"Glomed","idmuusqdcxp27yed":"Glomed","idmuusqdfp2836if":"Glomed","idmuusqdg1be1j73":"Glomed","idmuusqdi0zv1edb":"Glomed","idmuusqdg11vgchv":"Glomed","idmuusqdggwz9pbt":"Glomed","idmuusqdicftn6g4":"Glomed","idmuusqdal53xgbq":"Glomed","idmuusqdiqxmd67l":"Glomed","idmuusqdc5swg50v":"HNH","idmuusqdalpc8749":"Glomed","idmuusqdcy6mw4i4":"Glomed","idmuusqdf8z1cdpb":"Glomed","idmuusqdevfgsu4w":"Glomed","idmuusqdegqfp0w5":"Glomed","idmuusqda1jmnvnz":"Glomed","idmuusqdcxiowcac":"Glomed","idmuusqdiqkz6k8j":"Glomed","idmuusxglaxzvaoy":"Glomed","idmuusxgkmfv0k30":"Glomed","idmuusxgkygesew0":"Glomed","idmuusxgkau3pnkm":"Glomed","idmuusxglv22p3qd":"Glomed","idmuusxgmqk5ef9f":"Glomed","idmuusxgngym2a7o":"Glomed","idmuustl4fm0os6c":"Glomed","idmuustl4knpav22":"Glomed","idmuustkwpg9howy":"Glomed","idmuustl7cjhqed9":"Glomed","idmuustl8mxufby6":"Glomed","idmuustkwunkpk65":"Glomed","idmuustkxqokt48p":"Glomed","idmuustkuymg6ibt":"Glomed","idmuustlb6xxreph":"Glomed","idmuustku10tntqy":"Glomed","idmuustl65qiu75q":"Glomed","idmuustl55rkcr69":"Glomed","idmuustktqt7494c":"Glomed","idmuustl5vmdtn40":"Glomed","idmuustl6gyb05eh":"Glomed","idmuustl6vrewvs7":"Glomed","idmuustl4vrkjraq":"Glomed","idmuustlh4o2tt0m":"Glomed","idmuustlm8dnccp2":"Glomed","idmuustkos5ziil3":"Glomed","idmuustl5gus46yv":"Glomed","idmuustklunnkmeb":"Glomed","idmuustlbbpc0lhw":"Glomed","idmuustkw0aobyt5":"Glomed","idmuustl1wumz866":"Glomed","idmuustl1suh6pvm":"Glomed","idmuustkr365az3g":"Glomed","idmuustko9tni7sm":"Glomed","idmuustl1bhlfmf4":"Glomed","idmuustkyisohawr":"Glomed","idmuustlfwy1bsve":"Glomed","idmuxr02r702rp53":"Glomed","idmuxr02r6enzdxl":"Glomed","idmuxr02pliq3znq":"Glomed","idmuxr02puno779k":"Glomed","idmuxr02pu7adlub":"Glomed","idmuxr02pux9nu44":"Glomed","idmuxr02px5n1hcj":"Glomed","idmuxr02pxuk1h20":"Glomed","idmuxr02pxmg9ax0":"Glomed","idmuxr02r5qjtjcl":"Glomed","idmuxr02r59f4ohf":"Glomed","idmuxr02plriy18c":"Glomed","idmuxr02pw0ry2de":"Glomed","idmuxr02pxq4wylb":"Glomed","idmuxr02nyduo85b":"Glomed","idmuxr02r771p6f9":"Glomed","idmuuv8z2ayoxnru":"Glomed","idmuuv8z0rhgt7id":"HNH","idmuuv8z2n0cpqik":"Glomed","idmuuv8z31tad801":"Glomed","idmuuv8z2tewf821":"Glomed","idmuuv8z1yn3v5oq":"Glomed","idmuuv8z0qc5vtq0":"Glomed","idmuuv8z2g3h0xuq":"HNH"},"groups":{"idmuusqbb4m5i6ux":{"t":"Glomed","c":["idmuusqbb4m5i6ux~Glomed"]},"idmuusqbdt3ipchx":{"t":"Glomed","c":["idmuusqbdt3ipchx~Glomed"]},"idmuusqbzlte6esw":{"t":"Glomed","c":["idmuusqbzlte6esw~HNH"]},"idmuusqcu08rccq5":{"t":"Glomed","c":["idmuusqcu08rccq5~HNH"]},"idmuusqd7jmpbzng":{"t":"Glomed","c":["idmuusqd7jmpbzng~Glomed"]},"idmuusqdc461pcfd":{"t":"Glomed","c":["idmuusqdc461pcfd~HNH"]},"idmuusqd9kgy9zrj":{"t":"Glomed","c":["idmuusqd9kgy9zrj~Glomed"]},"idmuusqdg18n57hp":{"t":"Glomed","c":["idmuusqdg18n57hp~HNH"]}},"lock":{"idmuusqaerhmog37":"HNH","idmuusqag9xceoi4":"HNH","idmuusqaed49kwr1":"Glomed","idmuusqaedtamnfk":"Glomed","idmuusqag8ujb5rx":"Glomed","idmuusqag9do0xzt":"Glomed","idmuusqacht8jxgd":"Glomed","idmuusqacidmjver":"Glomed","idmuusqadov21oph":"Glomed","idmuusqaedm9cqtu":"Glomed","idmuusqaedp9rk84":"Glomed","idmuusqaedptars1":"Glomed","idmuusqaedcdp3yf":"Glomed","idmuusqaedh8z7oh":"Glomed","idmuusqaer1egutk":"Glomed","idmuusqaer2p3cl3":"Glomed","idmuusqafiu5og8e":"Glomed","idmuusqafiuotn0q":"Glomed","idmuusqag85aj6sg":"Glomed","idmuusqag9wu62q5":"Glomed","idmuusqafjdm1lam":"Glomed","idmuusqaaogsttm2":"Glomed","idmuusqadoo9ber8":"Glomed","idmuusqaedc5qi55":"Glomed","idmuusqaeq20yhv3":"Glomed","idmv2bjyvqas4gby":"HNH","idmuusu5ufmkjunu":"Glomed","idmuusu5y9wx8oj1":"Glomed","idmuusu5ytaedcg1":"Glomed","idmuusu5xqmcs1om":"Glomed","idmuxr01mx9jhir1":"HNH","idmuxr01pkin5n4e":"Glomed","idmuuv8wiow6m0fw":"Glomed","idmuuv8wiojq986v":"Glomed","idmuusqag9usbgqc":"Glomed","idmuusqal1f1lkvt":"Glomed","idmuusqapbaabsaz":"Glomed","idmuusqaobaa62nh":"Glomed","idmuusqaoueaio1z":"HNH","idmuusqaovm3aj2r":"HNH","idmuusqapw4b279z":"HNH","idmuusqahrgb23z9":"Glomed","idmuusqaogbhqvux":"Glomed","idmuusqap78105um":"Glomed","idmuusqanjvzi1s3":"Glomed","idmuusqaimyzohgy":"Glomed","idmuusqaga8kog4k":"Glomed","idmuusqagaac14hh":"Glomed","idmuusqaovoodaip":"Glomed","idmuusqal19q3h5j":"Glomed","idmuusqalgwje8hi":"Glomed","idmuusqalvqhwo46":"Glomed","idmuusqao9z8cna9":"Glomed","idmuusqaobe3y7in":"Glomed","idmuusqapwj5suha":"Glomed","idmuusqainqvjyym":"Glomed","idmuusqanjzithzy":"Glomed","idmuusqag99cris1":"Glomed","idmuusu4vhlj4sqe":"Glomed","idmuusu52f7y0945":"Glomed","idmuusu55hx4pplh":"Glomed","idmuusu4d0p8lr4i":"Glomed","idmuuv8wr4p59jl1":"Glomed","idmuuv8wp7rzo7ih":"HNH","idmuxr01rd4x9qeh":"Glomed","idmuxr5a54devpj8":"Glomed","idmuusqaylh30dlu":"Glomed","idmuusqavalvlx7u":"Glomed","idmuusqapwztyh9s":"Glomed","idmuusqaq6bz1lwk":"Glomed","idmuusqavcyl8r4q":"Glomed","idmuusqatzc2xxgv":"Glomed","idmuusqatybkb2ik":"Glomed","idmuusqatyxrom8o":"Glomed","idmuusqayka6hut5":"Glomed","idmuusqaq6cs7xdv":"HNH","idmuusqas7x9sics":"HNH","idmuusqax5bfa9ut":"Glomed","idmuusqay1u2lndo":"Glomed","idmuusqaq74e1ldx":"Glomed","idmuusqas64bphg1":"Glomed","idmuusqavbpfxohy":"Glomed","idmuusqavb3d936s":"Glomed","idmuusqay1precq7":"Glomed","idmuusqazxdvtj00":"Glomed","idmuusqaq7rv4zw7":"Glomed","idmuusqavb3q9r6s":"Glomed","idmuusqavbn6etvt":"Glomed","idmuusqazw9jdg3b":"Glomed","idmuusqazw20yajz":"Glomed","idmuusqavb257bn2":"Glomed","idmuusqazwo57i85":"Glomed","idmuusqas7u3vpks":"Glomed","idmuusqaykcet1ix":"Glomed","idmuusqaq64ebkwd":"Glomed","idmuusqaxhx8rvx3":"Glomed","idmuusqatzhjktza":"HNH","idmuusu3y7cjt728":"Glomed","idmuusu44u431pqr":"Glomed","idmuuv8wybvnv9xi":"HNH","idmuuv8wvjyvju3b":"Glomed","idmuuv8wv6o4hjwe":"HNH","idmuuv8ws7mk83y0":"HNH","idmuxr021ih6qg6c":"Glomed","idmuusqb4mwtgbz8":"Glomed","idmuusqayxrzmf69":"Glomed","idmuusqb3b27fap4":"Glomed","idmuusqb2u39osjr":"Glomed","idmuusqb2ciws3vn":"Glomed","idmuusqb5f4hrdob":"HNH","idmuusqb1v1hw7pk":"HNH","idmuusqawokt7ro2":"HNH","idmuusqb0bu0cuvp":"HNH","idmuusqb8tciwt63":"Glomed","idmuusqb52p40gnt":"Glomed","idmuusqb2cufk5ha":"Glomed","idmuusqb1wedglh3":"Glomed","idmuusqb1wwuc2ap":"Glomed","idmuusqb2u08wcz4":"Glomed","idmuusqb3byrdlb7":"Glomed","idmuusqb1vjrhpy1":"Glomed","idmuusqb2ccexmjd":"Glomed","idmuusqb2dbzmo6o":"Glomed","idmuusqb2uxm2mn3":"Glomed","idmuusqb3aw38tzu":"Glomed","idmuusqb4mpvonii":"Glomed","idmuusqb520pr4p2":"Glomed","idmuusqb5fzze1wz":"Glomed","idmuusqb773hffw9":"Glomed","idmuusqazwhholxr":"Glomed","idmuusqb2dgl9tgo":"Glomed","idmuusqb3by5yul7":"Glomed","idmuusqb3bqzexoj":"Glomed","idmuusqb81bnq6vz":"Glomed","idmuusqb1wnm3zkd":"HNH","idmuusqb3cyy65eb":"Glomed","idmuustx622ipyuk":"Glomed","idmuustzfu9jzso5":"Glomed","idmuustxbogw5sri":"HNH","idmuustzlp2c7reh":"Glomed","idmuustxlq8sr080":"HNH","idmuustyy9jxuvsg":"Glomed","idmuustza7llutg8":"Glomed","idmuusu2hoi91s51":"Glomed","idmuxr021zv8wuuq":"HNH","idmuuv8x3sfvq7jr":"Glomed","idmuuv8x3ffr0s2o":"HNH","idmuuv8x35nd727g":"HNH","idmuuv8x2esac4ki":"Glomed","idmuuv8x5bgyuk13":"Glomed","idmuuv8x61jpmdk5":"Glomed","idmuusqbap7u4cb0":"Glomed","idmuusqb9izygnvu":"Glomed","idmuusqb9k2r5x4v":"Glomed","idmuusqbarkr42mm":"Glomed","idmuusqbb4kikkro":"Glomed","idmuusqb9kyu1he1":"Glomed","idmuusqb9zhmdj84":"Glomed","idmuusqbar4rdk99":"Glomed","idmuusqbardnyki6":"Glomed","idmuusqbarxfdu6j":"Glomed","idmuusqbb41v8n0e":"Glomed","idmuusqbb4e43b3f":"Glomed","idmuusqb9ziolv4n":"Glomed","idmuusqbb3pcck2r":"HNH","idmuusqbaq2atxit":"HNH","idmuusqbaqbzb7na":"HNH","idmuusqb9inxjqei":"Glomed","idmuusqbaqxj9v54":"Glomed","idmuusqbaqs56z6e":"Glomed","idmuusqb9ks7ad1k":"Glomed","idmuusqb9zf5bx07":"Glomed","idmuusqbaqugi96r":"Glomed","idmuusqbaqgbgse7":"Glomed","idmuusqbaq16nkjr":"Glomed","idmuusqbadxfyscc":"Glomed","idmuusqbar5wmfde":"Glomed","idmuusqbaqnh1a35":"Glomed","idmuusqbb4lsi6m6":"Glomed","idmuusqbar8qlgxf":"Glomed","idmuustx3zbvy2om":"Glomed","idmuustwh2oqdwtu":"HNH","idmuustwri1keqfo":"Glomed","idmuxr025dbpagal":"HNH","idmuuv8x7t3w9n19":"Glomed","idmuuv8x62p6eirl":"HNH","idmuuv8x62bjr70g":"HNH","idmuuv8x9t58am4w":"Glomed","idmuuv8x9j3ciu37":"HNH","idmuuv8x9jviohfn":"HNH","idmuuv8x7ukmpy2i":"HNH","idmuuv8x9jy16bqg":"Glomed","idmuusqbardo0yy3":"Glomed","idmuusqbc31zgvji":"Glomed","idmuusqbc3dhotu1":"Glomed","idmuusqbcyahnrlq":"Glomed","idmuusqbf1dul5bz":"Glomed","idmuusqbb5y7xauz":"Glomed","idmuusqbcihuxlql":"Glomed","idmuusqbi3s1hevx":"Glomed","idmuusqbbi4as3vw":"Glomed","idmuusqbasicrq9r":"Glomed","idmuusqbc3twvv04":"Glomed","idmuusqbfy5p99uo":"Glomed","idmuusqbcjzji3d7":"Glomed","idmuusqbiojqa4qv":"HNH","idmuusqbidwddbdm":"HNH","idmuusqbcjsbh4fl":"HNH","idmuusqbcjercy8h":"HNH","idmuusqbdebzv8aq":"HNH","idmuusqbggy2oiiv":"Glomed","idmuusqbj2gn4h8p":"Glomed","idmuusqbas1ygjgu":"Glomed","idmuusqben9ryw24":"Glomed","idmuusqbf1965k4e":"Glomed","idmuusqbfysok4wj":"Glomed","idmuusqbgf530l9p":"Glomed","idmuusqbgf8b86rq":"Glomed","idmuusqbgfgzeckd":"Glomed","idmuusqbgg0f9c6y":"Glomed","idmuusqbgg05b8db":"Glomed","idmuusqbhqum8dvd":"Glomed","idmuusqbi3msatq3":"Glomed","idmuusqbj2q8n1sc":"Glomed","idmuusqbj31u33k8":"Glomed","idmuusqbcx3oz6ga":"Glomed","idmuusqbf05o0hv1":"Glomed","idmuusqbj282hn36":"Glomed","idmuusqbfi14c517":"HNH","idmuusqbcilu2c4q":"Glomed","idmuusqbcj4dvdtp":"Glomed","idmuusqbck44of0h":"Glomed","idmuusqbcxmsh0m9":"Glomed","idmuusqbdeotqdht":"Glomed","idmuusqbde9x3s63":"Glomed","idmuusqbeougubhh":"Glomed","idmuusqbeycxn3cu":"Glomed","idmuusqbey0edim5":"Glomed","idmuusqbeyrdbs6o":"Glomed","idmuusqbez0rgt5e":"Glomed","idmuusqbez550kef":"Glomed","idmuusqbezi2vm8k":"Glomed","idmuusqbezujngs9":"Glomed","idmuusqbezxjbzvd":"Glomed","idmuusqbf0t7vemq":"Glomed","idmuusqbf02j680s":"Glomed","idmuusqbf001d4ai":"Glomed","idmuusqbf0j1epg2":"Glomed","idmuusqbfht2xrxg":"Glomed","idmuusqbfi4csotr":"Glomed","idmuusqbfi7mlr4d":"Glomed","idmuusqbfih9s5t2":"Glomed","idmuusqbfiw1t3kx":"Glomed","idmuusqbfiw8m0by":"Glomed","idmuusqbfjojjb1l":"Glomed","idmuusqbfjv1yjux":"Glomed","idmuusqbfjxne5da":"Glomed","idmuusqbgiduytvy":"Glomed","idmuusqbgidj9clg":"Glomed","idmuusqbgikuzh9c":"Glomed","idmuusqbgv7e5w1n":"Glomed","idmuusqbgvebcgq2":"Glomed","idmuusqbjrvmopzy":"Glomed","idmuusqbc7828ogg":"Glomed","idmuusqbcj7piewe":"Glomed","idmuusqbcxfbzxez":"Glomed","idmuusqbdepcss4l":"Glomed","idmuusqbdet6cnpe":"Glomed","idmuusqbe6v463h0":"Glomed","idmuusqbeyf1vzdk":"Glomed","idmuusqbezwhs14b":"Glomed","idmuusqbf0vbtnm0":"Glomed","idmuusqbf09etrrv":"Glomed","idmuusqbf1px9bem":"Glomed","idmuusqbf1fpm3m7":"Glomed","idmuusqbfjgrmy05":"Glomed","idmuusqbfjobezul":"Glomed","idmuusqbfk5067sw":"Glomed","idmuusqbfwzee8m9":"Glomed","idmuusqbfx63se9w":"Glomed","idmuusqbfy1e65gh":"Glomed","idmuusqbfyrogwn8":"Glomed","idmuusqbgf2awcl3":"Glomed","idmuusqbgfk9pp7t":"Glomed","idmuusqbgfbmmrg6":"Glomed","idmuusqbggwq79u3":"Glomed","idmuusqbggbs3x9m":"Glomed","idmuusqbgg3e6byp":"Glomed","idmuusqbgg0uib3d":"Glomed","idmuusqbggd9i2ai":"Glomed","idmuusqbghwsi7e4":"Glomed","idmuusqbghg6q795":"Glomed","idmuusqbghfzy7vv":"Glomed","idmuusqbghahjsj6":"Glomed","idmuusqbgv0wu823":"Glomed","idmuusqbgvhjp4tm":"Glomed","idmuusqbgva8k4ha":"Glomed","idmuusqbgvydzxnw":"Glomed","idmuusqbgvmzu2ib":"Glomed","idmuusqbgw0ryf9u":"Glomed","idmuusqbgw5hi5du":"Glomed","idmuusqbhc2vyzrw":"Glomed","idmuusqbhcologn5":"Glomed","idmuusqbhcbbdsgd":"Glomed","idmuusqbhcau9krs":"Glomed","idmuusqbhcbekx2v":"Glomed","idmuusqbhc2syuip":"Glomed","idmuusqbhq4blqea":"Glomed","idmuusqbhqd9vbtg":"Glomed","idmuusqbi3m8lb7v":"Glomed","idmuusqbioryg0a4":"Glomed","idmuusqbio9qnrxk":"Glomed","idmuusqbj2ystrha":"Glomed","idmuusqbj2nwjken":"Glomed","idmuusqbj24g7d1d":"Glomed","idmuusqbj20j91hd":"Glomed","idmuusqbj3p4llit":"Glomed","idmuusqbj3zaba4x":"Glomed","idmuusqbj3lytjb3":"Glomed","idmuusqbj30fvhwd":"Glomed","idmuusqbjq686x6r":"Glomed","idmuusqbjq4ogv1q":"Glomed","idmuusqbeo99sjxj":"Glomed","idmuusqbeyrigg5m":"Glomed","idmuusqbc4zjun2w":"Glomed","idmuusqbch9l1uya":"Glomed","idmuusqbch3qipik":"Glomed","idmuusqbcid6cjip":"Glomed","idmuusqbciybd6fe":"Glomed","idmuusqbcit2gemc":"Glomed","idmuusqbcigxkfpo":"Glomed","idmuusqbcis6ipqn":"Glomed","idmuusqbcikq2ba3":"Glomed","idmuusqbcj1ouwtl":"Glomed","idmuusqbcjzz9zzu":"Glomed","idmuusqbcjlmddep":"Glomed","idmuusqbcjudrfq8":"Glomed","idmuusqbcjct8z3o":"Glomed","idmuusqbcjtn2h23":"Glomed","idmuusqbcjuz7njv":"Glomed","idmuusqbcjwlfkmb":"Glomed","idmuusqbcjj5x0x4":"Glomed","idmuusqbcjgkki80":"Glomed","idmuusqbck5x9a6e":"Glomed","idmuusqbckzc9t2o":"Glomed","idmuusqbckjunxw4":"Glomed","idmuusqbdeugy3oj":"Glomed","idmuusqbdee48q5w":"Glomed","idmuusqben9v1zqi":"Glomed","idmuusqbeom3naxr":"Glomed","idmuusqbeo7u709o":"Glomed","idmuusqbeoxdrpot":"Glomed","idmuusqbeo63vnn0":"Glomed","idmuusqbeyzi6ni8":"Glomed","idmuusqbeya5spka":"Glomed","idmuusqbey7j4plp":"Glomed","idmuusqbeyf1e432":"Glomed","idmuusqbeykdr2xs":"Glomed","idmuusqbeylcg7cm":"Glomed","idmuusqbeytp0xva":"Glomed","idmuusqbfy13p5wd":"Glomed","idmuusqbgfhzy1bc":"Glomed","idmuusqbgfsuh2yl":"Glomed","idmuusqbgf04vilj":"Glomed","idmuusqbggr2fwqr":"Glomed","idmuusqbggijwk8m":"Glomed","idmuusqbj3bl0gs5":"Glomed","idmuusqbj35rvqpw":"Glomed","idmuusqbjr65td96":"Glomed","idmuusqbc4try8ld":"Glomed","idmuusqbc4shrfd7":"Glomed","idmuusqbc4cftkbu":"Glomed","idmuusqbc4vk3yos":"Glomed","idmuusqbc4t97ur5":"Glomed","idmuusqbc47x9uwf":"Glomed","idmuusqbc75z2hn3":"Glomed","idmuusqbc71usubn":"Glomed","idmuusqbc7u8w3md":"Glomed","idmuusqbc7ho8ojz":"Glomed","idmuusqbc7q70lay":"Glomed","idmuusqbc7iivrc5":"Glomed","idmuusqbchudwrn6":"Glomed","idmuusqbcihbgmjq":"Glomed","idmuusqbci2qz88m":"Glomed","idmuusqbcj3vrbqh":"Glomed","idmuusqbckpsom5a":"Glomed","idmuusqbck0uu5kk":"Glomed","idmuusqbckpe2s6b":"Glomed","idmuusqbcxr4v48w":"Glomed","idmuusqbcxqdfneu":"Glomed","idmuusqbcykb6a6b":"Glomed","idmuusqbde0145pm":"Glomed","idmuusqbdeb5u298":"Glomed","idmuusqbdem7gkz6":"Glomed","idmuusqbdes60mnd":"Glomed","idmuusqbdeug5k38":"Glomed","idmuusqbdejn6718":"Glomed","idmuusqbdeeewbwa":"Glomed","idmuusqbde4wd285":"Glomed","idmuusqbdeb345di":"Glomed","idmuusqbdexc8pnu":"Glomed","idmuusqbdec1bzve":"Glomed","idmuusqbdetjqnqv":"Glomed","idmuusqbdf5skni2":"Glomed","idmuusqbdt72qob8":"Glomed","idmuusqbdtfne7p2":"Glomed","idmuusqbdtlknmcw":"Glomed","idmuusqbdtwcesmz":"Glomed","idmuusqbdtfocmfa":"Glomed","idmuusqbe6obn2nz":"Glomed","idmuusqben9nkb4c":"Glomed","idmuusqbengj613e":"Glomed","idmuusqbena3s42y":"Glomed","idmuusqbeo825ed0":"Glomed","idmuusqbeo5gqncy":"Glomed","idmuusqbeobfyy85":"Glomed","idmuusqbeolov4d8":"Glomed","idmuusqbeo41xpzf":"Glomed","idmuusqbeylszeqh":"Glomed","idmuusqbeyg5yatv":"Glomed","idmuusqbey7orgc4":"Glomed","idmuusqbey4t2oiz":"Glomed","idmuusqbey9aj9dr":"Glomed","idmuusqbey1n25b9":"Glomed","idmuusqbeymwflke":"Glomed","idmuusqbeymz8cx7":"Glomed","idmuusqbeydhjcz2":"Glomed","idmuusqbeyfuhcav":"Glomed","idmuusqbeyxi85vp":"Glomed","idmuusqbey6sx4pu":"Glomed","idmuusqbez8s0cnh":"Glomed","idmuusqbezrzqbf7":"Glomed","idmuusqbez7mg9ee":"Glomed","idmuusqbezwh8oa8":"Glomed","idmuusqbezw5af7j":"Glomed","idmuusqbez6xn8s8":"Glomed","idmuusqbezs3a2jh":"Glomed","idmuusqbez6kp6v7":"Glomed","idmuusqbez64sr3q":"Glomed","idmuusqbezytkpbp":"Glomed","idmuusqbf0t83ilc":"Glomed","idmuusqbf09rxp0x":"Glomed","idmuusqbf0lvqbhz":"Glomed","idmuusqbf0i7h35r":"Glomed","idmuusqbf0zyb4ce":"Glomed","idmuusqbf0naxllg":"Glomed","idmuusqbf0kg5uph":"Glomed","idmuusqbf13qe5pa":"Glomed","idmuusqbf1o5dygi":"Glomed","idmuusqbf1ti6u8g":"Glomed","idmuusqbf1zvnfdf":"Glomed","idmuusqbf1zhcmnm":"Glomed","idmuusqbf1drsdqb":"Glomed","idmuusqbf15dtogi":"Glomed","idmuusqbf1z23mru":"Glomed","idmuusqbfhm5bkol":"Glomed","idmuusqbfidp9lrf":"Glomed","idmuusqbfinv52k7":"Glomed","idmuusqbfi1grnvq":"Glomed","idmuusqbfirwjdul":"Glomed","idmuusqbfiteff9k":"Glomed","idmuusqbfyl784bb":"Glomed","idmuusqbfyt8eo21":"Glomed","idmuusqbjeitner0":"Glomed","idmuusqbjq9q20hb":"Glomed","idmuusqbjqgbtebt":"Glomed","idmuusqbjqqwhkh6":"Glomed","idmuusqbcxgm89eo":"HNH","idmuusqbeo93vpr5":"HNH","idmuusqbf0eba2kb":"HNH","idmuusqbc45d8kv9":"Glomed","idmuusqbc33uyk0z":"Glomed","idmuusqbf0nd7q5p":"Glomed","idmuusxgxuuxt80v":"HNH","idmuustrrgqf29hx":"Glomed","idmuustw9vnptb1w":"Glomed","idmuustwcz2a36fx":"Glomed","idmuustwayakse3t":"Glomed","idmuustsct04rpy3":"HNH","idmuustrqvt9lfx4":"Glomed","idmuustrs2n9k06p":"Glomed","idmuustsndb1hzte":"Glomed","idmuusttey6rbz1l":"Glomed","idmuusttt3abvj55":"Glomed","idmuustvgqbtl6sh":"Glomed","idmuxr0287l8nc8t":"Glomed","idmuxr0282xfkbop":"Glomed","idmuxr02817ci11z":"Glomed","idmuxr02826lnmw6":"Glomed","idmuxr02857gyi91":"Glomed","idmuxr0287k1tvs1":"Glomed","idmuxr028ar7jext":"Glomed","idmuuv8xdjdk2bic":"Glomed","idmuusqbzojauxdx":"Glomed","idmuusqc6ixga5p7":"Glomed","idmuusqbk7dd0yqj":"Glomed","idmuusqc6gw7nrcz":"HNH","idmuusqbt8iz0563":"HNH","idmuusqc2idkmzvu":"HNH","idmuusqbmdzl5onx":"Glomed","idmuusqbzkn6nbir":"Glomed","idmuusqbzkm55gkf":"Glomed","idmuusqbzkm7unet":"Glomed","idmuusqbl0wutrw4":"Glomed","idmuusqbmsk41gsr":"Glomed","idmuusqbnmjsxpz1":"Glomed","idmuusqbocodot2w":"Glomed","idmuusqbuyheodfy":"Glomed","idmuusqbvemuw4x6":"Glomed","idmuusqbwunoi6yn":"Glomed","idmuusqbxduhwcc0":"Glomed","idmuusqbxd48jd77":"Glomed","idmuusqbyb4jebzy":"Glomed","idmuusqbzhlffhh5":"Glomed","idmuusqbzjkxo76f":"Glomed","idmuusqbzl8klsq5":"Glomed","idmuusqbzlg3k8k6":"Glomed","idmuusqbzlm1uvvr":"Glomed","idmuusqbzmamns5c":"Glomed","idmuusqbxbt4tzgt":"Glomed","idmuusqbzmu546i8":"Glomed","idmuusqbznmgtb43":"Glomed","idmuusqbzp5oo27u":"Glomed","idmuusqc2j7771no":"Glomed","idmuusqc2j24tbx6":"Glomed","idmuusqbjrdaklog":"Glomed","idmuusqbknkgdxkj":"Glomed","idmuusqbl05x31mz":"Glomed","idmuusqbli3nmdvh":"Glomed","idmuusqbn8cw32te":"Glomed","idmuusqbnkf4f9i1":"Glomed","idmuusqbnlj18ex7":"Glomed","idmuusqbq8hrvhm7":"Glomed","idmuusqbven9olp2":"Glomed","idmuusqbvesdvm3f":"Glomed","idmuusqbwdmkf4rk":"Glomed","idmuusqbwdw2jsvo":"Glomed","idmuusqbwuhnh1jj":"Glomed","idmuusqbyq9r10vx":"Glomed","idmuusqbzhs40txl":"Glomed","idmuusqbzkvzyjka":"Glomed","idmuusqbxdh3jyj7":"Glomed","idmuusqc61lg9suc":"Glomed","idmuusqc6255o07g":"Glomed","idmuusqbfihom9qv":"Glomed","idmuusqbk7urj9u5":"Glomed","idmuusqblialtmrd":"Glomed","idmuusqbljfdfw40":"Glomed","idmuusqbmemsx5fk":"Glomed","idmuusqbmrfitcwe":"Glomed","idmuusqbmsx97wrf":"Glomed","idmuusqbmtzy1vkl":"Glomed","idmuusqbmv4c7qte":"Glomed","idmuusqbn8ptlc13":"Glomed","idmuusqbnlq8iruf":"Glomed","idmuusqbnlhwj5af":"Glomed","idmuusqbnlw58w53":"Glomed","idmuusqbnlltk7cc":"Glomed","idmuusqbnmc9z19m":"Glomed","idmuusqbnmutwza8":"Glomed","idmuusqbnmcbzgjo":"Glomed","idmuusqbnmlrimo9":"Glomed","idmuusqbocy76az4":"Glomed","idmuusqboc9xhqrr":"Glomed","idmuusqbphh6yusr":"Glomed","idmuusqbph88uyci":"Glomed","idmuusqbph0k6osn":"Glomed","idmuusqbph5yf681":"Glomed","idmuusqbqocok6em":"Glomed","idmuusqbr2dup464":"Glomed","idmuusqbrgbdenqg":"Glomed","idmuusqbrh5t8ixs":"Glomed","idmuusqbsuq4wnxm":"Glomed","idmuusqbsu5lpy68":"Glomed","idmuusqbt8v6wtij":"Glomed","idmuusqbwtxkrd6p":"Glomed","idmuusqbxb2i01ei":"Glomed","idmuusqbxch88rb4":"Glomed","idmuusqbxdp00d7k":"Glomed","idmuusqbxeev423t":"Glomed","idmuusqbxe4xvkwi":"Glomed","idmuusqbyaww9ksx":"Glomed","idmuusqbyafjdke0":"Glomed","idmuusqbybafw7l6":"Glomed","idmuusqbzgq0n1p0":"Glomed","idmuusqbzgpv37bi":"Glomed","idmuusqbzghpmq1c":"Glomed","idmuusqbzhygdpl5":"Glomed","idmuusqbzi457o3j":"Glomed","idmuusqbziw36uko":"Glomed","idmuusqbzj7r41tj":"Glomed","idmuusqbzjd65oof":"Glomed","idmuusqbzjapdnqt":"Glomed","idmuusqbzjyxkqep":"Glomed","idmuusqbzj9fmqir":"Glomed","idmuusqbzj0xyueo":"Glomed","idmuusqbzk36z3ma":"Glomed","idmuusqbzk6a1ysh":"Glomed","idmuusqbzktiyimi":"Glomed","idmuusqbzkraho41":"Glomed","idmuusqbzk76lhft":"Glomed","idmuusqbzk3rkjym":"Glomed","idmuusqbzkun2o5j":"Glomed","idmuusqbzkiaspkb":"Glomed","idmuusqbzkbt3cpy":"Glomed","idmuusqbzksmzanj":"Glomed","idmuusqbzlpav2f5":"Glomed","idmuusqbzlh3o64e":"Glomed","idmuusqbzlp2f5i5":"Glomed","idmuusqbzl9b6mxt":"Glomed","idmuusqbzlga3rgk":"Glomed","idmuusqbzlfs3pmd":"Glomed","idmuusqbzl6pdgrh":"Glomed","idmuusqbzmq5iaes":"Glomed","idmuusqbzmkc8pwp":"Glomed","idmuusqbzmry9lgo":"Glomed","idmuusqbzmfpnxk4":"Glomed","idmuusqbzmzhf5ag":"Glomed","idmuusqbzm0kzvru":"Glomed","idmuusqbzmgcjpd0":"Glomed","idmuusqbzmlhgof8":"Glomed","idmuusqbznhl8q8p":"Glomed","idmuusqbznzp0h4m":"Glomed","idmuusqbznka59o5":"Glomed","idmuusqbznw335kn":"Glomed","idmuusqbznjq9cvm":"Glomed","idmuusqbznyosbdh":"Glomed","idmuusqbzn1zroen":"Glomed","idmuusqbzn12w15c":"Glomed","idmuusqbznyc0cxb":"Glomed","idmuusqbzn2fd262":"Glomed","idmuusqbzn6z8xx4":"Glomed","idmuusqbzn144c64":"Glomed","idmuusqbzotqbl2o":"Glomed","idmuusqbzp7jrq5l":"Glomed","idmuusqc5mwjg6h2":"Glomed","idmuusqc5ms2vfxs":"Glomed","idmuusqc61677qb3":"Glomed","idmuusqc618c7d3n":"Glomed","idmuusqbphi7hoel":"Glomed","idmuusqbveb33czt":"Glomed","idmuusqbcjkeja0u":"Glomed","idmuusqbjrexv1lw":"Glomed","idmuusqbjs33i8k7":"Glomed","idmuusqbjs7icw2l":"Glomed","idmuusqbjsttw378":"Glomed","idmuusqbk7m19oj5":"Glomed","idmuusqbknrfxpzx":"Glomed","idmuusqbknrqby83":"Glomed","idmuusqbknyxrf7z":"Glomed","idmuusqbknbx2i7d":"Glomed","idmuusqbkofpr47m":"Glomed","idmuusqbl0goywfi":"Glomed","idmuusqbl0wgw48a":"Glomed","idmuusqbl0oktos8":"Glomed","idmuusqbl0v0m6ax":"Glomed","idmuusqbl02vemo1":"Glomed","idmuusqbl01bjp5i":"Glomed","idmuusqbl09em70m":"Glomed","idmuusqbl02aikj9":"Glomed","idmuusqbl0esrbyb":"Glomed","idmuusqblhr67acr":"Glomed","idmuusqbli6vpulo":"Glomed","idmuusqblie2hm1w":"Glomed","idmuusqblizw9cl2":"Glomed","idmuusqbli37lk21":"Glomed","idmuusqblitvf3f6":"Glomed","idmuusqblicgwty5":"Glomed","idmuusqbljckx62s":"Glomed","idmuusqbljqprryr":"Glomed","idmuusqbljn1ym1k":"Glomed","idmuusqbljhz7u2s":"Glomed","idmuusqblj176gk1":"Glomed","idmuusqbljs5qx4t":"Glomed","idmuusqbljcgcrqf":"Glomed","idmuusqblj4zt5s2":"Glomed","idmuusqblkqt00yh":"Glomed","idmuusqblkkxdxv9":"Glomed","idmuusqblk1p8pnm":"Glomed","idmuusqbmrq6qfc3":"Glomed","idmuusqbmrglcuut":"Glomed","idmuusqbmr7i0jwn":"Glomed","idmuusqbmsx0b6o4":"Glomed","idmuusqbmsg2c5lc":"Glomed","idmuusqbmsvuyeky":"Glomed","idmuusqbmskad8gf":"Glomed","idmuusqbmsvhxhcn":"Glomed","idmuusqbms267kah":"Glomed","idmuusqbmsbod3z6":"Glomed","idmuusqbmt16j9vm":"Glomed","idmuusqbmtnis4nb":"Glomed","idmuusqbmt2c72g0":"Glomed","idmuusqbmtmadrkv":"Glomed","idmuusqbmtx3p6e1":"Glomed","idmuusqbmtvsvylm":"Glomed","idmuusqbmttnplmo":"Glomed","idmuusqbmt4xk07j":"Glomed","idmuusqbmud1x82v":"Glomed","idmuusqbmui53n6h":"Glomed","idmuusqbmu5f0kr8":"Glomed","idmuusqbn892dy9r":"Glomed","idmuusqc61xeayjr":"Glomed","idmuusqc61334vs1":"Glomed","idmuusqbeoagjp93":"Glomed","idmuusqbjrsn9llw":"Glomed","idmuusqbjrqogmpi":"Glomed","idmuusqbjsd89r4a":"Glomed","idmuusqbjsm8ql1k":"Glomed","idmuusqbjskx0ghm":"Glomed","idmuusqbjsl0v0hk":"Glomed","idmuusqbjsc3bl1r":"Glomed","idmuusqbjsxe32vd":"Glomed","idmuusqbjsivqj4r":"Glomed","idmuusqbk715z0yt":"Glomed","idmuusqbk70t76p6":"Glomed","idmuusqbk7jtc68j":"Glomed","idmuusqbknit725u":"Glomed","idmuusqbkomkn63q":"Glomed","idmuusqbkoqkddl0":"Glomed","idmuusqbl07ibujm":"Glomed","idmuusqbl06xoqbh":"Glomed","idmuusqbl0zjovnn":"Glomed","idmuusqbl0kishlj":"Glomed","idmuusqbl0ahvz1d":"Glomed","idmuusqbl074owxh":"Glomed","idmuusqbl1hx87k2":"Glomed","idmuusqblhkzru8j":"Glomed","idmuusqblirbz93k":"Glomed","idmuusqblih8eb61":"Glomed","idmuusqblietx6g9":"Glomed","idmuusqbli049spw":"Glomed","idmuusqblihcjzmq":"Glomed","idmuusqbli4o2lvj":"Glomed","idmuusqblihxu7lj":"Glomed","idmuusqblj3y5zfb":"Glomed","idmuusqbljrv1ifz":"Glomed","idmuusqbljpelge4":"Glomed","idmuusqblktvfe7s":"Glomed","idmuusqbmejv840t":"Glomed","idmuusqbmr8up85v":"Glomed","idmuusqbmrvk4vr6":"Glomed","idmuusqbmr93khj1":"Glomed","idmuusqbmrioh7jn":"Glomed","idmuusqbms89oe1c":"Glomed","idmuusqbmsnfxyiq":"Glomed","idmuusqbmt96142w":"Glomed","idmuusqbmuwvj1l0":"Glomed","idmuusqbmuk0jrd8":"Glomed","idmuusqbmuascg0p":"Glomed","idmuusqbn8x9rdt7":"Glomed","idmuusqbn8qjyl7g":"Glomed","idmuusqbn8hw6mvd":"Glomed","idmuusqbn850zu1q":"Glomed","idmuusqbn9quavwd":"Glomed","idmuusqbn938yth4":"Glomed","idmuusqbnlohpbyd":"Glomed","idmuusqbnltoz6lm":"Glomed","idmuusqbnlixvcyu":"Glomed","idmuusqbnlfabpih":"Glomed","idmuusqbnmjtm22g":"Glomed","idmuusqbnm4sgdlw":"Glomed","idmuusqbodsyeaov":"Glomed","idmuusqbp4cuosx9":"Glomed","idmuusqbp5xtnw2v":"Glomed","idmuusqbp5dne1e7":"Glomed","idmuusqbpht0fevn":"Glomed","idmuusqbphe8e4u1":"Glomed","idmuusqbphr1kyhz":"Glomed","idmuusqbphwj380b":"Glomed","idmuusqbuymlxwyc":"Glomed","idmuusqbvfzurh37":"Glomed","idmuusqbwur6t3pp":"Glomed","idmuusqbwv4ndu4q":"Glomed","idmuusqbxc3d9o8a":"Glomed","idmuusqbxcrsp9tr":"Glomed","idmuusqbxdsir9o1":"Glomed","idmuusqbyaorqxab":"Glomed","idmuusqbybebc5mf":"Glomed","idmuusqbyb1r75s5":"Glomed","idmuusqbybf3n9tc":"Glomed","idmuusqbn8t9n128":"Glomed","idmuusqc61rztgrl":"HNH","idmuusqc61l4ponl":"Glomed","idmuusqc5m46xzdk":"Glomed","idmuusqc61kix1re":"Glomed","idmuusqc5m5nasz5":"HNH","idmuusqc62ew77s5":"Glomed","idmuustqnxy6f032":"Glomed","idmuustr00wpfpj8":"Glomed","idmuustrgfq462js":"Glomed","idmuustpx3t4y94y":"Glomed","idmuustqv91su8kc":"Glomed","idmuustot1gt9tmg":"Glomed","idmuustqs5269ns0":"HNH","idmuxr02bgq3vx2q":"HNH","idmuxr02dpktmsv9":"HNH","idmuxr02dx843zxy":"HNH","idmuxr02dppa5znf":"Glomed","idmuxr02dpwhc7pw":"Glomed","idmuxr5a53ug5b8g":"Glomed","idmuuv8xoa5pv8o4":"HNH","idmuuv8xr9cdppiq":"HNH","idmuuv8xsqkb7hwr":"HNH","idmuuv8xvkh6p62t":"HNH","idmuuv8xwrsxvekf":"HNH","idmuuv8xdr9lio9l":"Glomed","idmuuv8xen3vgdv7":"Glomed","idmuuv8xevm1nfv2":"Glomed","idmuuv8xf9sq1qxn":"Glomed","idmuuv8xi4t4t2rg":"Glomed","idmuuv8xicvaxn09":"Glomed","idmuuv8xik2021ne":"Glomed","idmuuv8xqggrs9u9":"HNH","idmuuv8xlv02u7p3":"Glomed","idmuusqcah2bb0ab":"Glomed","idmuusqcicc2r3iw":"Glomed","idmuusqcdc6klfhx":"Glomed","idmuusqcgcklsow0":"Glomed","idmuusqcioff77cb":"Glomed","idmuusqc6g74dfic":"Glomed","idmuusqc83znb6gx":"Glomed","idmuusqc8318v5rc":"Glomed","idmuusqcdcuh8v8r":"HNH","idmuusqcf9hxdctj":"Glomed","idmuusqcfxu6oco5":"Glomed","idmuusqc9f70g3d3":"Glomed","idmuusqc9s3klo5g":"Glomed","idmuusqccz2cpsef":"Glomed","idmuusqcdbfxua1j":"Glomed","idmuusqcfycytnsg":"Glomed","idmuusqchgyy4g36":"Glomed","idmuusqcizpzcw3z":"Glomed","idmuusqcdwq8xxvi":"Glomed","idmuusqcfabvsfgt":"Glomed","idmuusqcfati7ph4":"Glomed","idmuusqcbw8kzjab":"Glomed","idmuusqc5bhhxg7w":"Glomed","idmuusqbp4pj2nzu":"Glomed","idmuusqbzhgpp5hn":"Glomed","idmuusqc7r61jisz":"Glomed","idmuusqc83hw8fem":"Glomed","idmuusqc9e1gz0fj":"Glomed","idmuusqc9endpqtc":"Glomed","idmuusqc9fqd9vf9":"Glomed","idmuusqc9s68afh3":"Glomed","idmuusqc9s0lf9v3":"Glomed","idmuusqc9swcejud":"Glomed","idmuusqcahqxv7ch":"Glomed","idmuusqcah0wcbn0":"Glomed","idmuusqcahc4grv2":"Glomed","idmuusqcah8ip1bb":"Glomed","idmuusqcb8qhrygj":"Glomed","idmuusqcb8003of0":"Glomed","idmuusqcbkmuy39k":"Glomed","idmuusqcblef80b9":"Glomed","idmuusqcblna0ci5":"Glomed","idmuusqcbli3kreo":"Glomed","idmuusqccza5ju48":"Glomed","idmuusqcdbgu65gv":"Glomed","idmuusqcdbxkddtj":"Glomed","idmuusqcdw436zf4":"Glomed","idmuusqcdwgmdjru":"Glomed","idmuusqce7bjfelk":"Glomed","idmuusqce71m7x54":"Glomed","idmuusqcfa7y21ax":"Glomed","idmuusqcfweq6sp3":"Glomed","idmuusqcfx6ztj8h":"Glomed","idmuusqcfxcpjwvi":"Glomed","idmuusqcfxfmw2px":"Glomed","idmuusqcfxagcgyq":"Glomed","idmuusqcfygjx9e8":"Glomed","idmuusqcfymel703":"Glomed","idmuusqcgpyq4qp0":"Glomed","idmuusqcictoa48h":"Glomed","idmuusqciczdmpnd":"Glomed","idmuusqcicvzsvyi":"Glomed","idmuusqcindiq2k8":"Glomed","idmuusqcfauppjfn":"Glomed","idmuusqc5nsgb70c":"Glomed","idmuusqc9famka7f":"HNH","idmuusqc9fs9y6h1":"Glomed","idmuusqchgtt14ai":"HNH","idmuustohptqupol":"Glomed","idmuustojy0mrcsw":"Glomed","idmuustomoddurve":"Glomed","idmuustogqwvlfvo":"HNH","idmuustodq7347ir":"Glomed","idmuustoiq7lpyoh":"HNH","idmuustojtte72n0":"HNH","idmuxr02ej4vn33c":"HNH","idmuuv8y50uct4hy":"Glomed","idmuusqck8dp9lnl":"Glomed","idmuusqclsne22yj":"Glomed","idmuusqcnsoxh5ui":"Glomed","idmuusqciopm1bot":"Glomed","idmuusqcowp6ixm7":"Glomed","idmuusqckt3g1q71":"Glomed","idmuusqcqp7npuz5":"Glomed","idmuusqck8e24iwc":"Glomed","idmuusqc9slu9cer":"Glomed","idmuusqck6f9i487":"Glomed","idmuusqck7jfpvea":"Glomed","idmuusqcli5iv9s6":"Glomed","idmuusqclts1mm42":"Glomed","idmuusqcqpb94uij":"Glomed","idmuusqck6rvw3rz":"Glomed","idmuusqcm7jlshss":"Glomed","idmuusqcmll1efcz":"Glomed","idmuusqcqpoa4o6y":"Glomed","idmuusqcqqufcdnc":"Glomed","idmuusqcqpjhavwd":"Glomed","idmuusqcpiii16tv":"HNH","idmuusqck6ujlmmc":"Glomed","idmuustnpk77c8gy":"HNH","idmuustntt0tu4bi":"HNH","idmuxr02in5pmrlg":"Glomed","idmuuv8y9uej1xdf":"HNH","idmuuv8y83obhg5l":"Glomed","idmuuv8yc6idimbl":"Glomed","idmuusqcxfeicqgt":"HNH","idmuusqcwqjfim7l":"HNH","idmuusqcz5r5s909":"HNH","idmuusqcxq5xckei":"HNH","idmuusqcz57igx5j":"HNH","idmuusqcv6azsklv":"Glomed","idmuxr02ksxdu7ij":"Glomed","idmuxr02ks6lxw0d":"Glomed","idmuxr02me9kbzts":"Glomed","idmuxr02me7q8n7t":"Glomed","idmuuv8ygecj8um0":"Glomed","idmuuv8yhr260w6f":"Glomed","idmuuv8yhr4ihns7":"HNH","idmuusqd06vw86i8":"Glomed","idmuusqd06443j3f":"Glomed","idmuusqczagw31xw":"Glomed","idmuusqd0ow4633c":"Glomed","idmuusqczarlbtmn":"Glomed","idmuusqd07tggbbu":"HNH","idmuuv8yqd3sm2ub":"HNH","idmuuv8yqhfnegpo":"HNH","idmuusqd16jzej9s":"Glomed","idmuusqd29jalj80":"Glomed","idmuusqd15jx2as0":"Glomed","idmuusqd2pqkeqq5":"Glomed","idmuusqd3jwx19hz":"Glomed","idmuusqd16uv7o54":"Glomed","idmuusqd2qg2xjhr":"Glomed","idmuusqd15kdwmrh":"Glomed","idmuusqd1jrymy0c":"Glomed","idmuustms1env5mi":"HNH","idmuuv8yrojvduu4":"HNH","idmuusqd4m4l4y2a":"Glomed","idmuusqd3w3qekvd":"Glomed","idmuusqd4lpmfqez":"Glomed","idmuusqd4lgtt6ks":"Glomed","idmuusqd4mmnwkgl":"Glomed","idmuusqd4lkj32n4":"Glomed","idmuusqd6t3fz99q":"Glomed","idmuusqd4m2i9m0v":"HNH","idmuxr02mwzqx5lh":"Glomed","idmuuv8yxl474dd1":"HNH","idmuuv8yv1eq2vt0":"HNH","idmuuv8yv5rp5vua":"HNH","idmuusqd8c48rbli":"Glomed","idmuusqd7kl9z370":"Glomed","idmuusqdbcarlcnt":"Glomed","idmuusqdc45rsgbh":"Glomed","idmuusqda17ozoyb":"Glomed","idmuusqda23vxef1":"Glomed","idmuusqda2dn6neg":"Glomed","idmuusqda2t4xhsb":"HNH","idmuusqda2inhcm5":"Glomed","idmuusqd8cw7lnmr":"HNH","idmuusxgoqybe7d9":"Glomed","idmuustltggtzjvx":"HNH","idmuxr02pkc2597j":"Glomed","idmuusqdgfpw6oyb":"Glomed","idmuusqdcyblbp7t":"Glomed","idmuusqdc5nlcrbp":"Glomed","idmuusqdcx0ay05v":"Glomed","idmuusqdcxwyldzt":"Glomed","idmuusqdcygxqw37":"Glomed","idmuusqdcyg2upec":"Glomed","idmuusqdcyq718oz":"Glomed","idmuusqddlod2h4h":"Glomed","idmuusqdefx3w9tj":"Glomed","idmuusqdef4egeah":"Glomed","idmuusqdeftpb885":"Glomed","idmuusqdef3x3rnt":"Glomed","idmuusqdefmnj51g":"Glomed","idmuusqdeval2pf7":"Glomed","idmuusqdfq8kplab":"Glomed","idmuusqdgfxggsk4":"Glomed","idmuusqdc5lk6r1j":"Glomed","idmuusqdalgufqlj":"Glomed","idmuusqdc5z4er88":"HNH","idmuusqdc5j2ixuh":"Glomed","idmuusqdcx8serjn":"Glomed","idmuustko9shbesp":"Glomed","idmuustkq964n5sv":"Glomed","idmuustlfrqzbmtp":"Glomed","idmuuv8z0qy3ufzg":"HNH","idmuuv8z0qqaw7mh":"HNH","idmuusqd8ck6strn":"Glomed"}};
+function gsjHnhQtyRange(start, end) {
+  let q = 0;
+  state.checkerRows.forEach(r => { if (r && r.entitas === 'HNH' && r.status === 'OK' && r.tanggal >= start && r.tanggal <= end) q += Number(r.qty) || 0; });
+  return q;
+}
+function gsjFixHnhSesuaiCheckerSep2026() {
+  const KEY = 'fixHnhCheckerSep2026';
+  if (!state.settings || state.settings[KEY]) return;
+  const D = GSJ_FIX_HNH_SEP2026;
+  const before = gsjHnhQtyRange('2026-09-01', '2026-09-15');
+  const byId = new Map(state.checkerRows.map(r => [r.id, r]));
+  const del = new Set();
+  let nKeHnh = 0, nKeGsj = 0;
+  const lock = (r, t, wasHnh) => {
+    if (t === 'HNH' && r.entitas !== 'HNH') nKeHnh++;
+    else if (t === 'Glomed' && wasHnh) nKeGsj++;
+    r.entitas = t; r.status = 'OK'; r.entitasManual = true; r.autoEnt = undefined; r.autoTopUpQty = undefined;
+  };
+  // 1) pesanan yang dipecah -> gabung lagi jadi 1 baris utuh
+  Object.keys(D.groups).forEach(pid => {
+    const g = D.groups[pid], p = byId.get(pid);
+    if (!p) return;
+    const kids = g.c.map(id => byId.get(id)).filter(c => c && c.splitOf === pid);
+    let total = (p.splitTotalQty != null) ? Number(p.splitTotalQty) : (Number(p.qty) || 0) + kids.reduce((s, c) => s + (Number(c.qty) || 0), 0);
+    const wasHnh = p.entitas === 'HNH' || kids.some(c => c.entitas === 'HNH');
+    kids.forEach(c => del.add(c.id));
+    p.qty = total; p.qtyInternal = total;
+    delete p.splitTotalQty; p.splitInfo = undefined;
+    lock(p, g.t, wasHnh);
+  });
+  // 2) baris biasa yang entitasnya beda dengan checker
+  Object.keys(D.simple).forEach(id => { const r = byId.get(id); if (r) lock(r, D.simple[id], r.entitas === 'HNH'); });
+  // 3) baris produk yang sama yang sudah sesuai checker -> dikunci saja
+  Object.keys(D.lock).forEach(id => { const r = byId.get(id); if (r && !r.entitasManual) lock(r, D.lock[id], r.entitas === 'HNH'); });
+  if (del.size) state.checkerRows = state.checkerRows.filter(r => !del.has(r.id));
+  state.settings[KEY] = 'done';
+  recomputeAllCheckerRows();
+  const after = gsjHnhQtyRange('2026-09-01', '2026-09-15');
+  gsjDetailedAudit(`menyamakan penjualan <b>HNH 1–15 Sep 2026</b> dengan Checker (baris merah): ${fmtNum(nKeHnh)} baris pindah ke HNH, ${fmtNum(nKeGsj)} baris pindah dari HNH ke GSJ — total HNH ${fmtNum(before)} → ${fmtNum(after)} pcs`);
+  saveState();
+  if (typeof gsjScheduleRemoteRerender === 'function') gsjScheduleRemoteRerender();
+  setTimeout(() => alert(`✅ HNH 1–15 September 2026 sudah disamakan dengan Checker (baris merah).\n\n• ${fmtNum(nKeHnh)} baris pindah KE HNH\n• ${fmtNum(nKeGsj)} baris pindah dari HNH ke GSJ\n• Total terjual HNH (qty pesanan): ${fmtNum(before)} → ${fmtNum(after)}\n\nSudah dikunci manual, tidak akan pindah lagi.`), 300);
+}
+
+// Sekali jalan: pesanan yang di checker 1–15 Sep dibagi 2 warna (1 baris app -> dibagi sesuai checker).
+const GSJ_FIX_SPLIT_SEP2026 = [
+  { id: 'idmuuv8x9jviohfn', qty: 3, parts: { HNH: 1, Glomed: 2 } }, // Sonde Halfmoon 5 Sep, 2609057QXEN18B
+];
+function gsjFixSplitCheckerSep2026() {
+  const KEY = 'fixSplitCheckerSep2026';
+  if (!state.settings || state.settings[KEY]) return;
+  let n = 0;
+  GSJ_FIX_SPLIT_SEP2026.forEach(f => {
+    const r = state.checkerRows.find(x => x.id === f.id);
+    if (!r || Number(r.qty) !== f.qty || r.splitInfo) return;
+    if (gsjSplitRowManual(r, f.parts)) n++;
+  });
+  state.settings[KEY] = 'done';
+  if (n) { recomputeAllCheckerRows(); gsjDetailedAudit(`membagi ${n} pesanan sesuai warna checker 1–15 Sep 2026 (Sonde Halfmoon 5 Sep: HNH 1 + GSJ 2)`); }
+  saveState();
+  if (n && typeof gsjScheduleRemoteRerender === 'function') gsjScheduleRemoteRerender();
+}
+
 let tab3BrowseMonth = null; // bulan yang sedang di-browse untuk daftar chip tanggal — mirip tab2BrowseMonth
 
 function renderTab3DateTabs(dates, skipSync) {
@@ -7753,18 +7861,941 @@ function computeSingleProductPivot(entitas, tanggal, nama, stokAwalMap, dayRows,
   return { nama, stokAwal, ...b, totalOwn, totalGM, totalM, grandTotal, hargaModal, totalPembayaran, penambahan, penambahanInvoice, stokAkhir, namaCustomer, fuzzyContributors, hasPendingFaktur, satuan };
 }
 
+// ---------- Nama mentah marketplace -> nama internal yang benar (otomatis + manual) ----------
+// "Nama mentah" = nama internal yang isinya masih judul marketplace (Master Produk yang menunjuk ke
+// dirinya sendiri / belum dirapikan). Dicocokkan PER LISTING (nama marketplace + variasi), karena 1 judul
+// marketplace bisa berisi beberapa produk berbeda per variasi (mis. Gliserin 100 ML vs 1 Liter).
+const GSJ_SIZE_TOKENS = new Set(['xs', 's', 'm', 'l', 'xl', 'xxl']);
+const GSJ_COLOR_TOKENS = new Set(['merah', 'muda', 'biru', 'hijau', 'kuning', 'putih', 'hitam', 'ungu', 'pink', 'abu', 'abu-abu', 'orange', 'oren', 'cream', 'krem', 'tua', 'dongker', 'navy', 'lavender', 'pastel', 'gold', 'silver', 'coklat', 'cokelat', 'transparan', 'bening', 'black', 'white', 'blue', 'green', 'red', 'yellow', 'grey', 'gray', 'purple', 'violet', 'lilac']);
+function gsjRawNameSet() {
+  const clean = new Set();
+  state.invoices.forEach(inv => (inv.items || []).forEach(it => { if (it.nama) clean.add(normalizeName(it.nama)); }));
+  state.masterProduk.forEach(m => { if (m.namaInternal && !isStillRawMapping(m)) clean.add(normalizeName(m.namaInternal)); });
+  const raw = new Map();
+  state.masterProduk.forEach(m => {
+    if (!m.namaInternal || !isStillRawMapping(m)) return;
+    const k = normalizeName(m.namaInternal);
+    if (!clean.has(k) && !raw.has(k)) raw.set(k, m.namaInternal);
+  });
+  const okNames = (state.settings && state.settings.rawNamesOk) || {};
+  state.checkerRows.forEach(r => {
+    if (!r.namaAsli || !r.nama) return;
+    const k = normalizeName(r.nama);
+    if (k === normalizeName(r.namaAsli) && !clean.has(k) && !raw.has(k)) raw.set(k, r.nama);
+  });
+  Object.keys(okNames).forEach(k => raw.delete(k)); // sudah ditandai "biarkan, ini produk sendiri"
+  return raw; // normKey -> nama
+}
+function gsjIsRawName(nama) { return gsjRawNameSet().has(normalizeName(nama)); }
+function gsjCleanCandidates(rawSet) {
+  const cat = ensureFuzzyCatalog();
+  const raw = rawSet || gsjRawNameSet();
+  if (cat._clean && cat._cleanRawSize === raw.size) return cat._clean;
+  const list = cat.filter(c => c.tokens.size >= 2 && !raw.has(normalizeName(c.nama)));
+  list._inv = null;
+  cat._clean = list; cat._cleanRawSize = raw.size;
+  return list;
+}
+// Skor 1 kandidat untuk 1 listing. null = pasti bukan (angka/ukuran/negasi tidak cocok).
+const GSJ_SOFT_TOKENS = new Set(['per', 'satuan', 'isi', 'new', 'ori', 'original']);
+function gsjScoreListingCandidate(full, vt, firstSeg, c) {
+  let inter = 0, meaningful = false, firstHit = false, soft = 0;
+  for (const t of c.tokens) {
+    const num = /\d/.test(t);
+    if (GSJ_SOFT_TOKENS.has(t) && !full.has(t)) { soft++; continue; } // kata kemasan ("Per", "Satuan") tidak wajib ada di judul
+    if (full.has(t)) { inter++; if (t.length >= 4 && !num) meaningful = true; if (t.length >= 4 && !num && firstSeg.has(t)) firstHit = true; }
+    else if (num || GSJ_SIZE_TOKENS.has(t) || NEGATION_WORDS.has(t)) return null; // angka/ukuran/negasi di kandidat harus ada di listing
+  }
+  if (!meaningful) return null;
+  const cSized = [...c.tokens].some(t => GSJ_SIZE_TOKENS.has(t) || /\d/.test(t));
+  let vb = 0;
+  for (const t of vt) {
+    if (c.tokens.has(t)) vb++;
+    else if (cSized && t !== '1' && (GSJ_SIZE_TOKENS.has(t) || /^\d+(\.\d+)?$/.test(t))) return null; // ukuran di variasi harus ada di kandidat
+  }
+  // warna / ukuran di variasi yang TIDAK ada di nama kandidat -> kandidat ini belum tentu tepat (tidak dipilih otomatis)
+  let strict = true;
+  for (const t of vt) {
+    if (c.tokens.has(t)) continue;
+    if (GSJ_COLOR_TOKENS.has(t) || GSJ_SIZE_TOKENS.has(t)) { strict = false; break; }
+  }
+  const denom = c.tokens.size - soft;
+  if (denom < 2) return null;
+  return { cov: inter / denom, vb, n: c.tokens.size, firstHit, strict };
+}
+function gsjSuggestForListing(N, V, limit, cand) {
+  cand = cand || gsjCleanCandidates();
+  const vClean = /^(default|-|spesifikasi)$/i.test(String(V || '').trim()) ? '' : (V || '');
+  const full = tokenize(N + ' ' + vClean), vt = tokenize(vClean), firstSeg = tokenize(String(N).split('/')[0]);
+  const out = [];
+  for (const c of fuzzyCandidates(cand, full)) {
+    const s = gsjScoreListingCandidate(full, vt, firstSeg, c);
+    if (!s || s.cov < 0.6) continue;
+    out.push({ nama: c.nama, tokens: c.tokens, ...s });
+  }
+  out.sort((a, b) => b.cov - a.cov || b.vb - a.vb || (b.firstHit - a.firstHit) || b.n - a.n);
+  // nama dobel (ejaan beda tapi kata-katanya sama) -> 1 saja
+  const seen = new Set(), res = [];
+  for (const o of out) { const k = [...o.tokens].sort().join(' '); if (seen.has(k)) continue; seen.add(k); res.push(o); if (res.length >= (limit || 5)) break; }
+  return res;
+}
+// Pilihan otomatis: semua kata kandidat ada di listing, ada kata merek/jenis yang sama dengan judul utama,
+// dan tidak ada kandidat lain yang sama kuatnya.
+function gsjAutoPickForListing(N, V, freq, cand) {
+  cand = cand || gsjCleanCandidates();
+  const s = gsjSuggestForListing(N, V, 5, cand);
+  if (!s.length) return null;
+  const top = s[0], second = s[1];
+  if (top.cov < 1 || !top.firstHit || !top.strict) return null;
+  if (second && second.cov === 1 && second.vb === top.vb && second.firstHit === top.firstHit && second.n === top.n) return null;
+  // pilih ejaan yang paling sering dipakai di antara nama yang kata-katanya sama
+  const k = [...top.tokens].sort().join(' ');
+  let pick = top.nama, best = -1;
+  cand.forEach(c => { if (c.tokens.size === top.tokens.size && [...c.tokens].sort().join(' ') === k) { const f = (freq && freq[normalizeName(c.nama)]) || 0; if (f > best) { best = f; pick = c.nama; } } });
+  return pick;
+}
+function gsjListingsForRawName(R) {
+  const key = normalizeName(R);
+  const L = new Map();
+  state.masterProduk.forEach(m => { if (normalizeName(m.namaInternal) === key) { const k = normalizeName(m.namaMarketplace) + '||' + normalizeName(m.variasiMarketplace || ''); if (!L.has(k)) L.set(k, { N: m.namaMarketplace, V: m.variasiMarketplace || '', n: 0 }); } });
+  state.checkerRows.forEach(r => { if (r.namaAsli && normalizeName(r.nama) === key) { const k = normalizeName(r.namaAsli) + '||' + normalizeName(r.variasi || ''); const o = L.get(k) || { N: r.namaAsli, V: r.variasi || '', n: 0 }; o.n++; L.set(k, o); } });
+  return [...L.values()];
+}
+function gsjApplyListingName(N, V, target, source) {
+  const nk = normalizeName(N), vk = normalizeName(V || '');
+  let hit = 0;
+  state.masterProduk.forEach(m => {
+    if (normalizeName(m.namaMarketplace) === nk && normalizeName(m.variasiMarketplace || '') === vk) {
+      m.namaInternal = target; m.belumDirapikan = false; m.namaGracia = ''; m.namaHNH = ''; m.namaGlomed = '';
+      m.createdSource = source; hit++;
+    }
+  });
+  if (!hit) state.masterProduk.push({ id: uid(), namaMarketplace: N, variasiMarketplace: V || '', namaInternal: target, namaGracia: '', namaHNH: '', namaGlomed: '', entitasTetap: '', catatan: '', sumber: '', channel: '', createdAt: new Date().toISOString(), createdSource: source });
+  // baris penjualan listing ini langsung ikut (sisanya dirapikan saat hitung ulang)
+  state.checkerRows.forEach(r => { if (r.namaAsli && normalizeName(r.namaAsli) === nk && normalizeName(r.variasi || '') === vk) { r.nama = target; r.namaCanonical = target; r.fuzzyMatched = false; r.fuzzyScore = undefined; } });
+  invalidateMasterProdukIndex();
+}
+// Setelah semua listing sebuah nama mentah dipindah ke 1 nama yang sama -> riwayat stok (Stok Awal,
+// penambahan, faktur) yang masih atas nama mentah ikut digabung ke nama itu.
+function gsjMergeRawIfSingleTarget(R, targetsByListing) {
+  const ts = new Set(targetsByListing.map(normalizeName));
+  if (ts.size !== 1) return false;
+  const t = targetsByListing[0];
+  const leftover = gsjListingsForRawName(R).length;
+  if (leftover) return false;
+  mergeProductNames(R, t);
+  return true;
+}
+function gsjAutoMapRawNames(opts) {
+  opts = opts || {};
+  const raw = gsjRawNameSet();
+  if (!raw.size) return [];
+  const cand = gsjCleanCandidates(raw);
+  const freq = buildNameFrequencyMap();
+  // 1) hitung semua pilihan dulu (data belum diubah)
+  const plan = [];
+  raw.forEach(R => {
+    const L = gsjListingsForRawName(R);
+    const listings = L.length ? L : [{ N: R, V: '' }];
+    const picks = listings.map(l => ({ l, t: gsjAutoPickForListing(l.N, l.V, freq, cand) }));
+    if (picks.some(p => p.t)) plan.push({ R, hasListing: !!L.length, picks });
+  });
+  // 2) terapkan
+  const done = [];
+  plan.forEach(({ R, hasListing, picks }) => {
+    const ok = picks.filter(p => p.t);
+    if (!hasListing) { mergeProductNames(R, ok[0].t); done.push({ R, V: '', t: ok[0].t }); return; }
+    ok.forEach(p => { gsjApplyListingName(p.l.N, p.l.V, p.t, 'Otomatis dicocokkan sistem (nama mentah marketplace)'); done.push({ R, V: p.l.V, t: p.t }); });
+    if (ok.length === picks.length) gsjMergeRawIfSingleTarget(R, ok.map(p => p.t));
+  });
+  if (done.length && !opts.noRecompute) recomputeAllCheckerRows();
+  return done;
+}
+
+// ---------- Jendela "Gabungkan ke nama yang benar" (pengganti "Kenapa belum tergabung?") ----------
+let _t3RawSet = null;
+function openRawMergeModal(entitas, nama, prefill) {
+  const R = nama;
+  const ownName = String(R).split('/')[0].replace(/\s+/g, ' ').trim();
+  const L = gsjListingsForRawName(R);
+  const listings = L.length ? L : [{ N: R, V: '', n: 0, onlyName: true }];
+  const nAdj = state.adjustments.filter(a => normalizeName(a.nama) === normalizeName(R) && a.keterangan !== 'Auto top-up (catatan Master Produk)').length;
+  const nInv = state.invoices.reduce((s, inv) => s + (inv.items || []).filter(it => normalizeName(it.nama) === normalizeName(R)).length, 0);
+  const cand = gsjCleanCandidates();
+  const rowsHTML = listings.map((l, i) => {
+    const sug = gsjSuggestForListing(l.N, l.V, 4, cand);
+    const pre = sug.length && sug[0].cov === 1 && sug[0].strict ? sug[0].nama : (prefill || '');
+    return `<tr data-rm="${i}">
+      <td style="font-size:12px;max-width:260px;">${l.onlyName ? '<i>(nama ini dari Stok Awal / riwayat stok)</i>' : escapeAttr(l.N.slice(0, 90))}${l.V ? `<div style="color:var(--muted);">Variasi: <b>${escapeAttr(l.V)}</b></div>` : ''}${l.n ? `<div style="color:var(--muted);font-size:10.5px;">${fmtNum(l.n)} baris penjualan</div>` : ''}</td>
+      <td>${sug.length ? sug.map(x => `<button class="btn secondary small" data-rm-pick="${escapeAttr(x.nama)}" style="margin:1px;padding:2px 7px;font-size:11px;${x.cov === 1 && x.strict ? 'border-color:#16a34a;' : ''}" title="Kecocokan ${Math.round(x.cov * 100)}%">${escapeAttr(x.nama)} <span style="color:var(--muted);">${Math.round(x.cov * 100)}%</span></button>`).join('') : '<span style="color:var(--muted);font-size:11px;">Tidak ada saran — cari manual →</span>'}</td>
+      <td><input type="text" data-rm-input value="${escapeAttr(pre)}" placeholder="🔎 Cari nama yang benar..." autocomplete="new-password" style="width:100%;min-width:200px;padding:5px 7px;border:1px solid #c9c5b8;border-radius:5px;font-size:12px;"></td>
+    </tr>`;
+  }).join('');
+  const body = `
+    <p style="margin-top:0;font-size:12.5px;">Nama ini masih judul mentah dari marketplace. Pilih nama internal yang benar untuk tiap listing/variasi (klik saran atau cari), lalu <b>Gabungkan</b>. Pilihan disimpan ke Master Produk, jadi import berikutnya langsung masuk ke nama yang benar.</p>
+    ${nAdj || nInv ? `<p style="font-size:12px;background:#FEF3C7;padding:6px 9px;border-radius:6px;">Ada riwayat stok atas nama mentah ini (${nAdj} Stok Awal/penyesuaian${nInv ? `, ${nInv} item faktur` : ''}). Kalau semua listing digabung ke <b>1 nama yang sama</b>, riwayat stoknya ikut pindah. Kalau ke beberapa nama berbeda, riwayat stok tetap di nama ini.</p>` : ''}
+    <div style="background:#f6f8fb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;margin-bottom:8px;font-size:12px;">
+      <b>Tidak ada produk yang cocok / memang beda?</b>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:5px;">
+        ✏️ Jadikan produk sendiri dengan nama
+        <input type="text" id="rm-own" value="${escapeAttr(ownName)}" style="flex:1;min-width:200px;padding:5px 7px;border:1px solid #c9c5b8;border-radius:5px;font-size:12px;">
+        <button class="btn secondary small" id="rm-own-fill" title="Isi nama ini ke semua listing di bawah (bisa diubah per baris)">Isi ke semua ↓</button>
+        <button class="btn secondary small" id="rm-keep" title="Nama ini memang produk sendiri — tidak ditandai mentah lagi, namanya tidak diubah">✔ Biarkan nama ini</button>
+      </div>
+      <div style="color:var(--muted);font-size:11px;margin-top:4px;">Tiap variasi boleh beda tujuan — isi kolom "Gabungkan ke" per baris. Kosongkan baris yang belum mau diubah.</div>
+    </div>
+    <div style="overflow-x:auto;"><table class="dtable" style="width:100%;"><thead><tr><th>Listing / Variasi</th><th>Saran sistem</th><th style="width:240px;">Gabungkan ke</th></tr></thead><tbody>${rowsHTML}</tbody></table></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px;"><button class="btn secondary small" id="rm-go" style="background:var(--accent-dark);color:#fff;">🔗 Gabungkan</button></div>`;
+  showConfirmModal(`Gabungkan — ${R.length > 60 ? R.slice(0, 60) + '…' : R}`, body, true);
+  const box = document.querySelector('#confirmModal .modal-box'); if (box) box.style.maxWidth = '1050px';
+  document.querySelectorAll('#modalBody tr[data-rm]').forEach(tr => {
+    const inp = tr.querySelector('[data-rm-input]');
+    bindNamaLinkerAutocomplete(inp);
+    tr.querySelectorAll('[data-rm-pick]').forEach(b => b.addEventListener('click', () => { inp.value = b.dataset.rmPick; }));
+  });
+  const deliberateNew = new Set();
+  document.getElementById('rm-own-fill').addEventListener('click', () => {
+    const v = document.getElementById('rm-own').value.trim();
+    if (!v) return;
+    deliberateNew.add(normalizeName(v));
+    document.querySelectorAll('#modalBody [data-rm-input]').forEach(i => { i.value = v; });
+  });
+  document.getElementById('rm-keep').addEventListener('click', () => {
+    if (!confirm(`Biarkan "${R}" sebagai nama produknya sendiri?\n\nNamanya tidak diubah & tidak ditandai "nama mentah" lagi. Bisa dirapikan nanti lewat Master Produk.`)) return;
+    state.settings.rawNamesOk = Object.assign({}, state.settings.rawNamesOk || {}, { [normalizeName(R)]: true });
+    gsjDetailedAudit(`menandai nama <b>${escapeAttr(R.slice(0, 80))}</b> sebagai produk sendiri (bukan nama mentah)`);
+    saveState();
+    document.getElementById('confirmModal').classList.remove('show');
+    try { renderTab3TableKeepScroll(); } catch (e) {}
+  });
+  document.getElementById('rm-go').addEventListener('click', () => {
+    const chosen = [];
+    document.querySelectorAll('#modalBody tr[data-rm]').forEach(tr => {
+      const v = tr.querySelector('[data-rm-input]').value.trim();
+      if (v) chosen.push({ l: listings[Number(tr.dataset.rm)], t: v });
+    });
+    if (!chosen.length) { alert('Isi dulu minimal 1 nama tujuan.'); return; }
+    const unknown = [...new Set(chosen.map(c => c.t))].filter(t => !deliberateNew.has(normalizeName(t)) && !searchInternalProductNames(t, 20).some(n => normalizeName(n) === normalizeName(t)));
+    if (unknown.length && !confirm(`Nama berikut BELUM ada di katalog:\n• ${unknown.join('\n• ')}\n\nYakin ini produk baru (bukan duplikat)? Kalau ragu, Batal lalu pilih dari saran.`)) return;
+    chosen.forEach(c => { if (c.l.onlyName) mergeProductNames(R, c.t); else gsjApplyListingName(c.l.N, c.l.V, c.t, 'Digabung manual dari Stok Terjual'); });
+    let stockMoved = false;
+    if (!chosen.some(c => c.l.onlyName) && chosen.length === listings.length) stockMoved = gsjMergeRawIfSingleTarget(R, chosen.map(c => c.t));
+    else if (chosen.some(c => c.l.onlyName)) stockMoved = true;
+    recomputeAllCheckerRows();
+    gsjDetailedAudit(`menggabungkan nama mentah <b>${escapeAttr(R.slice(0, 80))}</b> ke ${chosen.map(c => `<b>${escapeAttr(c.t)}</b>${c.l.V ? ` (${escapeAttr(c.l.V)})` : ''}`).join(', ')}${stockMoved ? ' — riwayat stok ikut pindah' : ''}`);
+    saveState();
+    document.getElementById('confirmModal').classList.remove('show');
+    try { renderTab3TableKeepScroll(); } catch (e) {}
+    if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+    const sisa = listings.length - chosen.length;
+    alert(`✅ ${chosen.length} listing sudah digabung.${stockMoved ? '\nRiwayat stok nama mentah ikut dipindah.' : (nAdj || nInv ? '\nRiwayat stok masih di nama mentah (tujuannya lebih dari 1 nama / ada listing yang belum dipilih).' : '')}${sisa > 0 ? `\n${sisa} listing belum dipilih, masih di nama mentah.` : ''}`);
+  });
+}
+
+// Dijalankan otomatis setelah data tersinkron saat aplikasi dibuka: nama mentah yang cocoknya jelas
+// langsung dipindah ke nama internal yang benar.
+function gsjAutoMapRawNamesOnBoot() {
+  const done = gsjAutoMapRawNames();
+  if (!done.length) return;
+  gsjDetailedAudit(`sistem otomatis mencocokkan <b>${fmtNum(done.length)}</b> listing marketplace bernama mentah ke nama internal yang benar (mis. ${done.slice(0, 3).map(d => `${escapeAttr(d.t)}`).join(', ')}…)`);
+  saveState();
+  if (typeof gsjScheduleRemoteRerender === 'function') gsjScheduleRemoteRerender();
+}
+
+// Bagi 1 baris penjualan ke beberapa entitas (mis. checker: 1 pcs HNH + 2 pcs GSJ dalam 1 pesanan).
+// parts = { Gracia: n, HNH: n, Glomed: n }, jumlahnya harus = qty baris. Semua bagian dikunci manual.
+function gsjSplitRowManual(row, parts) {
+  const ents = ENTITIES.filter(e => (Number(parts[e]) || 0) > 0);
+  const total = ents.reduce((s, e) => s + Number(parts[e]), 0);
+  if (!ents.length || total !== (Number(row.qty) || 0)) return false;
+  const keepEnt = ents.includes(row.entitas) ? row.entitas : ents[0];
+  const base = JSON.parse(JSON.stringify(row));
+  const info = ents.map(e => `${QE_SHORT[e] || e} ${parts[e]}`).join(' + ') + ` (pesanan ${total})`;
+  const made = [];
+  ents.forEach(e => {
+    let target;
+    if (e === keepEnt) target = row;
+    else {
+      target = JSON.parse(JSON.stringify(base));
+      let nid = row.id + '~' + e;
+      while (state.checkerRows.some(x => x.id === nid)) nid = row.id + '~' + e + '~' + uid().slice(-4);
+      target.id = nid;
+      delete target.splitOf; delete target.splitTotalQty;
+      // biaya/voucher per pesanan cukup dihitung sekali (di baris induk)
+      if (target.rawRow && typeof target.rawRow === 'object') {
+        Object.keys(target.rawRow).forEach(k => { if (/voucher|cashback|discount|diskon|subtotal|ongkir|fee|biaya|total/i.test(k) && !/unit original price/i.test(k)) target.rawRow[k] = '0'; });
+      }
+      state.checkerRows.push(target);
+    }
+    target.qty = Number(parts[e]); target.qtyInternal = undefined;
+    target.entitas = e; target.status = 'OK'; target.entitasManual = true; target.autoEnt = undefined; target.autoTopUpQty = undefined;
+    target.splitInfo = info;
+    made.push(target);
+  });
+  delete row.splitTotalQty; delete row.splitOf;
+  return made;
+}
+
+
+// ---------- Nama mentah marketplace -> gabungkan ke produk yang benar ----------
+// Saran produk yang benar untuk nama mentah (judul marketplace yang belum tergabung). Beda dengan
+// pencocokan otomatis (yang sengaja ketat), di sini yang dihitung: berapa bagian KATA dari nama
+// kandidat ada di judul + variasi marketplace, dan apakah ANGKA/UKURAN-nya cocok (19 x 36 harus
+// ketemu 19 x 36, bukan 25 x 37). Hasilnya dipakai untuk mengisi otomatis pilihan gabung.
+const RAWMERGE_UNIT_WORDS = new Set(['per', 'pcs', 'box', 'satuan', 'isi', 'pack', 'cm', 'mm', 'ml', 'gr', 'gram', 'liter', 'lt', 'x', 'bh', 'buah', 'lembar', 'roll', 'set', 'pasang', 'psg', 'str', 'strip', 'botol', 'btl']);
+function rawMergeNums(tokens) { return new Set([...tokens].filter(t => /^\d+(\.\d+)?$/.test(t))); }
+function rawMergeSourceText(rawNama) {
+  const key = normalizeName(rawNama);
+  const parts = [rawNama]; const seen = new Set();
+  for (const r of state.checkerRows) {
+    if (normalizeName(r.nama) !== key) continue;
+    if (r.namaAsli && !seen.has('a' + r.namaAsli)) { seen.add('a' + r.namaAsli); parts.push(r.namaAsli); }
+    if (r.variasi && !seen.has('v' + r.variasi)) { seen.add('v' + r.variasi); parts.push(r.variasi); }
+    if (seen.size > 8) break;
+  }
+  return parts.join(' / ');
+}
+function rawNameCandidates(rawNama, limit) {
+  limit = limit || 6;
+  const key = normalizeName(rawNama);
+  const catalog = ensureFuzzyCatalog();
+  const rawTok = tokenize(rawMergeSourceText(rawNama));
+  const rawNum = rawMergeNums(rawTok);
+  // kata utama = bagian judul sebelum tanda "/" pertama (biasanya nama produk sebenarnya)
+  const headTok = [...tokenize(String(rawNama).split('/')[0])].filter(t => t.length >= 3 && !/^\d+(\.\d+)?$/.test(t) && !RAWMERGE_UNIT_WORDS.has(t));
+  const isWord = t => t.length >= 2 && !/^\d+(\.\d+)?$/.test(t) && !RAWMERGE_UNIT_WORDS.has(t);
+  const out = [];
+  for (const e of fuzzyCandidates(catalog, rawTok)) {
+    if (normalizeName(e.nama) === key) continue;
+    if ((e.nama.match(/\//g) || []).length >= 2 || e.nama.length > 75) continue; // kandidat yang juga masih nama mentah
+    const cw = [...e.tokens].filter(isWord);
+    if (!cw.length) continue;
+    const wScore = cw.filter(t => rawTok.has(t)).length / cw.length;
+    if (wScore < 0.5 || (cw.length <= 2 && wScore < 1)) continue;
+    const headCover = headTok.length ? headTok.filter(t => e.tokens.has(t)).length / headTok.length : wScore;
+    if (headCover === 0) continue;
+    const cn = rawMergeNums(e.tokens);
+    let nScore;
+    if (cn.size) { const hit = [...cn].filter(n => rawNum.has(n)).length; nScore = hit === cn.size ? 1 : (hit / cn.size) * 0.4; }
+    else nScore = rawNum.size ? 0.6 : 1;
+    let score = 0.4 * wScore + 0.3 * nScore + 0.3 * Math.min(1, headCover * 1.5);
+    if (cw.some(t => CRITICAL_DIFFERENTIATOR_WORDS.has(t) && !rawTok.has(t))) score *= 0.7; // warna/ukuran/jenis beda
+    out.push({ nama: e.nama, score });
+  }
+  out.sort((a, b) => b.score - a.score || a.nama.length - b.nama.length);
+  return out.slice(0, limit);
+}
+let _rawCandMemo = { sig: null, map: new Map() };
+function rawNameBestCandidate(rawNama) {
+  const sig = ensureFuzzyCatalog();
+  if (_rawCandMemo.sig !== sig || _rawCandMemo.n !== state.checkerRows.length) _rawCandMemo = { sig, n: state.checkerRows.length, map: new Map() };
+  const k = normalizeName(rawNama);
+  if (!_rawCandMemo.map.has(k)) _rawCandMemo.map.set(k, rawNameCandidates(rawNama, 1)[0] || null);
+  return _rawCandMemo.map.get(k);
+}
+// Gabungkan semua riwayat nama mentah ke nama produk yang benar + pastikan listing marketplace-nya
+// tercatat di Master Produk, supaya import berikutnya langsung dikenali otomatis.
+function doRawNameMerge(rawNama, toNama) {
+  const counts = mergeProductNames(rawNama, toNama);
+  const now = new Date().toISOString();
+  const toKey = normalizeName(toNama);
+  const added = new Set();
+  state.checkerRows.forEach(r => {
+    if (normalizeName(r.nama) !== toKey || !r.namaAsli) return;
+    const lk = normalizeName(r.namaAsli) + '\u0001' + normalizeName(r.variasi || '');
+    if (added.has(lk) || qeMasterForRow(r)) return;
+    added.add(lk);
+    state.masterProduk.push({ id: uid(), namaMarketplace: r.namaAsli, variasiMarketplace: r.variasi || '', namaInternal: toNama,
+      namaGracia: '', namaHNH: '', namaGlomed: '', entitasTetap: '', catatan: '', sumber: r.sumber || '', channel: r.channel || '',
+      createdAt: now, createdSource: 'Digabung dari Stok Terjual (nama mentah)' });
+  });
+  if (added.size) invalidateMasterProdukIndex();
+  recomputeAllCheckerRows();
+  gsjDetailedAudit(`menggabungkan nama mentah "${escapeAttr(rawNama.slice(0, 80))}" ke <b>${escapeAttr(toNama)}</b> (${counts.checkerRows} penjualan, ${counts.adjustments} stok, ${counts.invoiceItems} item faktur, ${counts.masterProduk + added.size} Master Produk)`);
+  saveState();
+  return counts;
+}
+function rawNameMergeConfirmAndRun(rawNama, toNama) {
+  toNama = (toNama || '').trim();
+  if (!toNama) { alert('Pilih / ketik dulu nama produk yang benar.'); return false; }
+  if (normalizeName(toNama) === normalizeName(rawNama)) { alert('Nama tujuannya sama dengan nama mentahnya.'); return false; }
+  const known = searchInternalProductNames(toNama, 30).some(n => normalizeName(n) === normalizeName(toNama));
+  if (!known && !confirm(`"${toNama}" belum ada di katalog produk.\n\nYakin ini produk BARU (bukan duplikat nama lain)? Kalau ragu, klik Batal lalu pilih dari saran.`)) return false;
+  if (!confirm(`Gabungkan SEMUA riwayat:\n\n"${rawNama}"\n\nke:\n\n"${toNama}"\n\nPenjualan, stok, dan Master Produk ikut pindah. Import berikutnya otomatis dikenali. Bisa di-undo (Ctrl+Z).`)) return false;
+  const c = doRawNameMerge(rawNama, toNama);
+  document.getElementById('confirmModal').classList.remove('show');
+  try { renderTab3TableKeepScroll(); } catch (e) {}
+  if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+  setTimeout(() => alert(`✅ Sudah digabung ke "${toNama}".\n${c.checkerRows} penjualan · ${c.adjustments} stok · ${c.invoiceItems} item faktur.`), 50);
+  return true;
+}
+function openRawNameMergeDialog(rawNama) {
+  const cands = rawNameCandidates(rawNama, 6);
+  const key = normalizeName(rawNama);
+  const rows = state.checkerRows.filter(r => normalizeName(r.nama) === key);
+  const listings = [...new Map(rows.filter(r => r.namaAsli).map(r => [normalizeName(r.namaAsli) + '|' + normalizeName(r.variasi || ''), r])).values()].slice(0, 6);
+  const best = cands[0];
+  showConfirmModal('Gabungkan ke Produk yang Benar', `
+    <div style="background:#f6f8fb;padding:8px 10px;border-radius:6px;font-size:12.5px;margin-bottom:8px;"><b>Nama mentah:</b> ${escapeAttr(rawNama)}
+      <div style="color:var(--muted);font-size:11.5px;margin-top:3px;">${fmtNum(rows.length)} penjualan${listings.length ? ' · Variasi: ' + listings.map(r => escapeAttr(r.variasi || '(tanpa variasi)')).join(', ') : ''}</div></div>
+    <div style="font-size:12.5px;margin-bottom:4px;"><b>Gabungkan ke:</b> ${best ? '<span style="color:var(--muted);font-size:11.5px;">(sudah diisi otomatis dengan saran paling cocok — ganti kalau salah)</span>' : ''}</div>
+    <input type="text" id="rm-target" autocomplete="new-password" value="${escapeAttr(best ? best.nama : '')}" placeholder="🔎 Ketik nama produk yang benar..." style="width:100%;padding:8px 10px;border:2px solid var(--accent-dark,#4f46e5);border-radius:6px;font-size:13px;">
+    ${cands.length ? `<div style="font-size:11.5px;color:var(--muted);margin:8px 0 4px;">Saran lain (klik untuk pilih):</div>
+    <div style="display:flex;flex-direction:column;gap:4px;">${cands.map(c => `<button class="btn secondary small" data-rm-pick="${escapeAttr(c.nama)}" style="text-align:left;justify-content:space-between;display:flex;gap:8px;"><span>${escapeAttr(c.nama)}</span><span style="color:${c.score >= 0.85 ? '#16a34a' : c.score >= 0.65 ? '#b45309' : '#9ca3af'};font-weight:700;">${Math.round(c.score * 100)}%</span></button>`).join('')}</div>`
+    : '<p style="font-size:12px;color:var(--muted);">Belum ada saran yang mirip — ketik nama produknya di kotak atas.</p>'}
+    <div style="display:flex;justify-content:flex-end;margin-top:12px;">
+      <button class="btn small" id="rm-go" style="background:var(--accent-dark,#4f46e5);color:#fff;">🔗 Gabungkan</button>
+    </div>`, true);
+  const inp = document.getElementById('rm-target');
+  bindNamaLinkerAutocomplete(inp);
+  document.querySelectorAll('[data-rm-pick]').forEach(b => b.addEventListener('click', () => { inp.value = b.dataset.rmPick; inp.focus(); }));
+  document.getElementById('rm-go').addEventListener('click', () => rawNameMergeConfirmAndRun(rawNama, inp.value));
+}
+
+
+// ---------- Paket (1 listing = beberapa produk) ----------
+const PAKET_MONEY_KEY_RE = /voucher|cashback|discount|diskon|subtotal|ongkir|fee|biaya|total/i;
+// Variasi "kosong" beda-beda tulisannya antar marketplace: Shopee "" , Tokopedia "Default",
+// TikTok "-" / "Spesifikasi". Untuk paket semuanya dianggap sama (= tanpa variasi), jadi paket yang
+// diatur di 1 listing ikut berlaku ke listing dengan judul sama di marketplace lain.
+function gsjPaketVarKey(v) {
+  const n = normalizeName(v || '');
+  return (!n || n === '-' || n === 'default' || n === 'tanpa variasi' || n === 'spesifikasi' || n === 'standar' || n === 'standard') ? '' : n;
+}
+function gsjPaketIndex() {
+  const idx = new Map();
+  state.masterProduk.forEach(m => {
+    if (!m || !Array.isArray(m.paketIsi) || !m.paketIsi.length) return;
+    const k = normalizeName(m.namaMarketplace) + '\u0001' + gsjPaketVarKey(m.variasiMarketplace);
+    if (!idx.has(k)) idx.set(k, m);
+  });
+  return idx;
+}
+// Master Produk yang menyimpan paket untuk baris ini (bisa milik listing marketplace lain yang judulnya sama)
+function gsjPaketMasterForRow(r) {
+  if (!r || !r.namaAsli) return null;
+  return gsjPaketIndex().get(normalizeName(r.namaAsli) + '\u0001' + gsjPaketVarKey(r.variasi)) || null;
+}
+function gsjExpandPaketRows() {
+  // rapikan isi paket yang tercatat 2x dengan nama sama (sisakan yang pertama)
+  state.masterProduk.forEach(m => {
+    if (!m || !Array.isArray(m.paketIsi) || m.paketIsi.length < 2) return;
+    const seen = new Set();
+    const clean = m.paketIsi.filter(c => { const k = normalizeName(c && c.nama); if (!k || seen.has(k)) return false; seen.add(k); return true; });
+    if (clean.length !== m.paketIsi.length) m.paketIsi = clean;
+  });
+  const idx = gsjPaketIndex();
+  const want = new Map(); // id baris isi -> { parent, c }
+  if (idx.size) {
+    state.checkerRows.forEach(r => {
+      if (r.paketDari || !r.namaAsli || r.qtyTetap) return;
+      const m = idx.get(normalizeName(r.namaAsli) + '\u0001' + gsjPaketVarKey(r.variasi));
+      if (!m) return;
+      // isi dengan nama yang sama cukup 1 baris (dulu bisa ketambah 2x -> baris isi dobel)
+      const seenIsi = new Set();
+      m.paketIsi.forEach((c, i) => {
+        if (!c || !c.nama) return;
+        const k = normalizeName(c.nama);
+        if (seenIsi.has(k)) return;
+        seenIsi.add(k);
+        want.set(r.id + '~pk' + i, { parent: r, c });
+      });
+    });
+  }
+  const hadPaket = state.checkerRows.some(r => r.paketDari || r.paketHargaAsli != null);
+  if (!want.size && !hadPaket) return;
+  // buang baris isi yang induknya sudah hilang / isinya sudah dihapus dari paket
+  // (pecahan stok dari baris isi, id "...~pk0~HNH", ikut baris isinya)
+  const pkBase = id => { const mm = String(id).match(/^(.*?~pk\d+)/); return mm ? mm[1] : id; };
+  state.checkerRows = state.checkerRows.filter(r => !r.paketDari || want.has(pkBase(r.id)));
+  // Pengaman baris isi DOBEL (mis. dari laptop lain yang masih pakai versi lama, atau id kembar hasil
+  // sinkron): per pesanan utama, 1 nama isi = 1 baris saja. Yang dipertahankan: id yang memang
+  // diharapkan (want) & yang entitasnya sudah diklik manual.
+  {
+    const keepBy = new Map();
+    const score = r => (want.has(r.id) ? 4 : 0) + (r.entitasManual ? 2 : 0) + (/~pk\d+$/.test(r.id) ? 1 : 0);
+    state.checkerRows.forEach(r => {
+      if (!r.paketDari || r.splitOf) return;
+      const k = r.paketDari + '\u0001' + normalizeName(r.namaCanonical || r.nama);
+      const cur = keepBy.get(k);
+      if (!cur || score(r) > score(cur)) keepBy.set(k, r);
+    });
+    const keepSet = new Set(keepBy.values());
+    const seenId = new Set();
+    state.checkerRows = state.checkerRows.filter(r => {
+      if (!r.paketDari) return true;
+      if (seenId.has(r.id)) return false; // objek kembar dengan id sama
+      seenId.add(r.id);
+      if (r.splitOf) return true;
+      return keepSet.has(r);
+    });
+  }
+  const byId = new Map(state.checkerRows.map(r => [r.id, r]));
+  want.forEach(({ parent, c }, id) => {
+    const q = (Number(parent.qty) || 0) * (Number(c.qty) || 1);
+    const x = byId.get(id);
+    if (x) {
+      x.qty = q; x.qtyInternal = undefined; x.tanggal = parent.tanggal;
+      if (normalizeName(x.namaCanonical) !== normalizeName(c.nama)) { x.nama = c.nama; x.namaCanonical = c.nama; }
+      return;
+    }
+    const raw = parent.rawRow && typeof parent.rawRow === 'object' ? JSON.parse(JSON.stringify(parent.rawRow)) : {};
+    Object.keys(raw).forEach(k => { if (PAKET_MONEY_KEY_RE.test(k) && !/unit original price/i.test(k)) raw[k] = '0'; });
+    const row = {
+      id, paketDari: parent.id, tanggal: parent.tanggal, nama: c.nama, namaCanonical: c.nama,
+      namaAsli: parent.namaAsli, variasi: parent.variasi || '', qty: q, hargaModal: 0, totalModal: 0,
+      entitas: parent.entitas, status: 'OK', catatan: '', sumber: parent.sumber, channel: parent.channel,
+      noPesanan: parent.noPesanan, hargaJual: parent.hargaJual || 0, rawRow: raw,
+      statusAsli: parent.statusAsli || '', paidTimeRaw: parent.paidTimeRaw || '',
+    };
+    const at = state.checkerRows.indexOf(parent);
+    state.checkerRows.splice(at < 0 ? state.checkerRows.length : at + 1, 0, row);
+  });
+  // HARGA PAKET dibagi rata ke semua isinya (dulu: harga penuh tercatat di baris utama DAN tiap isi,
+  // jadi Pembayaran & Pemotongan Fee dobel). Sama seperti checker: 60.700 -> 30.350 + 30.350.
+  // Harga asli disimpan di baris utama (paketHargaAsli); dibagi ulang hanya kalau jumlah isinya berubah,
+  // jadi harga yang diedit manual sesudahnya tidak ditimpa.
+  const kidsBy = new Map();
+  state.checkerRows.forEach(r => { if (r.paketDari && !r.splitOf) { const a = kidsBy.get(r.paketDari) || []; a.push(r); kidsBy.set(r.paketDari, a); } });
+  state.checkerRows.forEach(p => {
+    if (p.paketDari) return;
+    const kids = (kidsBy.get(p.id) || []).filter(k => /~pk\d+$/.test(k.id));
+    if (!kids.length) {
+      if (p.paketHargaAsli != null) { p.hargaJual = p.paketHargaAsli; delete p.paketHargaAsli; delete p.paketN; }
+      return;
+    }
+    if (p.paketHargaAsli == null) p.paketHargaAsli = Number(p.hargaJual) || 0;
+    if (p.paketN === kids.length && kids.every(k => k.paketHargaSet)) return;
+    const total = Number(p.paketHargaAsli) || 0;
+    const share = Math.round(total / (kids.length + 1));
+    kids.forEach(k => { k.hargaJual = share; k.paketHargaSet = true; });
+    p.hargaJual = total - share * kids.length;
+    p.paketN = kids.length;
+  });
+}
+
+// ---------- Cek & Ubah Cepat dari Stok Terjual ----------
+// Waktu double-check total per tanggal vs Stok Terjual manual: klik nama produk / angka Total di
+// tab Stok Terjual -> muncul daftar transaksi produk itu di tanggal itu (di entitas ini DAN di
+// entitas lain), dan bisa langsung ubah Entitas, Nama Internal, dan Pengali per baris — tidak perlu
+// bolak-balik ke tab Import Marketplace. Ubah entitas di sini berlaku untuk BARIS itu saja (dikunci
+// manual), sama seperti warna per baris di file checker.
+const QE_ENT_COLOR = { Gracia: '#111827', HNH: '#dc2626', Glomed: '#16a34a' };
+const QE_SHORT = { Gracia: 'GSM', HNH: 'HNH', Glomed: 'GSJ' };
+let qeCtx = null; // { entitas, tanggal, nama, ids:Set, q:'' }
+
+function qeProdKey(r) { return normalizeName(r.namaCanonical || r.nama); }
+function qeRowsByIds(ids) {
+  return state.checkerRows.filter(r => ids.has(r.id) || (r.splitOf && ids.has(r.splitOf)) || (r.bagiDari && ids.has(r.bagiDari)) || (r.paketDari && ids.has(r.paketDari)));
+}
+function qeMasterForRow(r) {
+  if (!r.namaAsli) return null;
+  const nk = normalizeName(r.namaAsli), vk = normalizeName(r.variasi || '');
+  return state.masterProduk.find(m => normalizeName(m.namaMarketplace) === nk && normalizeName(m.variasiMarketplace || '') === vk) || null;
+}
+function qeCurrentMultiplier(r) {
+  const m = qeMasterForRow(r);
+  if (m) return m.qtyMultiplier || extractQtyMultiplierFromCatatan(m.catatan) || 1;
+  return Number(r.qtyMultiplier) || 1;
+}
+
+function openQuickEditStokTerjual(entitas, tanggal, nama) {
+  const key = normalizeName(nama);
+  const own = state.checkerRows.filter(r => r.tanggal === tanggal && r.entitas === entitas && normalizeName(r.nama) === key);
+  const keys = new Set([key]);
+  own.forEach(r => { keys.add(qeProdKey(r)); keys.add(normalizeName(r.nama)); });
+  const others = state.checkerRows.filter(r => r.tanggal === tanggal && r.entitas !== entitas && (keys.has(qeProdKey(r)) || keys.has(normalizeName(r.nama))));
+  qeCtx = { entitas, tanggal, nama, ids: new Set([...own, ...others].map(r => r.splitOf || r.id)), q: '' };
+  showConfirmModal(`Cek Transaksi — ${nama}`, `<div id="qe-root"></div>`, true);
+  const box = document.querySelector('#confirmModal .modal-box');
+  if (box) { box.style.maxWidth = '1150px'; box.dataset.qe = '1'; }
+  qeRender();
+}
+
+function qeRowHTML(r) {
+  const mult = r.qtyTetap ? 1 : qeCurrentMultiplier(r);
+  const qInt = Number(r.qtyInternal != null ? r.qtyInternal : r.qty) || 0;
+  const ents = ENTITIES.map(e => {
+    const on = r.entitas === e && r.status === 'OK';
+    return `<button class="btn small" data-qe-ent="${e}" style="padding:3px 8px;font-size:11px;margin:1px;${on ? `background:${QE_ENT_COLOR[e]};color:#fff;border-color:${QE_ENT_COLOR[e]};` : 'background:#fff;color:#374151;border:1px solid #d1d5db;'}">${escapeAttr(QE_SHORT[e])}</button>`;
+  }).join('');
+  const flag = r.status === 'PERLU_KONFIRMASI' ? '<span class="pill confirm" style="font-size:9px;">PERLU KONFIRMASI</span>' : '';
+  const split = r.splitInfo ? `<div style="font-size:10px;color:#b45309;">✂ ${escapeAttr(r.splitInfo)}</div>` : '';
+  const manual = r.entitasManual ? '<div style="font-size:10px;color:var(--muted);">🔒 manual</div>' : '';
+  const canSplit = (Number(r.qty) || 0) > 1 && !r.splitOf && r.splitTotalQty == null && !r.paketDari;
+  const isPaketIsi = !!r.paketDari;
+  const paketM = !isPaketIsi && r.namaAsli && !r.qtyTetap ? (gsjPaketMasterForRow(r) || qeMasterForRow(r)) : null;
+  const paketList = paketM && Array.isArray(paketM.paketIsi) ? paketM.paketIsi : [];
+  const canPaket = !isPaketIsi && !!r.namaAsli && !r.qtyTetap;
+  const paketNote = isPaketIsi ? '<div style="font-size:10px;color:#7c3aed;">📦 isi paket (ikut pesanan utama)</div>'
+    : (paketList.length ? `<div style="font-size:10px;color:#7c3aed;">📦 paket + ${paketList.map(c => escapeAttr(c.nama)).join(', ')}</div>` : '');
+  const tetapNote = r.qtyTetap ? '<div style="font-size:10px;color:#b45309;">✏️ diketik di Stok Terjual (tanpa pengali)</div>' : '';
+  return `<tr data-qe-id="${escapeAttr(r.id)}" style="border-left:4px solid ${QE_ENT_COLOR[r.entitas] || '#f59e0b'};">
+    <td style="white-space:nowrap;">${ents}${(Number(r.qty) || 0) > 1 ? `<button class="btn small" data-qe-split style="padding:3px 7px;font-size:11px;margin:1px;background:#fff;color:#92400e;border:1px dashed #d97706;" title="Bagi pesanan ini ke beberapa entitas (mis. 1 HNH + 2 GSJ)">✂ Bagi</button>` : ''}${flag}${manual}</td>
+    <td style="font-size:11.5px;white-space:nowrap;">${escapeAttr(r.sumber || '-')}<br><span style="color:var(--muted);">${escapeAttr(r.channel || '')} · ${escapeAttr(r.noPesanan || '-')}</span></td>
+    <td style="font-size:11.5px;max-width:260px;">${escapeAttr((r.namaAsli || r.nama || '').slice(0, 90))}${r.variasi ? `<div style="color:var(--muted);">Variasi: ${escapeAttr(r.variasi)}</div>` : ''}${split}</td>
+    <td class="num" style="font-family:var(--mono);white-space:nowrap;">${fmtNum(r.qty)}${mult > 1 && !r.qtyTetap ? `<div style="font-size:10px;color:var(--muted);">×${mult} = ${fmtNum(qInt)}</div>` : ''}${tetapNote}${paketNote}${canPaket ? `<div><button class="btn secondary small" data-qe-paketbtn style="padding:1px 6px;font-size:10.5px;margin-top:3px;" title="Listing ini paket isi beberapa produk (mis. Pump + Refill)? Tambah isi lainnya di sini — tiap isi jadi baris sendiri & bisa beda entitas">📦 Paket</button></div>` : ''}${canSplit ? `<div><button class="btn secondary small" data-qe-splitbtn style="padding:1px 6px;font-size:10.5px;margin-top:3px;" title="Bagi pesanan ini ke 2 entitas (misal 1 HNH + 2 GSJ, seperti di checker)">✂ Bagi</button></div>` : ''}</td>
+    <td><input type="text" data-qe-nama value="${escapeAttr(r.nama || '')}" autocomplete="new-password" ${isPaketIsi ? 'disabled title="Isi paket — ubah lewat tombol 📦 Paket di baris utama"' : ''} style="width:100%;min-width:180px;padding:4px 6px;border:1px solid #c9c5b8;border-radius:4px;font-size:12px;"></td>
+    <td><input type="number" min="1" data-qe-mult value="${mult}" ${r.namaAsli && !r.qtyTetap && !isPaketIsi ? '' : 'disabled title="Baris ini angkanya diketik manual / bukan dari marketplace — tidak pakai pengali"'} style="width:62px;padding:4px 6px;border:1px solid #c9c5b8;border-radius:4px;"></td>
+  </tr>${canSplit ? `<tr data-qe-split-for="${escapeAttr(r.id)}" style="display:none;background:#fffbeb;">
+    <td colspan="6" style="font-size:12px;">✂ Pindahkan <input type="number" min="1" max="${Number(r.qty) - 1}" value="1" data-qe-split-n style="width:60px;padding:3px 5px;border:1px solid #c9c5b8;border-radius:4px;"> dari ${fmtNum(r.qty)} ke:
+      ${ENTITIES.filter(e => e !== r.entitas).map(e => `<button class="btn small" data-qe-split-ent="${e}" style="padding:3px 10px;background:${QE_ENT_COLOR[e]};color:#fff;border-color:${QE_ENT_COLOR[e]};">${QE_SHORT[e]}</button>`).join(' ')}
+      <span style="color:var(--muted);">— sisanya tetap di ${QE_SHORT[r.entitas] || r.entitas}. Jadi 2 baris (No. Pesanan sama).</span></td></tr>` : ''}${canPaket ? `<tr data-qe-paket-for="${escapeAttr(r.id)}" style="display:none;background:#f5f3ff;">
+    <td colspan="6" style="font-size:12px;">
+      <div style="margin-bottom:4px;">📦 <b>Isi paket</b> listing ini: <b>${escapeAttr(r.namaCanonical || r.nama || '')}</b> (produk utama, baris ini)${paketList.map((c, i) => ` + <span style="background:#ede9fe;border-radius:4px;padding:1px 5px;">${escapeAttr(c.nama)} ×${Number(c.qty) || 1} <a href="#" data-qe-paket-del="${i}" style="color:var(--red);text-decoration:none;" title="Hapus isi ini">✕</a></span>`).join('')}</div>
+      Tambah isi: <input type="text" data-qe-paket-nama placeholder="🔎 nama produk (mis. Aseptic Plus Essential Refill 500 Ml)" autocomplete="new-password" style="width:300px;padding:3px 6px;border:1px solid #c9c5b8;border-radius:4px;">
+      × <input type="number" min="1" value="1" data-qe-paket-qty style="width:50px;padding:3px 5px;border:1px solid #c9c5b8;border-radius:4px;">
+      <button class="btn small" data-qe-paket-add style="padding:3px 10px;background:#7c3aed;color:#fff;border-color:#7c3aed;">➕ Tambah</button>
+      <div style="color:var(--muted);font-size:11px;margin-top:3px;">Disimpan ke Master Produk: SEMUA penjualan listing ini (semua tanggal) otomatis dapat baris isi tambahan. Entitasnya bisa diklik per baris.</div>
+    </td></tr>` : ''}`;
+}
+
+function qeTableHTML(rows, emptyText) {
+  if (!rows.length) return `<p style="color:var(--muted);font-size:12px;margin:6px 0;">${emptyText}</p>`;
+  return `<div style="overflow-x:auto;"><table class="dtable" style="width:100%;">
+    <thead><tr><th style="width:150px;">Entitas</th><th style="width:130px;">Marketplace</th><th>Nama di Marketplace</th><th style="width:70px;">Qty</th><th style="width:220px;">Nama Internal</th><th style="width:70px;">Pengali</th></tr></thead>
+    <tbody>${rows.map(qeRowHTML).join('')}</tbody></table></div>`;
+}
+
+function qeRender() {
+  const root = document.getElementById('qe-root');
+  if (!root || !qeCtx) return;
+  const { entitas, tanggal, nama } = qeCtx;
+  const shown = qeRowsByIds(qeCtx.ids).sort((a, b) => (a.entitas === entitas ? 0 : 1) - (b.entitas === entitas ? 0 : 1) || String(a.sumber).localeCompare(String(b.sumber)));
+  const tot = {};
+  // entitas yang sedang dibuka = angka persis di Stok Terjual; entitas lain = jumlah baris di daftar ini
+  // (nama produk di entitas lain bisa beda, jadi tidak dicari lewat nama)
+  ENTITIES.forEach(e => {
+    tot[e] = e === entitas ? computeSingleProductPivot(e, tanggal, nama).grandTotal
+      : shown.filter(r => r.entitas === e && r.status === 'OK').reduce((s, r) => s + (Number(r.qtyInternal != null ? r.qtyInternal : r.qty) || 0), 0);
+  });
+  let found = [];
+  const q = normalizeName(qeCtx.q || '');
+  if (q.length >= 2) {
+    const shownIds = new Set(shown.map(r => r.id));
+    found = state.checkerRows.filter(r => r.tanggal === tanggal && !shownIds.has(r.id) && !r.splitOf &&
+      (normalizeName(r.namaAsli || '').includes(q) || normalizeName(r.nama || '').includes(q) || normalizeName(r.variasi || '').includes(q) || String(r.noPesanan || '').toLowerCase().includes(q))).slice(0, 40);
+  }
+  root.innerHTML = `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+      <span style="font-size:12.5px;"><b>${escapeAttr(dateLabelID(tanggal))}</b> · Terjual produk ini:</span>
+      ${ENTITIES.map(e => `<span class="pill" style="background:${e === entitas ? QE_ENT_COLOR[e] : '#f3f4f6'};color:${e === entitas ? '#fff' : QE_ENT_COLOR[e]};font-weight:700;">${escapeAttr(QE_SHORT[e])} ${fmtNum(tot[e])}</span>`).join('')}
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px;font-size:12px;">
+      Pindahkan semua baris di bawah ke:
+      ${ENTITIES.map(e => `<button class="btn small" data-qe-all="${e}" style="padding:3px 10px;background:${QE_ENT_COLOR[e]};color:#fff;border-color:${QE_ENT_COLOR[e]};">${escapeAttr(QE_SHORT[e])}</button>`).join('')}
+    </div>
+    ${qeTableHTML(shown, 'Tidak ada transaksi marketplace untuk produk ini di tanggal ini.')}
+    <div style="margin-top:12px;border-top:1px dashed #d1d5db;padding-top:10px;">
+      <div style="font-size:12px;margin-bottom:4px;"><b>Penjualan yang hilang / masuk nama lain?</b> Cari transaksi lain di tanggal ini (nama marketplace, variasi, nama internal, atau No. Pesanan):</div>
+      <input type="text" id="qe-search" value="${escapeAttr(qeCtx.q || '')}" placeholder="🔎 min. 2 huruf..." style="width:100%;padding:7px 10px;border:1px solid #c9c5b8;border-radius:6px;font-size:13px;">
+      <div id="qe-found" style="margin-top:6px;">${q.length >= 2 ? qeTableHTML(found, 'Tidak ketemu.') + (found.length ? '<p style="font-size:11px;color:var(--muted);margin:4px 0 0;">Ubah Entitas / Nama Internal langsung di baris hasil cari — baris itu otomatis ikut ditampilkan di daftar atas.</p>' : '') : ''}</div>
+    </div>
+    <p style="font-size:11px;color:var(--muted);margin:10px 0 0;">Entitas: berlaku untuk baris itu saja (dikunci manual). Nama Internal & Pengali: disimpan ke Master Produk untuk listing marketplace itu, jadi berlaku ke semua penjualan listing yang sama. Semua perubahan langsung tersimpan & tersinkron.</p>
+  `;
+  root.querySelectorAll('tr[data-qe-id]').forEach(tr => qeBindRow(tr));
+  // tandai pesanan yang tercatat 2x (No. Pesanan + listing + variasi sama) — biasanya ter-import dobel
+  {
+    const cnt = new Map();
+    const key = r => [r.sumber, r.noPesanan, normalizeName(r.namaAsli || ''), normalizeName(r.variasi || ''), r.paketDari ? 'pk' + normalizeName(r.nama) : ''].join('|');
+    const dayRows = state.checkerRows.filter(r => r.tanggal === tanggal);
+    const bagiParents = new Set(dayRows.filter(x => x.bagiDari).map(x => x.bagiDari));
+    const all = dayRows.filter(r => r.noPesanan && !r.splitOf && !r.bagiDari && !bagiParents.has(r.id));
+    all.forEach(r => cnt.set(key(r), (cnt.get(key(r)) || 0) + 1));
+    root.querySelectorAll('tr[data-qe-id]').forEach(tr => {
+      const r = state.checkerRows.find(x => x.id === tr.dataset.qeId);
+      if (r && !r.splitOf && (cnt.get(key(r)) || 0) > 1) {
+        const td = tr.children[1];
+        if (td) td.insertAdjacentHTML('beforeend', '<div style="font-size:10px;color:var(--red);font-weight:700;">⚠ No. Pesanan ini tercatat ' + cnt.get(key(r)) + 'x — cek dobel import</div>');
+      }
+    });
+  }
+  root.querySelectorAll('[data-qe-all]').forEach(b => b.addEventListener('click', () => {
+    const ent = b.dataset.qeAll;
+    const rows = qeRowsByIds(qeCtx.ids).filter(r => !(r.entitas === ent && r.status === 'OK' && r.entitasManual));
+    if (!rows.length) return;
+    if (!confirm(`Pindahkan ${rows.length} baris ke ${ENTITY_LABEL[ent] || ent}?`)) return;
+    qeSetEntitas(rows, ent);
+  }));
+  const s = document.getElementById('qe-search');
+  if (s) {
+    let t = null;
+    s.addEventListener('input', () => {
+      clearTimeout(t);
+      t = setTimeout(() => { qeCtx.q = s.value; qeRender(); const s2 = document.getElementById('qe-search'); if (s2) { s2.focus(); s2.setSelectionRange(s2.value.length, s2.value.length); } }, 300);
+    });
+  }
+}
+
+function qeBindRow(tr) {
+  const id = tr.dataset.qeId;
+  const get = () => state.checkerRows.find(x => x.id === id);
+  tr.querySelectorAll('[data-qe-ent]').forEach(b => b.addEventListener('click', () => {
+    const r = get(); if (!r) return;
+    qeCtx.ids.add(r.splitOf || r.id);
+    if (r.entitas === b.dataset.qeEnt && r.status === 'OK' && r.entitasManual) return;
+    qeSetEntitas([r], b.dataset.qeEnt);
+  }));
+  const sp = tr.querySelector('[data-qe-split]');
+  if (sp) sp.addEventListener('click', () => {
+    const r = get(); if (!r) return;
+    const nx = tr.nextElementSibling;
+    if (nx && nx.dataset.qeSplitRow) { nx.remove(); return; }
+    const q = Number(r.qty) || 0;
+    const ed = document.createElement('tr');
+    ed.dataset.qeSplitRow = '1';
+    ed.innerHTML = `<td colspan="6" style="background:#fffbeb;">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px;">
+        <b>Bagi ${fmtNum(q)} pcs ke:</b>
+        ${ENTITIES.map(e => `<label style="display:flex;align-items:center;gap:4px;"><span class="pill" style="background:${QE_ENT_COLOR[e]};color:#fff;">${QE_SHORT[e]}</span><input type="number" min="0" data-qe-part="${e}" value="${e === r.entitas ? q : 0}" style="width:60px;padding:3px 5px;border:1px solid #c9c5b8;border-radius:4px;"></label>`).join('')}
+        <span data-qe-sum style="color:var(--muted);"></span>
+        <button class="btn small" data-qe-split-save style="padding:3px 10px;background:var(--accent-dark);color:#fff;">Simpan pembagian</button>
+        <button class="btn secondary small" data-qe-split-cancel style="padding:3px 10px;">Batal</button>
+      </div></td>`;
+    tr.after(ed);
+    const sumEl = ed.querySelector('[data-qe-sum]');
+    const upd = () => { const t = [...ed.querySelectorAll('[data-qe-part]')].reduce((a, i) => a + (Number(i.value) || 0), 0); sumEl.textContent = `Jumlah: ${t} dari ${q}`; sumEl.style.color = t === q ? '#16a34a' : 'var(--red)'; };
+    ed.querySelectorAll('[data-qe-part]').forEach(i => i.addEventListener('input', upd)); upd();
+    ed.querySelector('[data-qe-split-cancel]').addEventListener('click', () => ed.remove());
+    ed.querySelector('[data-qe-split-save]').addEventListener('click', () => {
+      const parts = {}; ed.querySelectorAll('[data-qe-part]').forEach(i => { parts[i.dataset.qePart] = Math.max(0, parseInt(i.value, 10) || 0); });
+      const t = Object.values(parts).reduce((a, b) => a + b, 0);
+      if (t !== q) { alert(`Jumlah pembagian harus ${q} (sekarang ${t}).`); return; }
+      const rr = get(); if (!rr) return;
+      const made = gsjSplitRowManual(rr, parts);
+      if (!made) return;
+      made.forEach(m => qeCtx.ids.add(m.id));
+      qeAfterChange(`membagi pesanan <b>${escapeAttr(rr.nama || '')}</b> tgl ${escapeAttr(rr.tanggal)} (${escapeAttr(rr.noPesanan || '-')}) jadi ${escapeAttr(made[0].splitInfo || '')} dari Stok Terjual`);
+    });
+  });
+  const ni = tr.querySelector('[data-qe-nama]');
+  if (ni) {
+    bindNamaLinkerAutocomplete(ni);
+    ni.addEventListener('focus', () => { ni.dataset.old = ni.value; });
+    ni.addEventListener('change', () => {
+      const r = get(); const v = ni.value.trim();
+      if (!r || !v || normalizeName(v) === normalizeName(r.nama)) { ni.value = r ? r.nama : ni.value; return; }
+      qeCtx.ids.add(r.splitOf || r.id);
+      if (!qeSetNamaInternal(r, v)) ni.value = r.nama;
+    });
+  }
+  const pb = tr.querySelector('[data-qe-paketbtn]');
+  const pr = tr.parentElement ? [...tr.parentElement.querySelectorAll('tr[data-qe-paket-for]')].find(x => x.dataset.qePaketFor === id) : null;
+  if (pb && pr) {
+    pb.addEventListener('click', () => { pr.style.display = pr.style.display === 'none' ? '' : 'none'; });
+    const pn = pr.querySelector('[data-qe-paket-nama]');
+    bindNamaLinkerAutocomplete(pn);
+    pr.querySelector('[data-qe-paket-add]').addEventListener('click', () => {
+      const r = get(); if (!r) return;
+      const nm = pn.value.trim(); const q = Math.max(1, parseInt(pr.querySelector('[data-qe-paket-qty]').value, 10) || 1);
+      if (!nm) { alert('Isi dulu nama produk isi paketnya.'); return; }
+      qeCtx.ids.add(r.id);
+      qeSetPaket(r, list => list.concat([{ nama: nm, qty: q }]), `menambah isi paket <b>${escapeAttr(nm)}</b> ×${q}`);
+    });
+    pr.querySelectorAll('[data-qe-paket-del]').forEach(a => a.addEventListener('click', (e) => {
+      e.preventDefault();
+      const r = get(); if (!r) return;
+      const i = Number(a.dataset.qePaketDel);
+      if (!confirm('Hapus isi paket ini dari listing? Baris isinya di semua tanggal ikut terhapus.')) return;
+      qeSetPaket(r, list => list.filter((_, j) => j !== i), 'menghapus 1 isi paket');
+    }));
+  }
+  const sb = tr.querySelector('[data-qe-splitbtn]');
+  const sr = tr.parentElement ? [...tr.parentElement.querySelectorAll('tr[data-qe-split-for]')].find(x => x.dataset.qeSplitFor === id) : null;
+  if (sb && sr) {
+    sb.addEventListener('click', () => { sr.style.display = sr.style.display === 'none' ? '' : 'none'; const n = sr.querySelector('[data-qe-split-n]'); if (n) n.focus(); });
+    sr.querySelectorAll('[data-qe-split-ent]').forEach(b => b.addEventListener('click', () => {
+      const r = get(); if (!r) return;
+      const n = parseInt(sr.querySelector('[data-qe-split-n]').value, 10) || 0;
+      if (n < 1 || n >= (Number(r.qty) || 0)) { alert(`Isi jumlah antara 1 dan ${(Number(r.qty) || 0) - 1}.`); return; }
+      qeCtx.ids.add(r.id);
+      qeSplitRow(r, n, b.dataset.qeSplitEnt);
+    }));
+  }
+  const mi = tr.querySelector('[data-qe-mult]');
+  if (mi) mi.addEventListener('change', () => {
+    const r = get(); if (!r) return;
+    qeCtx.ids.add(r.splitOf || r.id);
+    qeSetPengali(r, Math.max(1, parseInt(mi.value, 10) || 1));
+  });
+}
+
+function qeAfterChange(auditText) {
+  recomputeAllCheckerRows();
+  if (auditText) gsjDetailedAudit(auditText);
+  saveState();
+  qeRender();
+  try { renderTab3TableKeepScroll(); } catch (e) {}
+  if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+}
+
+function qeSetEntitas(rows, ent) {
+  const names = [];
+  rows.forEach(row => {
+    if (!state.checkerRows.includes(row)) return;
+    names.push(`${row.nama || row.namaAsli || ''} (${row.qty})`);
+    if (row.splitOf || row.splitTotalQty != null) {
+      // pesanan dipecah: bagian ini saja yang pindah; kalau jadi sama dengan bagian lain -> digabung
+      const pid = row.splitOf || row.id;
+      const parts = state.checkerRows.filter(x => x.id === pid || x.splitOf === pid);
+      const parent = parts.find(x => x.id === pid);
+      const same = parts.find(x => x !== row && x.entitas === ent);
+      if (same) {
+        const keep = (row === parent || same === parent) ? parent : same;
+        const other = keep === row ? same : row;
+        keep.qty = (Number(keep.qty) || 0) + (Number(other.qty) || 0);
+        keep.qtyInternal = keep.qty;
+        state.checkerRows = state.checkerRows.filter(x => x !== other);
+        keep.entitas = ent;
+      } else row.entitas = ent;
+      const left = state.checkerRows.filter(x => x.id === pid || x.splitOf === pid);
+      left.forEach(x => { delete x.splitOf; delete x.splitTotalQty; });
+      if (left.length === 1) delete left[0].splitInfo;
+      else {
+        const info = left.map(x => `${ENTITY_LABEL[x.entitas] || x.entitas} ${x.qty}`).join(' + ') + ` (pesanan ${left.reduce((a, x) => a + (Number(x.qty) || 0), 0)})`;
+        left.forEach(x => { x.splitInfo = info; });
+      }
+      left.forEach(x => { x.entitasManual = true; x.status = 'OK'; x.autoEnt = undefined; x.autoTopUpQty = undefined; });
+      return;
+    }
+    row.entitas = ent; row.status = 'OK'; row.entitasManual = true; row.autoEnt = undefined; row.autoTopUpQty = undefined;
+    qeMergeBagi(row);
+  });
+  qeAfterChange(`mengubah entitas ${names.length} baris penjualan tgl ${escapeAttr(qeCtx.tanggal)} ke <b>${escapeAttr(ENTITY_LABEL[ent] || ent)}</b> dari Stok Terjual: ${escapeAttr(names.slice(0, 5).join(', '))}${names.length > 5 ? ', …' : ''}`);
+}
+
+// Bagi 1 baris pesanan jadi 2 baris di entitas berbeda (dikunci manual). Baris baru menyimpan
+// bagiDari = id baris asal, supaya kalau nanti entitasnya disamakan lagi otomatis digabung kembali.
+const QE_MONEY_KEY_RE = /voucher|cashback|discount|diskon|subtotal|ongkir|fee|biaya|total/i;
+function qeBagiRefreshInfo(rootId) {
+  const parts = state.checkerRows.filter(x => x.id === rootId || x.bagiDari === rootId);
+  if (parts.length <= 1) { parts.forEach(x => { x.splitInfo = undefined; if (x.id !== rootId) delete x.bagiDari; }); return; }
+  const total = parts.reduce((a, x) => a + (Number(x.qty) || 0), 0);
+  const info = 'Dibagi manual: ' + parts.map(x => `${QE_SHORT[x.entitas] || x.entitas} ${x.qty}`).join(' + ') + ` (pesanan ${total})`;
+  parts.forEach(x => { x.splitInfo = info; });
+}
+function qeSplitRow(row, n, ent) {
+  const rootId = row.bagiDari || row.id;
+  const idx = state.checkerRows.indexOf(row);
+  if (idx < 0) return;
+  const child = JSON.parse(JSON.stringify(row));
+  child.id = rootId + '~bagi' + Date.now().toString(36);
+  child.bagiDari = rootId;
+  delete child.splitOf; delete child.splitTotalQty;
+  child.qty = n; child.qtyInternal = undefined;
+  child.entitas = ent; child.status = 'OK'; child.entitasManual = true; child.autoEnt = undefined; child.autoTopUpQty = undefined;
+  // biaya/voucher per pesanan cukup dihitung sekali (di baris asal) — sama seperti pecahan otomatis
+  if (child.rawRow && typeof child.rawRow === 'object') {
+    Object.keys(child.rawRow).forEach(k => { if (QE_MONEY_KEY_RE.test(k) && !/unit original price/i.test(k)) child.rawRow[k] = '0'; });
+  }
+  row.qty = (Number(row.qty) || 0) - n; row.qtyInternal = undefined;
+  row.status = 'OK'; row.entitasManual = true; row.autoEnt = undefined; row.autoTopUpQty = undefined;
+  state.checkerRows.splice(idx + 1, 0, child);
+  qeCtx.ids.add(child.id);
+  qeBagiRefreshInfo(rootId);
+  qeAfterChange(`membagi pesanan <b>${escapeAttr(row.nama || row.namaAsli || '')}</b> ${escapeAttr(row.noPesanan || '')} tgl ${escapeAttr(row.tanggal)}: ${QE_SHORT[row.entitas] || row.entitas} ${row.qty} + ${QE_SHORT[ent] || ent} ${n}`);
+}
+// Setelah entitas diubah: kalau 2 bagian dari pesanan yang dibagi manual jadi sama entitasnya -> gabung lagi
+function qeMergeBagi(row) {
+  const rootId = row.bagiDari || (state.checkerRows.some(x => x.bagiDari === row.id) ? row.id : null);
+  if (!rootId) return;
+  let parts = state.checkerRows.filter(x => x.id === rootId || x.bagiDari === rootId);
+  const byEnt = {};
+  parts.forEach(x => { (byEnt[x.entitas] = byEnt[x.entitas] || []).push(x); });
+  Object.values(byEnt).forEach(list => {
+    if (list.length < 2) return;
+    const keep = list.find(x => x.id === rootId) || list[0];
+    list.forEach(x => { if (x === keep) return; keep.qty = (Number(keep.qty) || 0) + (Number(x.qty) || 0); });
+    keep.qtyInternal = undefined;
+    const drop = new Set(list.filter(x => x !== keep));
+    state.checkerRows = state.checkerRows.filter(x => !drop.has(x));
+  });
+  // kalau induknya yang hilang (digabung ke bagian lain), jadikan sisa bagian pertama sebagai induk
+  parts = state.checkerRows.filter(x => x.id === rootId || x.bagiDari === rootId);
+  qeBagiRefreshInfo(rootId);
+}
+
+function qeSetNamaInternal(row, newNama) {
+  const known = searchInternalProductNames(newNama, 20).some(n => normalizeName(n) === normalizeName(newNama));
+  if (!known && !confirm(`"${newNama}" belum ada di katalog produk.\n\nYakin ini produk BARU (bukan duplikat nama lain)? Kalau ragu, klik Batal lalu pilih dari daftar saran.`)) return false;
+  const oldNama = row.nama;
+  if (row.namaAsli) {
+    if (!confirm(`Ganti nama internal listing ini?\n\nMarketplace: "${row.namaAsli}"${row.variasi ? `\nVariasi: ${row.variasi}` : ''}\nDari: "${oldNama}"\nJadi: "${newNama}"\n\nDisimpan ke Master Produk — berlaku untuk SEMUA penjualan listing ini.`)) return false;
+    const now = new Date().toISOString();
+    const m = qeMasterForRow(row);
+    if (m) {
+      m.namaInternal = newNama; m.belumDirapikan = false;
+      // nama khusus per entitas milik produk lama tidak berlaku lagi untuk produk baru
+      m.namaGracia = ''; m.namaHNH = ''; m.namaGlomed = '';
+      m.createdAt = now; m.createdSource = 'Diganti dari Stok Terjual (Cek Transaksi)';
+    } else {
+      state.masterProduk.push({ id: uid(), namaMarketplace: row.namaAsli, variasiMarketplace: row.variasi || '', namaInternal: newNama,
+        namaGracia: '', namaHNH: '', namaGlomed: '', entitasTetap: '', catatan: '', sumber: row.sumber || '', channel: row.channel || '',
+        createdAt: now, createdSource: 'Dari Stok Terjual (Cek Transaksi)' });
+    }
+    invalidateMasterProdukIndex();
+  }
+  row.nama = newNama; row.namaCanonical = newNama; row.status = 'OK'; row.fuzzyMatched = false; row.fuzzyScore = undefined;
+  if (!row.namaAsli) row.entitasManual = true;
+  qeAfterChange(`mengganti nama internal penjualan tgl ${escapeAttr(row.tanggal)} dari "${escapeAttr(oldNama || '')}" menjadi <b>${escapeAttr(newNama)}</b> (dari Stok Terjual)`);
+  return true;
+}
+
+function qeSetPaket(row, mutate, auditVerb) {
+  if (!row.namaAsli) return;
+  const known = (nm) => searchInternalProductNames(nm, 20).some(n => normalizeName(n) === normalizeName(nm));
+  let m = gsjPaketMasterForRow(row) || qeMasterForRow(row);
+  const now = new Date().toISOString();
+  if (!m) {
+    m = { id: uid(), namaMarketplace: row.namaAsli, variasiMarketplace: row.variasi || '', namaInternal: row.namaCanonical || row.nama,
+      namaGracia: '', namaHNH: '', namaGlomed: '', entitasTetap: '', catatan: '', sumber: row.sumber || '', channel: row.channel || '',
+      createdAt: now, createdSource: 'Paket dari Stok Terjual (Cek Transaksi)' };
+    state.masterProduk.push(m);
+    invalidateMasterProdukIndex();
+  }
+  const before = Array.isArray(m.paketIsi) ? m.paketIsi : [];
+  const after = mutate(before.slice());
+  const added = after.filter(c => !before.includes(c));
+  for (const c of added) {
+    if (normalizeName(c.nama) === normalizeName(m.namaInternal)) { alert('Itu sudah produk utama paket ini (baris ini).'); return; }
+    if (before.some(b => b && normalizeName(b.nama) === normalizeName(c.nama))) { alert(`"${c.nama}" sudah ada di isi paket ini. Kalau isinya 2, ubah jumlahnya (×) — hapus dulu lalu tambah lagi dengan ×2.`); return; }
+    if (!known(c.nama) && !confirm(`"${c.nama}" belum ada di katalog produk.\n\nYakin ini produk BARU (bukan duplikat)? Kalau ragu, Batal lalu pilih dari saran.`)) return;
+  }
+  m.paketIsi = after.length ? after : undefined;
+  qeAfterChange(`${auditVerb} di listing "${escapeAttr(row.namaAsli.slice(0, 60))}"${row.variasi ? ` (${escapeAttr(row.variasi)})` : ''} — isi paket: ${escapeAttr(m.namaInternal)}${after.map(c => ' + ' + escapeAttr(c.nama) + ' ×' + c.qty).join('')}`);
+}
+
+function qeSetPengali(row, n) {
+  if (!row.namaAsli) return;
+  let m = qeMasterForRow(row);
+  const now = new Date().toISOString();
+  if (!m) {
+    m = { id: uid(), namaMarketplace: row.namaAsli, variasiMarketplace: row.variasi || '', namaInternal: row.namaCanonical || row.nama,
+      namaGracia: '', namaHNH: '', namaGlomed: '', entitasTetap: '', catatan: '', sumber: row.sumber || '', channel: row.channel || '',
+      createdAt: now, createdSource: 'Pengali dari Stok Terjual (Cek Transaksi)' };
+    state.masterProduk.push(m);
+  }
+  const old = m.qtyMultiplier || extractQtyMultiplierFromCatatan(m.catatan) || 1;
+  if (old === n) return;
+  m.qtyMultiplier = n > 1 ? n : undefined;
+  if (n > 1 && (!m.catatan || /dipotong\s*\d+/i.test(m.catatan))) m.catatan = `Pengali stok internal: 1 unit yang terjual dipotong ${n} di Stok Terjual.`;
+  else if (n === 1 && /dipotong\s*\d+/i.test(m.catatan || '')) m.catatan = '';
+  invalidateMasterProdukIndex();
+  qeAfterChange(`mengubah <b>pengali</b> listing "${escapeAttr(row.namaAsli.slice(0, 60))}"${row.variasi ? ` (${escapeAttr(row.variasi)})` : ''} dari ${old} menjadi ${n} (dari Stok Terjual)`);
+}
+
 function buildTab3RowHTML(r) {
   // Products whose Nama Produk still looks like a raw, un-mapped marketplace title (long
   // and/or "/"-separated aliases) get a small diagnostic icon — clicking it computes, on
   // demand, the closest catalog candidate found and its score, so it's visible right in the
   // app why it either did or didn't get auto-matched, without needing to dig through raw data.
-  const looksRaw = (!r.fuzzyContributors || !r.fuzzyContributors.length) && (r.nama.includes('/') || r.nama.length > 55);
+  const looksRaw = _t3RawSet ? _t3RawSet.has(normalizeName(r.nama)) : ((!r.fuzzyContributors || !r.fuzzyContributors.length) && (r.nama.includes('/') || r.nama.length > 55));
   return `
     <tr data-nama="${escapeAttr(r.nama)}">
       <td>
-        ${escapeAttr(r.nama)}
+        <span data-action="quickedit" title="Klik untuk cek & ubah transaksi produk ini di tanggal ini (entitas, nama internal, pengali)" style="cursor:pointer;border-bottom:1px dashed #9ca3af;">${escapeAttr(r.nama)}</span>
         ${r.fuzzyContributors && r.fuzzyContributors.length ? `<span title="${escapeAttr('Dicocokkan OTOMATIS dari nama marketplace berikut (belum ada Master Produk):\n' + r.fuzzyContributors.map(f => `• "${f.namaAsli}" (mirip ${Math.round(f.score*100)}%)`).join('\n') + '\n\nCek dulu apakah ini memang produk yang sama. Kalau benar, tambahkan Master Produk supaya tidak perlu dicocokkan otomatis lagi.')}" style="cursor:help;color:var(--amber);margin-left:3px;">⚠</span>` : ''}
-        ${looksRaw ? `<button class="btn secondary small" data-action="whynotmerged" data-nama="${escapeAttr(r.nama)}" style="margin-left:4px;padding:1px 6px;font-size:10px;" title="Nama ini kelihatan seperti nama mentah dari marketplace (belum tergabung ke katalog manapun) — klik untuk lihat kandidat produk paling mirip yang ditemukan sistem.">🔍 Kenapa belum tergabung?</button>` : ''}
+        ${looksRaw ? (() => { const best0 = rawNameBestCandidate(r.nama); const best = best0 && best0.score >= 0.75 ? best0 : null; return `<div style="margin-top:3px;font-size:11px;">${best ? `💡 <b>${escapeAttr(best.nama)}</b> <span style="color:var(--muted);">(${Math.round(best.score * 100)}%)</span> <button class="btn small" data-action="quickmerge" data-to="${escapeAttr(best.nama)}" style="padding:1px 7px;font-size:10.5px;background:#16a34a;color:#fff;border-color:#16a34a;" title="Buka jendela gabung (sudah terisi saran ini) — bisa diatur per variasi">🔗 Gabung…</button>` : `<button class="btn secondary small" data-action="whynotmerged" style="padding:1px 7px;font-size:10.5px;" title="Pilih produk yang benar per variasi, jadikan produk sendiri, atau biarkan">🔗 Rapikan nama…</button>`}</div>`; })() : ''}
       </td>
       <td data-cell="satuan" style="text-align:center; color:var(--muted);">${escapeAttr(r.satuan || 'Pcs')}</td>
       <td class="num" data-cell="stokAwal" style="font-family:var(--mono); ${r.stokAwal<0?'color:var(--red);':''}">
@@ -7774,14 +8805,14 @@ function buildTab3RowHTML(r) {
       <td class="num editable-cell"><input type="number" data-platform="ownShopee" value="${r.ownShopee||0}"></td>
       <td class="num editable-cell"><input type="number" data-platform="ownTokopedia" value="${r.ownTokopedia||0}"></td>
       <td class="num editable-cell"><input type="number" data-platform="ownTikTok" value="${r.ownTikTok||0}"></td>
-      <td class="num" data-cell="totalOwn" style="font-family:var(--mono); font-weight:700;">${fmtNum(r.totalOwn)}</td>
+      <td class="num" data-cell="totalOwn" data-action="quickedit" title="Klik untuk cek transaksi" style="cursor:pointer;text-decoration:underline dotted;font-family:var(--mono); font-weight:700;">${fmtNum(r.totalOwn)}</td>
       <td class="num editable-cell" style="background:#fef6ef;"><input type="number" data-platform="gmShopee" value="${r.gmShopee||0}"></td>
       <td class="num editable-cell" style="background:#fef6ef;"><input type="number" data-platform="gmTokopedia" value="${r.gmTokopedia||0}"></td>
       <td class="num editable-cell" style="background:#f0faf1;"><input type="number" data-platform="mShopee" value="${r.mShopee||0}"></td>
       <td class="num editable-cell" style="background:#f0faf1;"><input type="number" data-platform="mTokopedia" value="${r.mTokopedia||0}"></td>
-      <td class="num" data-cell="totalGM" style="font-family:var(--mono);">${fmtNum(r.totalGM)}</td>
-      <td class="num" data-cell="totalM" style="font-family:var(--mono);">${fmtNum(r.totalM)}</td>
-      <td class="num" data-cell="grandTotal" style="font-family:var(--mono); font-weight:700;">${fmtNum(r.grandTotal)}</td>
+      <td class="num" data-cell="totalGM" data-action="quickedit" title="Klik untuk cek transaksi" style="cursor:pointer;text-decoration:underline dotted;font-family:var(--mono);">${fmtNum(r.totalGM)}</td>
+      <td class="num" data-cell="totalM" data-action="quickedit" title="Klik untuk cek transaksi" style="cursor:pointer;text-decoration:underline dotted;font-family:var(--mono);">${fmtNum(r.totalM)}</td>
+      <td class="num" data-cell="grandTotal" data-action="quickedit" title="Klik untuk cek transaksi" style="cursor:pointer;text-decoration:underline dotted;font-family:var(--mono); font-weight:700;">${fmtNum(r.grandTotal)}</td>
       <td class="num editable-cell"><input type="number" data-field="hargaModal" value="${Math.round(r.hargaModal)}"></td>
       <td class="num" data-cell="totalPembayaran" style="font-family:var(--mono);">${fmtMoney(Math.round(r.totalPembayaran))}</td>
       <td class="num editable-cell"><input type="number" data-platform="fakturPajak" value="${r.fakturPajak||0}"></td>
@@ -7823,6 +8854,7 @@ function renderTab3Table() {
   if (dlBtnDaily) dlBtnDaily.textContent = '⬇️ Download Excel (Tanggal Ini)';
   const entitas = tab3Entity;
   let pivot = computeStokTerjualPivot(entitas, tab3Date);
+  try { _t3RawSet = gsjRawNameSet(); } catch (e) { _t3RawSet = null; }
   const searchEl = document.getElementById('t3-search');
   const q = searchEl ? normalizeName(searchEl.value) : '';
   if (q) pivot = pivot.filter(r => normalizeName(r.nama).includes(q));
@@ -7890,6 +8922,7 @@ function renderTab3Table() {
         : `Menampilkan semua ${fmtNum(pivot.length)} produk`}
     </div>
     <p style="font-size:11px;color:var(--muted);margin-top:8px;" class="t3-fs-hide">
+      💡 Klik <b>nama produk</b> atau angka <b>Total</b> untuk cek transaksinya & ubah Entitas / Nama Internal / Pengali langsung dari sini.
       Edit kolom platform untuk ubah jumlah terjual hari itu (menggabungkan transaksi jika lebih dari satu jadi satu baris ringkasan). Kolom "Harga Modal" di sini menimpa rata-rata otomatis dari Faktur Masuk kalau diisi manual.
     </p>
   `;
@@ -7952,38 +8985,12 @@ function bindTab3RowEvents(wrap, entitas) {
 function bindTab3RowEventsForRows(rowElements, entitas) {
   rowElements.forEach(tr => {
     const nama = tr.dataset.nama;
+    tr.querySelectorAll('[data-action="quickedit"]').forEach(el => el.addEventListener('click', () => openQuickEditStokTerjual(entitas, tab3Date, nama)));
 
     const whyBtn = tr.querySelector('[data-action="whynotmerged"]');
-    if (whyBtn) whyBtn.addEventListener('click', () => {
-      const best = fuzzyMatchCatalogDebug(nama);
-      const bodyHTML = best
-        ? `<p>Kandidat paling mirip yang ditemukan sistem untuk:</p>
-           <p style="background:#f6f8fb;padding:8px 10px;border-radius:6px;font-family:var(--mono);font-size:12.5px;">${escapeAttr(nama)}</p>
-           <p>adalah:</p>
-           <p style="background:#f6f8fb;padding:8px 10px;border-radius:6px;font-family:var(--mono);font-size:12.5px;">${escapeAttr(best.nama)}</p>
-           <p>Skor kemiripan: <b>${Math.round(best.score*100)}%</b> (batas otomatis: 82%)</p>
-           <p style="color:var(--muted);font-size:12px;">${best.score >= 0.82
-              ? 'Skornya sudah cukup tinggi. Kalau masih terpisah, ini biasanya karena riwayat Stok Awal/transaksinya sudah kadung tersimpan terpisah dari sebelumnya — klik tombol di bawah untuk gabungkan riwayatnya sekalian, bukan cuma nama ke depannya.'
-              : 'Skornya masih di bawah batas, jadi sistem sengaja TIDAK menggabungkan otomatis (menghindari salah gabung produk berbeda). Kalau Anda YAKIN ini produk yang sama, tetap bisa gabungkan manual lewat tombol di bawah.'}</p>
-           <div style="display:flex; justify-content:flex-end; margin-top:10px;">
-             <button class="btn secondary small" id="t3-do-merge" style="background:var(--accent-dark);color:#fff;">🔗 Gabungkan Sekarang ke "${escapeAttr(best.nama.length>30?best.nama.slice(0,30)+'…':best.nama)}"</button>
-           </div>`
-        : `<p>Sistem tidak menemukan kandidat produk yang mirip sama sekali di katalog untuk nama ini. Kemungkinan produk ini benar-benar baru, atau namanya terlalu berbeda dari yang sudah ada di katalog.</p>`;
-      showConfirmModal('Kenapa Belum Tergabung?', bodyHTML);
-      const mergeBtn = document.getElementById('t3-do-merge');
-      if (mergeBtn && best) {
-        mergeBtn.addEventListener('click', () => {
-          if (!confirm(`Gabungkan SEMUA riwayat (Stok Awal, transaksi, Master Produk) dari:\n\n"${nama}"\n\nke:\n\n"${best.nama}"\n\nTindakan ini menyatukan data lama yang sudah kadung terpisah — bisa di-undo (Ctrl+Z) kalau ternyata salah.`)) return;
-          const counts = mergeProductNames(nama, best.nama);
-          recomputeAllCheckerRows();
-          saveState();
-          document.getElementById('confirmModal').classList.remove('show');
-          renderTab3Table();
-          if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
-          alert(`Berhasil digabungkan!\n\nStok Awal/Penambahan: ${counts.adjustments}\nBaris transaksi: ${counts.checkerRows}\nItem Faktur Masuk: ${counts.invoiceItems}\nMaster Produk: ${counts.masterProduk}`);
-        });
-      }
-    });
+    if (whyBtn) whyBtn.addEventListener('click', () => openRawMergeModal(entitas, nama));
+    const qmBtn = tr.querySelector('[data-action="quickmerge"]');
+    if (qmBtn) qmBtn.addEventListener('click', () => openRawMergeModal(entitas, nama, qmBtn.dataset.to));
 
     tr.querySelectorAll('[data-platform]').forEach(input => {
       input.addEventListener('focus', () => { input.dataset.oldValue = input.value; });
@@ -8955,7 +9962,7 @@ const DUPE_SCAN_MIN_SCORE = 0.65; // dinaikkan dari 0.5 — di angka 50% ternyat
 // once, directly as a number — instead of needing to write out a full catatan sentence like
 // "kalau variasi ini maka dipotong 20" for every single row. Also auto-writes a matching
 // human-readable catatan so the reasoning stays visible/editable in the normal table too.
-function openBulkMultiplierTool() {
+function openBulkMultiplierTool(prefill) {
   const bodyHTML = `
     <p style="margin-top:0;">Cari nama produk, lalu isi angka pengali langsung di kolom "Pengali" (misal isi <b>20</b> kalau 1 unit yang terjual = 20 pcs di Stok Terjual). Kosongkan / isi 1 kalau tidak ada pengali (potong apa adanya).</p>
     <input type="text" id="t4bm-search" placeholder="🔎 Cari nama produk atau variasi..." style="width:100%;padding:8px 10px;border:1px solid #c9c5b8;border-radius:6px;font-size:13px;margin-bottom:10px;">
@@ -8982,7 +9989,9 @@ function openBulkMultiplierTool() {
     let rows = [...state.masterProduk].sort((a,b) => (a.namaMarketplace||'').localeCompare(b.namaMarketplace||''));
     if (q) rows = rows.filter(m => normalizeName(m.namaMarketplace).includes(q) || normalizeName(m.namaInternal).includes(q) || normalizeName(m.variasiMarketplace||'').includes(q));
     const totalMatch = rows.length;
-    const CAP = 1000; // dinaikkan dari 200 — 200 ternyata suka kepotong padahal orangnya belum selesai scroll/cari
+    // Tanpa kata kunci cukup tampilkan 100 dulu (gambar 1000 baris sekaligus bikin lambat waktu dibuka);
+    // begitu mengetik, sampai 1000 hasil.
+    const CAP = q ? 1000 : 100;
     rows = rows.slice(0, CAP);
     const msgEl = document.getElementById('t4bm-msg');
     if (msgEl) msgEl.textContent = totalMatch > CAP ? `Menampilkan ${CAP} dari ${totalMatch} hasil — ketik nama produk untuk mempersempit pencarian.` : '';
@@ -9008,8 +10017,12 @@ function openBulkMultiplierTool() {
     });
   }
 
-  document.getElementById('t4bm-search').addEventListener('input', renderRows);
+  const _bmSearch = document.getElementById('t4bm-search');
+  if (prefill) _bmSearch.value = prefill;
+  let _bmT = null;
+  _bmSearch.addEventListener('input', () => { clearTimeout(_bmT); _bmT = setTimeout(renderRows, 250); });
   renderRows();
+  setTimeout(() => { _bmSearch.focus(); _bmSearch.select(); }, 30);
 
   document.getElementById('t4bm-save').addEventListener('click', () => {
     const ids = Object.keys(pendingChanges);
@@ -9028,10 +10041,12 @@ function openBulkMultiplierTool() {
       }
       updated++;
     });
+    invalidateMasterProdukIndex();
     recomputeAllCheckerRows();
     saveState();
     document.getElementById('confirmModal').classList.remove('show');
-    renderTab4MasterTable();
+    try { renderTab4MasterTable(); } catch (e) {}
+    try { if (document.getElementById('t3-table-wrap')) renderTab3TableKeepScroll(); } catch (e) {}
     if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
     alert(`${updated} produk berhasil diperbarui pengalinya. Stok Terjual sudah dihitung ulang otomatis.`);
   });
@@ -10066,6 +11081,43 @@ function t8PaymentLine(sellerKey) {
 }
 // </T8-PURE>
 
+// ---------- Barang yang TIDAK ditagihkan ke Glomed ----------
+// Bubble wrap = bahan packing (bukan barang dagangan ke Glomed). Biohazard 80X60 tidak pernah ada di
+// invoice H&H manual (dari Maret–September), jadi ikut dikecualikan dari invoice H&H. Daftar ini
+// disimpan di settings (tersinkron) dan bisa diubah dari tab Invoice ke Glomed. Produk yang
+// disembunyikan di Stok Terjual entitas itu juga otomatis tidak ditagihkan.
+const T8_DEFAULT_EXCLUDE = {
+  HNH: ['Bubble wrap', 'Biohazard (Plastik Sampah Medis) 80X60 (Pcs)'],
+  GSM: ['Bubble wrap'],
+};
+function t8ExcludeList(sellerKey) {
+  state.settings = state.settings || {};
+  if (!state.settings.t8Exclude) state.settings.t8Exclude = JSON.parse(JSON.stringify(T8_DEFAULT_EXCLUDE));
+  if (!Array.isArray(state.settings.t8Exclude[sellerKey])) state.settings.t8Exclude[sellerKey] = (T8_DEFAULT_EXCLUDE[sellerKey] || []).slice();
+  return state.settings.t8Exclude[sellerKey];
+}
+function t8ExcludedSet(sellerKey) {
+  const s = T8_SELLERS[sellerKey];
+  const set = new Set(t8ExcludeList(sellerKey).map(n => normalizeName(n)));
+  (state.hiddenProducts || []).forEach(h => { if (h.entitas === s.entitas) set.add(normalizeName(h.nama)); });
+  return set;
+}
+function t8SetExcluded(sellerKey, nama, on) {
+  const list = t8ExcludeList(sellerKey);
+  const k = normalizeName(nama);
+  const i = list.findIndex(n => normalizeName(n) === k);
+  if (on && i < 0) list.push(nama);
+  if (!on && i >= 0) list.splice(i, 1);
+  if (!on) { // kalau ternyata dikecualikan karena disembunyikan di Stok Terjual, beri tahu
+    const s = T8_SELLERS[sellerKey];
+    if ((state.hiddenProducts || []).some(h => h.entitas === s.entitas && normalizeName(h.nama) === k)) {
+      alert(`"${nama}" disembunyikan di Stok Terjual ${s.label}, jadi tetap tidak ditagihkan. Munculkan dulu produknya di Stok Terjual kalau mau ditagihkan.`);
+    }
+  }
+  gsjDetailedAudit(`${on ? 'mengecualikan' : 'memasukkan lagi'} <b>${escapeAttr(nama)}</b> ${on ? 'dari' : 'ke'} invoice ${escapeAttr(T8_SELLERS[sellerKey].label)} ke Glomed`);
+  saveState();
+}
+
 // ---------- Rekap dari Stok Terjual (checkerRows) ----------
 function t8Recap(sellerKey, year, month, half) {
   const s = T8_SELLERS[sellerKey];
@@ -10075,9 +11127,20 @@ function t8Recap(sellerKey, year, month, half) {
   const catMap = {};
   getProductCatalogForEntity(s.entitas).forEach(n => { catMap[normalizeName(n)] = n; });
   const agg = {};
+  const excl = t8ExcludedSet(sellerKey);
+  const excluded = {};
   state.checkerRows.forEach(row => {
     if (row.entitas !== s.entitas || !row.tanggal || row.tanggal < isoFrom || row.tanggal > isoTo) return;
     if (!row.nama || !String(row.nama).trim()) return;
+    if (excl.has(normalizeName(row.nama))) {
+      const bucketX = classifyRowForPivot(row);
+      if (T8_MP_BUCKETS.indexOf(bucketX) !== -1) {
+        const kx = normalizeName(row.nama);
+        const ex = excluded[kx] || (excluded[kx] = { nama: catMap[kx] || row.nama, qty: 0 });
+        ex.qty += Number(row.qtyInternal != null ? row.qtyInternal : row.qty) || 0;
+      }
+      return;
+    }
     const bucket = classifyRowForPivot(row);
     const q = Number(row.qtyInternal != null ? row.qtyInternal : row.qty) || 0;
     const key = normalizeName(row.nama);
@@ -10091,6 +11154,7 @@ function t8Recap(sellerKey, year, month, half) {
     satuan: getProductSatuan(s.entitas, a.nama),
   }));
   const calc = t8Calc(sellerKey, rows);
+  calc.excluded = Object.values(excluded).sort((a, b) => t8SortKey(a.nama).localeCompare(t8SortKey(b.nama)));
   return Object.assign({ sellerKey, tahun: year, bulan: month, half, dari: isoFrom, sampai: isoTo }, calc);
 }
 
@@ -10615,6 +11679,17 @@ function t8RenderPreview() {
       ${t8WarningsHTML(rc)}
       ${empty ? `<div class="t8-empty">Tidak ada penjualan marketplace ${t8Esc(s.label)} di periode ini.</div>` : `<div class="t8-paper-wrap">${t8InvoiceHTML(draft)}</div>`}
       ${skipped}
+      ${saved ? '' : `<details style="margin-top:8px;font-size:12px;color:var(--muted);" ${(rc.excluded || []).length ? 'open' : ''}>
+        <summary>🚫 ${(rc.excluded || []).length} barang tidak ditagihkan (bahan packing / dikecualikan)${(rc.excluded || []).length ? ': ' + rc.excluded.map(x => `${t8Esc(x.nama)} ${t8Num(x.qty)}`).join(', ') : ''}</summary>
+        <div style="margin-top:6px;display:flex;flex-direction:column;gap:4px;">
+          ${t8ExcludeList(k).map(n => `<div>• ${t8Esc(n)} <a href="#" data-t8-incl="${t8Esc(n)}" style="color:var(--accent);">↩ tagihkan lagi</a></div>`).join('') || '<div>Belum ada.</div>'}
+          <div style="display:flex;gap:6px;align-items:center;margin-top:4px;">
+            <input type="text" list="t8-items-${k}" data-t8-exname placeholder="Nama barang yang tidak ditagihkan..." style="flex:1;max-width:360px;padding:4px 7px;border:1px solid #c9c5b8;border-radius:5px;font-size:12px;">
+            <datalist id="t8-items-${k}">${rc.items.map(i => `<option value="${t8Esc(i.nama)}">`).join('')}</datalist>
+            <button class="btn secondary small" data-t8-exadd>🚫 Jangan tagihkan</button>
+          </div>
+        </div>
+      </details>`}
     </div>`;
   }).join('');
   el.innerHTML = t8DiagHTML() + cards + `
@@ -10646,6 +11721,20 @@ function t8RenderPreview() {
       else if (act === 'print') t8DoPrint([k]);
     });
   });
+  el.querySelectorAll('.t8-card [data-t8-incl]').forEach(a => a.addEventListener('click', e => {
+    e.preventDefault();
+    const k = a.closest('.t8-card').dataset.key;
+    t8SetExcluded(k, a.dataset.t8Incl, false);
+    t8Compute();
+  }));
+  el.querySelectorAll('.t8-card [data-t8-exadd]').forEach(b => b.addEventListener('click', () => {
+    const card = b.closest('.t8-card'); const k = card.dataset.key;
+    const v = (card.querySelector('[data-t8-exname]').value || '').trim();
+    if (!v) return;
+    if (!confirm(`"${v}" tidak ditagihkan ke Glomed di invoice ${T8_SELLERS[k].label} (semua periode)?`)) return;
+    t8SetExcluded(k, v, true);
+    t8Compute();
+  }));
   el.querySelectorAll(':scope > .card [data-act="save-all"]').forEach(b => b.addEventListener('click', () => t8SaveKeys(T8_SELLER_KEYS)));
   el.querySelectorAll(':scope > .card [data-act="xls-all"]').forEach(b => b.addEventListener('click', () => t8DoExport(T8_SELLER_KEYS)));
   el.querySelectorAll(':scope > .card [data-act="print-all"]').forEach(b => b.addEventListener('click', () => t8DoPrint(T8_SELLER_KEYS)));
@@ -13495,6 +14584,9 @@ function gsjBootMainApp() {
           if (!state.settings.rulesV3) { recomputeAllCheckerRows(); state.settings.rulesV3 = true; saveState(); if (typeof gsjScheduleRemoteRerender === 'function') gsjScheduleRemoteRerender(); }
         } catch (e) { console.warn(e); }
         try { gsjRestoreGsmRekapSep2026(); } catch (e) { console.warn(e); }
+        try { gsjFixHnhSesuaiCheckerSep2026(); } catch (e) { console.warn(e); }
+        try { gsjFixSplitCheckerSep2026(); } catch (e) { console.warn(e); }
+        setTimeout(() => { try { gsjAutoMapRawNamesOnBoot(); } catch (e) { console.warn(e); } }, 800);
       }, 1500);
       iuRemoteInit();
     }
