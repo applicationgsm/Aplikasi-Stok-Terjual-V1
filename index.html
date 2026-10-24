@@ -6781,7 +6781,15 @@ function bindTab2RowActions(tbody) {
       row.entitasManual = true; // confirming a flagged row is also a deliberate choice — protect it from recompute
       offerToSaveMasterProdukMapping(row);
       // Konfirmasi sekali = set produk ini ke entitas baris ini untuk semua penjualannya.
-      if (ENTITIES.includes(row.entitas)) { setProductEntitasFromRow(row, row.entitas); recomputeAllCheckerRows(); }
+      if (ENTITIES.includes(row.entitas)) {
+        setProductEntitasFromRow(row, row.entitas);
+        // setProductEntitasFromRow melepas kunci semua baris produk ini, TERMASUK baris yang baru diklik.
+        // Untuk produk yang catatan Master Produk-nya "konfirmasi lagi tiap ada yang beli", hitung ulang
+        // langsung mengembalikan baris ini ke "Perlu Konfirmasi" -> tombol terlihat tidak berfungsi.
+        // Baris yang di-"Tandai OK" = keputusan manual: kunci lagi di entitas ini.
+        row.status = 'OK'; row.entitasManual = true; row.autoEnt = undefined;
+        recomputeAllCheckerRows();
+      }
       gsjDetailedAudit(`menandai OK baris <b>${escapeAttr(row.nama || row.namaAsli || '')}</b> di Import Marketplace (produk di-set ke ${escapeAttr(ENTITY_LABEL[row.entitas] || row.entitas)})`);
       saveState();
       renderTab2TableKeepScroll();
@@ -8372,6 +8380,70 @@ function gsjExpandPaketRows() {
     p.hargaJual = total - share * kids.length;
     p.paketN = kids.length;
   });
+}
+
+
+// ---------- Perbaikan sekali jalan #2: HNH 1–15 Sep 2026 (penjualan HIJAU di checker yang masuk HNH) ----------
+// Dari backup 24 Okt: 38 penjualan (99 pcs) yang di Cheeker Inv GSM 1–15 Sep berwarna HIJAU (GSJ) tapi
+// di aplikasi masuk HNH — sebagian pindah otomatis karena stok GSJ habis (+ tambah stok HNH), sebagian
+// diklik manual ke HNH. Dikembalikan ke GSJ & dikunci, supaya Stok Terjual HNH 1–15 = rekap manual.
+const GSJ_FIX2_HNH_SEP2026 = {"idmuusqdegmu2qrh":"Glomed","idmuusqdgf2xvx4f":"Glomed","idmuusqdgfa4iyg9":"Glomed","idmuusqdh8ehn1uk":"Glomed","idmuusqdiceqpu1h":"Glomed","idmuusqdicpig1p0":"Glomed","idmuusqdefw4z7hj~HNH":"Glomed","idmuusqd9loii478":"Glomed","idmuusqda14eiu7x":"Glomed","idmuustnjku29y3t":"Glomed","idmuxr3uxdfq7y8z":"Glomed","idmuusqbjsahgr6q":"Glomed","idmuusqbjsdhmldy":"Glomed","idmuusqbjrfw9kve":"Glomed","idmuusqbjriyxvie":"Glomed","idmuusqbjsrgut4i":"Glomed","idmuustrihkh8h1n":"Glomed","idmuuv8yhnswhuzy":"Glomed","idmuxr0281bujqr9":"Glomed","idmuxr02pkzil64i":"Glomed","idmuustox53o7p3g":"Glomed","idmuustpomhtjb5g":"Glomed","idmuusqcvmf9llcf":"Glomed","idmuuv8xn17m2zgx":"Glomed","idmuusqckt2hypfa":"Glomed","idmuustn26rtw22q":"Glomed","idmuustnbd5mxj0s":"Glomed","idmuuv8yj1q8xqek":"Glomed","idmuusqdi03344i1":"Glomed","idmuuv8yd0vyqmd7":"Glomed","idmuusqbli3v3yzi":"Glomed","idmuusqbk7et1fb9":"Glomed","idmuusqbljbl2ilg":"Glomed","idmuusqbmsp7p9sx":"Glomed","idmuusqbzjtmnyai":"Glomed","idmuusqbzl967vzw":"Glomed","idmuusqdefcuw9l2":"Glomed","idmuusqdf8yv62bb":"Glomed"};
+function gsjFix2HnhSep2026() {
+  const KEY = 'fix2HnhCheckerSep2026';
+  if (!state.settings || state.settings[KEY]) return;
+  const byId = new Map(state.checkerRows.map(r => [r.id, r]));
+  const rows = Object.keys(GSJ_FIX2_HNH_SEP2026).map(id => byId.get(id)).filter(r => r && r.entitas === 'HNH');
+  state.settings[KEY] = 'done';
+  if (!rows.length) { saveState(); return; }
+  const before = gsjHnhQtyRange('2026-09-01', '2026-09-15');
+  const prevCtx = qeCtx;
+  qeCtx = { entitas: 'HNH', tanggal: '1–15 Sep 2026', nama: '', ids: new Set(), q: '' };
+  qeSetEntitas(rows, 'Glomed'); // kunci manual + gabung pecahan pesanan; sudah hitung ulang & simpan
+  qeCtx = prevCtx;
+  const after = gsjHnhQtyRange('2026-09-01', '2026-09-15');
+  setTimeout(() => alert(`✅ HNH 1–15 Sep 2026 dirapikan lagi sesuai checker.\n\n• ${rows.length} penjualan (hijau di checker) dikembalikan dari HNH ke GSJ\n• Total terjual HNH (qty pesanan): ${fmtNum(before)} → ${fmtNum(after)}`), 400);
+}
+
+
+// ---------- Perbaikan sekali jalan #3: pemetaan variasi yang beda dengan Stok Terjual HNH manual ----------
+// Listing marketplace yang masuk ke nama produk lain dari yang dipakai di rekap manual (harga modalnya
+// jadi 0 / beda): KN95 Sensi "Putih" -> Masker KN95 Sensi Putih, Duckbill One Care Putih -> Masker One
+// Care Isi 50 Pcs Putih, Gunting Stainless "Bengkok,SS SILVER" -> Gunting Operasi Bengkok Silver.
+// Berlaku di Master Produk (semua penjualan listing itu, semua tanggal).
+const GSJ_FIX3_LISTINGS = [["Masker KN95 Sensi / Masker Sensi KN 95 / Masker Earloop Sensi KN95","Putih","Masker KN95 Sensi Putih"],["Masker Duckbill One Care / Masker Duckbill / Duckbill One Care /Masker","Duckbil OneCare, Putih","Masker One Care Isi 50 Pcs Putih"],["Gunting Stainless / Gunting Lurus / Gunting Bengkok / Gunting Dental / Gunting Jahit /Gunting Gusi / Gum Scissor","Bengkok,SS SILVER","Gunting Operasi Bengkok Silver"]];
+function gsjFix3ListingSep2026() {
+  const KEY = 'fix3ListingSep2026';
+  if (!state.settings || state.settings[KEY]) return;
+  state.settings[KEY] = 'done';
+  GSJ_FIX3_LISTINGS.forEach(([n, v, t]) => gsjApplyListingName(n, v, t, 'Disamakan dengan Stok Terjual HNH manual'));
+  recomputeAllCheckerRows();
+  gsjDetailedAudit(`menyamakan pemetaan ${GSJ_FIX3_LISTINGS.length} listing dengan Stok Terjual HNH manual: ${GSJ_FIX3_LISTINGS.map(x => escapeAttr(x[2])).join(', ')}`);
+  saveState();
+  if (typeof gsjScheduleRemoteRerender === 'function') gsjScheduleRemoteRerender();
+}
+
+
+// ---------- Perbaikan sekali jalan #4: sisa selisih HNH 1–15 Sep 2026 vs Stok Terjual HNH manual ----------
+// • Pesanan 2609069N5WTF60 (6 Sep, Gunting Bengkok + Lurus SS Silver) dihitung HNH di rekap manual -> HNH.
+// • Baris "Masker Sensi Duckbill Anak Polos" di pesanan 260907CJ689KCX: di checker pesanan itu isinya Tas
+//   P3K (hijau/GSJ), tidak ada masker duckbill -> keluar dari HNH (ke GSJ).
+// • Tokopedia variasi "Anak PutihPolos" -> Masker Sensi Duckbill Anak Polos (nama yang dipakai di manual).
+const GSJ_FIX4_HNH_SEP2026 = {"keHnh":["idmuusqbcjw8qkyb","idmuusqbcjzji3d7"],"keGsj":["idmuusqbzm88swqk"],"listing":["Masker Sensi Duckbill / Masker Sensi / Masker Duckbill Sensi","Anak PutihPolos","Masker Sensi Duckbill Anak Polos"]};
+function gsjFix4HnhSep2026() {
+  const KEY = 'fix4HnhCheckerSep2026';
+  if (!state.settings || state.settings[KEY]) return;
+  state.settings[KEY] = 'done';
+  const D = GSJ_FIX4_HNH_SEP2026;
+  const byId = new Map(state.checkerRows.map(r => [r.id, r]));
+  const prevCtx = qeCtx;
+  qeCtx = { entitas: 'HNH', tanggal: '1–15 Sep 2026', nama: '', ids: new Set(), q: '' };
+  const toH = D.keHnh.map(id => byId.get(id)).filter(r => r && r.entitas !== 'HNH');
+  const toG = D.keGsj.map(id => byId.get(id)).filter(r => r && r.entitas === 'HNH');
+  gsjApplyListingName(D.listing[0], D.listing[1], D.listing[2], 'Disamakan dengan Stok Terjual HNH manual');
+  if (toH.length) qeSetEntitas(toH, 'HNH');
+  if (toG.length) qeSetEntitas(toG, 'Glomed');
+  if (!toH.length && !toG.length) { recomputeAllCheckerRows(); saveState(); }
+  qeCtx = prevCtx;
 }
 
 // ---------- Cek & Ubah Cepat dari Stok Terjual ----------
@@ -14214,7 +14286,7 @@ const GSJ_AUDIT_KEY = 'stokapp_gsm_audit_v1';    // localStorage: array of {id, 
 const GSJ_SESSION_ID = 'sess_' + Math.random().toString(36).slice(2) + Date.now();
 const GSJ_ONLINE_HEARTBEAT_MS = 4000;
 const GSJ_ONLINE_TIMEOUT_MS = 12000;
-const GSJ_MAX_AUDIT = 400;
+const GSJ_MAX_AUDIT = 1500;
 
 let gsjCurrentUser = null; // { name, role }
 const GSJ_PLATFORM_LABEL = {
@@ -14288,7 +14360,100 @@ function logAuditEntry() {
   if (gsjAudit.length > GSJ_MAX_AUDIT) gsjAudit = gsjAudit.slice(0, GSJ_MAX_AUDIT);
   gsjPersistAudit();
   gsjRenderAudit();
+  gsjAuditPushNew(gsjAudit[0]);
 }
+
+// ---- Riwayat Edit tersinkron ke SEMUA device ----
+// Dulu riwayat cuma disimpan di localStorage (per browser), jadi tiap laptop punya riwayatnya
+// sendiri-sendiri. Sekarang tiap entri juga disimpan di Supabase (tabel gsj_settings, 1 baris per
+// entri: id 'audit_<id>'), dikirim langsung ke device lain lewat broadcast realtime, dan dicocokkan
+// ulang tiap 60 detik / saat panel Riwayat dibuka. Hapus riwayat juga berlaku di semua device.
+const GSJ_AUDIT_PREFIX = 'audit_';
+let gsjAuditChannel = null;
+let gsjAuditOff = false;
+let gsjAuditLastTs = 0;
+let gsjAuditPollTimer = null;
+function gsjAuditRow(a) {
+  return { id: GSJ_AUDIT_PREFIX + a.id, data: { id: a.id, text: a.text, ts: a.ts }, updated_at: new Date(a.ts || Date.now()).toISOString(), updated_by: GSJ_SESSION_ID };
+}
+function gsjAuditMergeIn(list) {
+  if (!Array.isArray(list) || !list.length) return;
+  const by = new Map(gsjAudit.map(a => [a.id, a]));
+  let changed = false;
+  list.forEach(a => {
+    if (!a || !a.id || !a.text) return;
+    const cur = by.get(a.id);
+    if (!cur) { by.set(a.id, { id: a.id, text: a.text, ts: Number(a.ts) || 0, synced: true }); changed = true; }
+    else if (!cur.synced) { cur.synced = true; changed = true; }
+    if ((Number(a.ts) || 0) > gsjAuditLastTs) gsjAuditLastTs = Number(a.ts) || 0;
+  });
+  if (!changed) return;
+  gsjAudit = [...by.values()].sort((x, y) => (y.ts || 0) - (x.ts || 0)).slice(0, GSJ_MAX_AUDIT);
+  gsjPersistAudit();
+  gsjRenderAudit();
+}
+function gsjAuditRemoveLocal(ids) {
+  const set = new Set(ids);
+  const before = gsjAudit.length;
+  gsjAudit = gsjAudit.filter(a => !set.has(a.id));
+  if (gsjAudit.length !== before) { gsjPersistAudit(); gsjRenderAudit(); }
+}
+async function gsjAuditUpsert(entries) {
+  if (!gsjSupabase || gsjAuditOff || !entries.length) return false;
+  for (let i = 0; i < entries.length; i += 200) {
+    const r = await gsjSupabase.from('gsj_settings').upsert(entries.slice(i, i + 200).map(gsjAuditRow));
+    if (r.error) { console.warn('Riwayat gagal disinkron:', r.error); return false; }
+  }
+  entries.forEach(a => { a.synced = true; });
+  gsjPersistAudit();
+  return true;
+}
+function gsjAuditBroadcast(event, payload) {
+  try { if (gsjAuditChannel) gsjAuditChannel.send({ type: 'broadcast', event, payload }); } catch (e) {}
+}
+async function gsjAuditPushNew(a) {
+  if (!a) return;
+  if (a.ts > gsjAuditLastTs) gsjAuditLastTs = a.ts;
+  gsjAuditBroadcast('add', { list: [{ id: a.id, text: a.text, ts: a.ts }] });
+  await gsjAuditUpsert([a]);
+}
+// Ambil riwayat dari server. full=true: cocokkan juga yang sudah dihapus di device lain.
+async function gsjAuditPull(full) {
+  if (!gsjSupabase || gsjAuditOff) return;
+  try {
+    let q = gsjSupabase.from('gsj_settings').select('id,data,updated_at').like('id', GSJ_AUDIT_PREFIX + '%');
+    if (!full && gsjAuditLastTs) q = q.gt('updated_at', new Date(gsjAuditLastTs).toISOString());
+    const r = await q.order('updated_at', { ascending: false }).limit(GSJ_MAX_AUDIT);
+    if (r.error) { console.warn('Riwayat gagal diambil:', r.error); return; }
+    const remote = (r.data || []).map(x => x.data).filter(Boolean);
+    if (full) {
+      // entri yang dulu sudah tersinkron tapi sekarang tidak ada di server = dihapus di device lain
+      const ids = new Set(remote.map(a => a.id));
+      const oldest = remote.length >= GSJ_MAX_AUDIT ? Math.min(...remote.map(a => Number(a.ts) || 0)) : 0;
+      const gone = gsjAudit.filter(a => a.synced && !ids.has(a.id) && (a.ts || 0) >= oldest).map(a => a.id);
+      if (gone.length) gsjAuditRemoveLocal(gone);
+    }
+    gsjAuditMergeIn(remote);
+    // riwayat lama di device ini yang belum pernah naik ke server -> naikkan (sekali saja)
+    const pending = gsjAudit.filter(a => !a.synced);
+    if (pending.length) await gsjAuditUpsert(pending);
+  } catch (e) { console.warn('Riwayat sinkron error:', e); }
+}
+function gsjAuditSyncStart() {
+  if (!gsjSupabase || gsjAuditChannel) return;
+  try {
+    gsjAuditChannel = gsjSupabase.channel('gsj_audit_bc', { config: { broadcast: { self: false } } })
+      .on('broadcast', { event: 'add' }, ({ payload }) => gsjAuditMergeIn(payload && payload.list))
+      .on('broadcast', { event: 'del' }, ({ payload }) => gsjAuditRemoveLocal((payload && payload.ids) || []))
+      .on('broadcast', { event: 'clear' }, () => { gsjAudit = []; gsjPersistAudit(); gsjRenderAudit(); })
+      .subscribe();
+  } catch (e) { console.warn(e); }
+  gsjAuditPull(true);
+  clearInterval(gsjAuditPollTimer);
+  gsjAuditPollTimer = setInterval(() => { if (!document.hidden) gsjAuditPull(false); }, 60000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) gsjAuditPull(false); });
+}
+
 // Diisi sesaat SEBELUM memanggil saveState() di titik-titik edit yang sudah tahu persis
 // produk & field apa yang berubah (lihat gsjDetailedAudit di bawah), lalu dikonsumsi dan
 // dikosongkan lagi oleh logAuditEntry() di atas.
@@ -14390,17 +14555,28 @@ async function gsjDeleteAudit(id) {
   gsjAudit = gsjAudit.filter(a => a.id !== id);
   gsjPersistAudit();
   gsjRenderAudit();
-  gsjShowToast('Riwayat dihapus');
+  gsjAuditBroadcast('del', { ids: [id] });
+  if (gsjSupabase && !gsjAuditOff) {
+    const r = await gsjSupabase.from('gsj_settings').delete().eq('id', GSJ_AUDIT_PREFIX + id);
+    if (r.error) console.warn('Hapus riwayat di server gagal:', r.error);
+  }
+  gsjShowToast('Riwayat dihapus (semua device)');
 }
 async function gsjClearAudit() {
   if (!gsjAudit.length) { gsjShowToast('Riwayat sudah kosong'); return; }
-  if (!(await gsjAskOwner('Hapus SEMUA riwayat (' + gsjAudit.length + ' entri)?'))) return;
+  if (!(await gsjAskOwner('Hapus SEMUA riwayat (' + gsjAudit.length + ' entri) di SEMUA device?'))) return;
   gsjAudit = [];
   gsjPersistAudit();
   gsjRenderAudit();
-  gsjShowToast('Semua riwayat dihapus');
+  gsjAuditBroadcast('clear', {});
+  if (gsjSupabase && !gsjAuditOff) {
+    const r = await gsjSupabase.from('gsj_settings').delete().like('id', GSJ_AUDIT_PREFIX + '%');
+    if (r.error) console.warn('Hapus semua riwayat di server gagal:', r.error);
+  }
+  gsjShowToast('Semua riwayat dihapus (semua device)');
 }
 function gsjOpenAudit() {
+  gsjAuditPull(true);
   document.getElementById('auditOverlay').classList.add('show');
   document.getElementById('auditDrawer').classList.add('show');
 }
@@ -14537,6 +14713,7 @@ function gsjEnterApp() {
 
   gsjLoadAudit();
   gsjRenderAudit();
+  gsjAuditSyncStart();
   gsjSetupPresence();
 
   gsjBootMainApp();
@@ -14585,6 +14762,9 @@ function gsjBootMainApp() {
         } catch (e) { console.warn(e); }
         try { gsjRestoreGsmRekapSep2026(); } catch (e) { console.warn(e); }
         try { gsjFixHnhSesuaiCheckerSep2026(); } catch (e) { console.warn(e); }
+        try { gsjFix2HnhSep2026(); } catch (e) { console.warn(e); }
+        try { gsjFix3ListingSep2026(); } catch (e) { console.warn(e); }
+        try { gsjFix4HnhSep2026(); } catch (e) { console.warn(e); }
         try { gsjFixSplitCheckerSep2026(); } catch (e) { console.warn(e); }
         setTimeout(() => { try { gsjAutoMapRawNamesOnBoot(); } catch (e) { console.warn(e); } }, 800);
       }, 1500);
