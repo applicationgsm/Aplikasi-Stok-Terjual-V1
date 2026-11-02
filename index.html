@@ -3463,6 +3463,45 @@ function importHargaModalWorkbook(workbook) {
   return { rows: Object.values(result) };
 }
 
+// Import Satuan dari file Stok Terjual (kolom "Nama Produk" + "Satuan"). Semua sheet dibaca;
+// kalau 1 produk muncul di beberapa sheet, yang terakhir dipakai. Baris tanpa satuan dilewati.
+function importSatuanWorkbook(workbook) {
+  const NAMA_ALIASES = ['nama produk', 'nama barang'];
+  const SATUAN_ALIASES = ['satuan', 'unit'];
+  function findCol(header, aliases) {
+    for (let i = 0; i < header.length; i++) {
+      if (aliases.includes(normalizeName(header[i]))) return i;
+    }
+    return -1;
+  }
+  const result = {};
+  let matchedAnySheet = false;
+  for (const sheetName of workbook.SheetNames) {
+    const ws = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+    if (!rows.length) continue;
+    // header boleh tidak di baris 1 (mis. ada banner judul) — cari di 5 baris pertama
+    let hIdx = -1, colNama = -1, colSat = -1;
+    for (let h = 0; h < Math.min(5, rows.length); h++) {
+      const header = (rows[h] || []).map(x => (x == null ? '' : String(x)).trim());
+      const cn = findCol(header, NAMA_ALIASES), cs = findCol(header, SATUAN_ALIASES);
+      if (cn !== -1 && cs !== -1) { hIdx = h; colNama = cn; colSat = cs; break; }
+    }
+    if (hIdx === -1) continue;
+    matchedAnySheet = true;
+    for (let r = hIdx + 1; r < rows.length; r++) {
+      const row = rows[r];
+      if (!row) continue;
+      const nama = row[colNama];
+      const sat = row[colSat] == null ? '' : String(row[colSat]).trim().replace(/\s+/g, ' ');
+      if (!nama || !String(nama).trim() || !sat) continue;
+      result[normalizeName(nama)] = { nama: String(nama).trim().replace(/\s+/g, ' '), satuan: sat };
+    }
+  }
+  if (!matchedAnySheet) return { error: 'Tidak ada sheet dengan kolom "Nama Produk" dan "Satuan" yang bisa dikenali.' };
+  return { rows: Object.values(result) };
+}
+
 // Editing the "+Stok" (Penambahan) cell in the Stok Terjual pivot: since the cell shows the
 // TOTAL of any adjustment records for that exact product/date/entity, editing it replaces
 // all of them with a single record carrying the new total (so what's typed is what's stored).
@@ -7784,9 +7823,19 @@ function ensureProductSatuanMap() {
 function lookupStokTerjualSatuan(entitas, nama) {
   const key = normalizeName(nama || '');
   if (!key) return null;
+  const ovSat = getSatuanOverride(entitas, nama);
+  if (ovSat) return ovSat;
   const map = ensureProductSatuanMap();
   if (entitas && map[entitas + '||' + key]) return map[entitas + '||' + key];
-  for (const e of (typeof ENTITIES !== 'undefined' ? ENTITIES : ['Gracia', 'HNH', 'Glomed'])) {
+  const ents = (typeof ENTITIES !== 'undefined' ? ENTITIES : ['Gracia', 'HNH', 'Glomed']);
+  // Fallback: pinjam satuan HASIL IMPORT entitas lain yang nama produknya sama persis
+  // (mis. Glomed yang file Stok Terjual-nya tidak punya kolom Satuan ikut pakai satuan HNH).
+  for (const e of ents) {
+    if (e === entitas) continue;
+    const s = getSatuanOverride(e, nama);
+    if (s) return s;
+  }
+  for (const e of ents) {
     if (map[e + '||' + key]) return map[e + '||' + key];
   }
   return null;
@@ -7822,8 +7871,18 @@ function bindSatuanAutofill(namaInput, satuanInput, getEntitas) {
   namaInput.addEventListener('input', () => { clearTimeout(t); t = setTimeout(apply, 350); });
   namaInput._satuanRefresh = () => { lastNamaKey = null; apply(); };
 }
+// Satuan hasil "Import Satuan" (Tab 4) — prioritas PERTAMA, di atas satuan dari Invoice Masuk.
+// Disimpan di state.settings.satuanOverride dengan kunci "Entitas||nama normal" supaya ikut
+// tersinkron ke Supabase (gsj_settings) dan ikut masuk file Backup JSON.
+function getSatuanOverride(entitas, nama) {
+  const ov = state.settings && state.settings.satuanOverride;
+  if (!ov || !entitas) return null;
+  return ov[entitas + '||' + normalizeName(nama)] || null;
+}
+// Urutan: import entitas ini -> Invoice Masuk entitas ini -> import entitas lain (nama sama persis)
+// -> Invoice Masuk entitas lain -> "Pcs".
 function getProductSatuan(entitas, nama) {
-  return ensureProductSatuanMap()[entitas + '||' + normalizeName(nama)] || 'Pcs';
+  return lookupStokTerjualSatuan(entitas, nama) || 'Pcs';
 }
 
 function computeSingleProductPivot(entitas, tanggal, nama, stokAwalMap, dayRows, dayAdjustments, dayInvoiceItems) {
@@ -9537,6 +9596,7 @@ let tab4StockEntity = 'Gracia';
 let pendingMappingFile = null;
 let pendingStokAwalFile = null;
 let pendingHargaModalFile = null;
+let pendingSatuanFile = null;
 
 function renderTab4() {
   const el = document.getElementById('tab4');
@@ -9609,6 +9669,17 @@ function renderTab4() {
         <div class="field">
           <button class="btn secondary" id="t4-hargamodal-import" style="width:100%;" disabled>⬆️ Import Harga Modal</button>
         </div>
+        <div class="field">
+          <label>4. Import Satuan (.xlsx) <span style="font-weight:400;color:var(--muted);">— dari file Stok Terjual yang ada kolom Nama Produk + Satuan. Entitas yang belum punya satuan otomatis pinjam satuan entitas lain yang nama produknya sama persis.</span></label>
+          <input type="file" id="t4-satuan-file" accept=".xlsx,.xls">
+        </div>
+        <div class="field">
+          <label>Untuk Entitas</label>
+          <select id="t4-satuan-entitas">${ENTITIES.map(e=>`<option value="${e}">${ENTITY_LABEL[e]}</option>`).join('')}</select>
+        </div>
+        <div class="field">
+          <button class="btn secondary" id="t4-satuan-import" style="width:100%;" disabled>⬆️ Import Satuan</button>
+        </div>
       </div>
       <div id="t4-import-msg"></div>
       <div style="margin-top:10px;">
@@ -9652,6 +9723,11 @@ function renderTab4() {
     document.getElementById('t4-hargamodal-import').disabled = !pendingHargaModalFile;
   });
   document.getElementById('t4-hargamodal-import').addEventListener('click', doImportHargaModal);
+  document.getElementById('t4-satuan-file').addEventListener('change', (e) => {
+    pendingSatuanFile = e.target.files[0] || null;
+    document.getElementById('t4-satuan-import').disabled = !pendingSatuanFile;
+  });
+  document.getElementById('t4-satuan-import').addEventListener('click', doImportSatuan);
   document.getElementById('t4-rematch').addEventListener('click', () => {
     const updated = rematchCheckerRowsToMaster();
     recomputeAllCheckerRows();
@@ -10016,6 +10092,46 @@ function doImportHargaModal() {
     if (iuChanges.length) iuLog({ type: 'hargamodal', op: 'import', label: `Import Harga Modal ${ENTITY_LABEL[entitas]} — ${matched} produk${pendingHargaModalFile ? ' (file ' + pendingHargaModalFile.name + ')' : ''}`, changes: iuChanges });
     saveState();
     showImportMsg('ok', `Harga Modal berhasil dicocokkan untuk ${matched} produk di ${ENTITY_LABEL[entitas]}.${notInCatalog ? `\n(${notInCatalog} di antaranya belum muncul di daftar Stok Terjual entitas ini — akan otomatis terpakai begitu produk itu ada transaksi/faktur.)` : ''}`);
+    renderTab4Stock();
+    if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+  }).catch(err => showImportMsg('err', 'Gagal membaca file: ' + err.message));
+}
+
+function doImportSatuan() {
+  if (!pendingSatuanFile) return;
+  const entitas = document.getElementById('t4-satuan-entitas').value;
+  const fileName = pendingSatuanFile.name;
+  showImportMsg('', 'Memproses...');
+  readWorkbookFile(pendingSatuanFile).then(wb => {
+    const result = importSatuanWorkbook(wb);
+    if (result.error) { showImportMsg('err', result.error); return; }
+    state.settings = state.settings || {};
+    state.settings.satuanOverride = Object.assign({}, state.settings.satuanOverride || {});
+    const ov = state.settings.satuanOverride;
+    const catalogKeys = new Set(getProductCatalogForEntity(entitas).map(n => normalizeName(n)));
+    const iuChanges = [], notInCatalog = [];
+    let baru = 0, berubah = 0, sama = 0;
+    result.rows.forEach(r => {
+      const key = entitas + '||' + normalizeName(r.nama);
+      const existed = Object.prototype.hasOwnProperty.call(ov, key);
+      if (existed && ov[key] === r.satuan) { sama++; }
+      else {
+        iuChanges.push({ key, existed, val: ov[key] });
+        if (existed) berubah++; else baru++;
+        ov[key] = r.satuan;
+      }
+      if (!catalogKeys.has(normalizeName(r.nama))) notInCatalog.push(r.nama);
+    });
+    const label = ENTITY_LABEL[entitas];
+    gsjDetailedAudit(`meng-import Satuan untuk ${escapeAttr(label)} dari file "${escapeAttr(fileName)}" — ${result.rows.length} produk`);
+    if (iuChanges.length) iuLog({ type: 'satuan', op: 'import', label: `Import Satuan ${label} — ${iuChanges.length} produk (file ${fileName})`, changes: iuChanges });
+    _productSatuanMapSourceLens = null; // paksa hitung ulang cache satuan
+    saveState();
+    if (typeof gsjPushSettings === 'function') { clearTimeout(gsjSyncDebounceTimers.settings); gsjPushSettings(); }
+    const daftar = notInCatalog.slice(0, 15).map(n => '• ' + escapeAttr(n)).join('\n');
+    showImportMsg(notInCatalog.length ? 'warn' : 'ok',
+      `Satuan ${label} berhasil diimport: ${result.rows.length} produk dibaca (${baru} baru, ${berubah} diganti, ${sama} sudah sama).` +
+      (notInCatalog.length ? `\n\n⚠️ ${notInCatalog.length} nama tidak ketemu di daftar Stok Terjual ${label} (beda tulisan / belum ada). Satuannya tetap disimpan & otomatis terpakai kalau namanya nanti sama persis:\n${daftar}${notInCatalog.length > 15 ? `\n… dan ${notInCatalog.length - 15} lainnya` : ''}` : ''));
     renderTab4Stock();
     if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
   }).catch(err => showImportMsg('err', 'Gagal membaca file: ' + err.message));
@@ -12629,6 +12745,7 @@ const IU_TYPES = {
   stokawal: { icon: '📦', label: 'Stok Awal' },
   master: { icon: '🗂️', label: 'Master Produk' },
   hargamodal: { icon: '💲', label: 'Harga Modal' },
+  satuan: { icon: '📏', label: 'Satuan' },
   dobel: { icon: '🔎', label: 'Faktur Berisiko Dobel' },
 };
 const IU_MAX_LOG = 14;
@@ -12781,6 +12898,14 @@ async function iuUndo(id) {
     }
     e.undone = true; iuSave();
     iuFinish({ rematch: true, recompute: true, flush: 'masterProduk' });
+  } else if (e.type === 'satuan') {
+    state.settings = state.settings || {};
+    state.settings.satuanOverride = Object.assign({}, state.settings.satuanOverride || {});
+    e.changes.forEach(c => { if (c.existed) state.settings.satuanOverride[c.key] = c.val; else delete state.settings.satuanOverride[c.key]; });
+    _productSatuanMapSourceLens = null;
+    e.undone = true; iuSave();
+    iuFinish({});
+    if (typeof gsjPushSettings === 'function') { clearTimeout(gsjSyncDebounceTimers.settings); gsjPushSettings(); }
   } else if (e.type === 'hargamodal') {
     state.hargaModalOverride = state.hargaModalOverride || {};
     e.changes.forEach(c => { if (c.existed) state.hargaModalOverride[c.key] = c.val; else delete state.hargaModalOverride[c.key]; });
@@ -12840,7 +12965,31 @@ function iuClearHargaModal(entitas) {
   return true;
 }
 
+function iuSatuanKeys(entitas) {
+  const ov = (state.settings && state.settings.satuanOverride) || {};
+  const prefix = entitas + '||';
+  return Object.keys(ov).filter(k => k.indexOf(prefix) === 0);
+}
+function iuClearSatuan(entitas) {
+  const keys = iuSatuanKeys(entitas);
+  const label = (typeof ENTITY_LABEL !== 'undefined' && ENTITY_LABEL[entitas]) || entitas;
+  if (!keys.length) { iuMsg('warn', `Belum ada Satuan hasil import untuk ${label}.`); return false; }
+  if (!confirm(`Hapus SEMUA ${keys.length} Satuan hasil import untuk ${label}?\n\nSatuan akan kembali diambil dari Invoice Masuk (atau "Pcs" kalau belum ada).\nBisa dibatalkan lewat riwayat di bawah.`)) return false;
+  state.settings.satuanOverride = Object.assign({}, state.settings.satuanOverride);
+  const ov = state.settings.satuanOverride;
+  const changes = keys.map(k => ({ key: k, existed: true, val: ov[k] }));
+  keys.forEach(k => { delete ov[k]; });
+  _productSatuanMapSourceLens = null;
+  iuLog({ type: 'satuan', op: 'clear', label: `Hapus semua Satuan ${label} (${keys.length} produk)`, changes });
+  if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`menghapus semua Satuan ${escapeAttr(label)} — ${keys.length} produk`);
+  iuFinish({});
+  if (typeof gsjPushSettings === 'function') { clearTimeout(gsjSyncDebounceTimers.settings); gsjPushSettings(); }
+  iuMsg('ok', `${keys.length} Satuan ${label} dihapus.`);
+  return true;
+}
+
 // ---------- Tampilan ----------
+let iuSatuanEntitas = null;
 let iuHargaEntitas = null;
 let iuSaEntitas = null;
 function iuRenderCard() {
@@ -12848,6 +12997,8 @@ function iuRenderCard() {
   if (!box) return;
   const ents = (typeof ENTITIES !== 'undefined') ? ENTITIES : ['Gracia', 'HNH', 'Glomed'];
   if (!iuHargaEntitas) iuHargaEntitas = ents[0];
+  if (!iuSatuanEntitas) iuSatuanEntitas = ents[0];
+  const nST = iuSatuanKeys(iuSatuanEntitas).length;
   if (!iuSaEntitas) iuSaEntitas = ents[0];
   const label = (e) => (typeof ENTITY_LABEL !== 'undefined' && ENTITY_LABEL[e]) || e;
   const nSA = iuStokAwalActiveRows(iuSaEntitas).length, nMP = state.masterProduk.length, nHM = iuHargaModalKeys(iuHargaEntitas).length;
@@ -12868,13 +13019,14 @@ function iuRenderCard() {
   const hist = gsjImportLog.slice().reverse().slice(0, 10).map(e => `<li style="${e.undone ? 'opacity:.55;text-decoration:line-through;' : ''}">${IU_TYPES[e.type].icon} ${escapeAttr(e.label)} <span style="color:var(--muted);">— ${escapeAttr(iuWhen(e.at))}, ${escapeAttr(e.by)}${e.undone ? ' · dibatalkan' : ''}</span></li>`).join('');
   box.innerHTML = `
     <h2>↩️ Batalkan Import / Mulai dari Awal</h2>
-    <p class="desc">Salah import? Batalkan langkah terakhir, atau hapus semuanya lalu import ulang dari awal — untuk <b>Stok Awal</b>, <b>Master Produk</b>, dan <b>Harga Modal</b>. <b>Invoice Masuk tidak ikut ter-undo maupun terhapus</b> (tombol ↶ / Ctrl+Z di atas juga tidak menyentuh Invoice Masuk).</p>
+    <p class="desc">Salah import? Batalkan langkah terakhir, atau hapus semuanya lalu import ulang dari awal — untuk <b>Stok Awal</b>, <b>Master Produk</b>, <b>Harga Modal</b>, dan <b>Satuan</b>. <b>Invoice Masuk tidak ikut ter-undo maupun terhapus</b> (tombol ↶ / Ctrl+Z di atas juga tidak menyentuh Invoice Masuk).</p>
     <div class="table-wrap"><table class="dtable" style="min-width:760px;">
       <thead><tr><th>Jenis data</th><th style="text-align:right;">Data sekarang</th><th>Langkah terakhir</th><th></th></tr></thead>
       <tbody>
         ${row('stokawal', nSA, `<br><select id="iu-sa-ent" style="margin-top:4px;padding:3px 6px;font-size:12px;">${ents.map(e => `<option value="${e}" ${e === iuSaEntitas ? 'selected' : ''}>${escapeAttr(label(e))}</option>`).join('')}</select>${nSaGen > 1 ? `<div style="font-size:10.5px;color:var(--muted);margin-top:3px;">${nSaGen} periode tersimpan</div>` : ''}`, 'clear-stokawal', escapeAttr(saSummary))}
         ${row('master', nMP, '', 'clear-master')}
         ${row('hargamodal', nHM, `<br><select id="iu-hm-ent" style="margin-top:4px;padding:3px 6px;font-size:12px;">${ents.map(e => `<option value="${e}" ${e === iuHargaEntitas ? 'selected' : ''}>${escapeAttr(label(e))}</option>`).join('')}</select>`, 'clear-hargamodal')}
+        ${row('satuan', nST, `<br><select id="iu-st-ent" style="margin-top:4px;padding:3px 6px;font-size:12px;">${ents.map(e => `<option value="${e}" ${e === iuSatuanEntitas ? 'selected' : ''}>${escapeAttr(label(e))}</option>`).join('')}</select>`, 'clear-satuan')}
       </tbody></table></div>
     <div id="iu-msg" style="margin-top:8px;"></div>
     ${hist ? `<details style="margin-top:10px;font-size:12px;"><summary style="cursor:pointer;font-weight:700;">Riwayat langkah (${gsjImportLog.length})</summary><ul style="margin:6px 0 0 18px;padding:0;line-height:1.7;">${hist}</ul><div style="font-size:11px;color:var(--muted);margin-top:4px;">${iuRemoteDisabled ? 'Riwayat ini tersimpan di browser ini saja (server riwayat tidak bisa diakses).' : 'Riwayat ini tersinkron realtime ke semua device — langkah dari laptop lain juga bisa dibatalkan dari sini.'}</div></details>` : ''}`;
@@ -12882,12 +13034,15 @@ function iuRenderCard() {
   if (selSA) selSA.addEventListener('change', () => { iuSaEntitas = selSA.value; iuRenderCard(); });
   const sel = box.querySelector('#iu-hm-ent');
   if (sel) sel.addEventListener('change', () => { iuHargaEntitas = sel.value; iuRenderCard(); });
+  const selST = box.querySelector('#iu-st-ent');
+  if (selST) selST.addEventListener('change', () => { iuSatuanEntitas = selST.value; iuRenderCard(); });
   box.querySelectorAll('[data-iu-act]').forEach(b => b.addEventListener('click', () => {
     const act = b.dataset.iuAct;
     if (act === 'undo') { const t = b.closest('tr').dataset.iuType; const l = t === 'stokawal' ? iuLatest(t, iuSaEntitas) : iuLatest(t); if (l) iuUndo(l.id); }
     else if (act === 'clear-stokawal') iuClearStokAwal(iuSaEntitas);
     else if (act === 'clear-master') iuClearMaster();
     else if (act === 'clear-hargamodal') iuClearHargaModal(iuHargaEntitas);
+    else if (act === 'clear-satuan') iuClearSatuan(iuSatuanEntitas);
   }));
 }
 
