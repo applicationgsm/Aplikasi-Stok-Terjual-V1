@@ -16702,14 +16702,53 @@ async function gsjFastOrFullSync() {
 </script>
 <script>
 // ===== chat.js =====
-// 💬 CHAT: (1) Chat Tim — pesan antar user, langsung tampil di semua laptop (Supabase realtime broadcast),
-// tersimpan di tabel gsj_settings sebagai baris "chatmsg_..." (tidak perlu tabel baru); (2) Asisten — tanya
-// jawab soal data aplikasi (stok, penjualan, faktur, modal, total pembayaran). Asisten bekerja langsung dari
-// data aplikasi di browser (tanpa layanan AI berbayar), jadi paham pola pertanyaan umum.
-const CHAT_PREFIX = 'chatmsg_', CHAT_DAYS = 14, CHAT_LIMIT = 300;
-let chatMsgs = [], chatChannel = null, chatOpen = false, chatTab = 'tim', chatUnread = 0, chatLoaded = false;
-let chatAsk = []; // riwayat asisten (lokal)
+// 💬 CHAT: (1) Chat Tim — grup semua admin + chat pribadi (1 lawan 1), bisa lampirkan foto. Pesan langsung
+// tampil di laptop lain (Supabase realtime broadcast) & tersimpan di tabel gsj_settings sebagai baris "chatmsg_..."
+// (tidak perlu tabel baru). (2) Asisten — tanya jawab soal data aplikasi tanpa layanan AI berbayar.
+const CHAT_PREFIX = 'chatmsg_', CHAT_DAYS = 14, CHAT_LIMIT = 400;
+let chatMsgs = [], chatChannel = null, chatOpen = false, chatTab = 'tim', chatLoaded = false;
+let chatConv = null;          // null = daftar percakapan; 'grup' atau 'dm:<nama>' = sedang membuka
+let chatAttach = null;        // foto yang mau dikirim { dataUrl, w, h, size }
+let chatAsk = [];             // riwayat asisten (lokal)
+let chatOnlineNames = [];     // nama yang sedang online (dari presence)
 function chatEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function chatMe() { return (typeof gsjCurrentUser !== 'undefined' && gsjCurrentUser && gsjCurrentUser.name) || (typeof getUserName === 'function' && getUserName()) || 'Saya'; }
+const chatKey = n => String(n || '').trim().toLowerCase();
+// Percakapan sebuah pesan: 'grup' atau 'dm:<nama lawan bicara>' (dari sudut pandang saya)
+function chatConvOf(m) {
+  if (!m.to) return 'grup';
+  const me = chatKey(chatMe());
+  if (chatKey(m.from) === me) return 'dm:' + chatKey(m.to);
+  if (chatKey(m.to) === me) return 'dm:' + chatKey(m.from);
+  return null; // chat pribadi orang lain -> tidak ditampilkan
+}
+function chatReadMap() { try { return JSON.parse(localStorage.getItem('gsj_chat_read_' + chatKey(chatMe())) || '{}'); } catch (e) { return {}; } }
+function chatMarkRead(conv) {
+  if (!conv) return;
+  const r = chatReadMap(); r[conv] = new Date().toISOString();
+  try { localStorage.setItem('gsj_chat_read_' + chatKey(chatMe()), JSON.stringify(r)); } catch (e) {}
+}
+function chatUnreadOf(conv) {
+  const r = chatReadMap(), since = r[conv] || '', me = chatKey(chatMe());
+  return chatMsgs.filter(m => chatConvOf(m) === conv && chatKey(m.from) !== me && m.at > since).length;
+}
+function chatTotalUnread() {
+  const convs = new Set(chatMsgs.map(chatConvOf).filter(Boolean));
+  let n = 0; convs.forEach(c => { n += chatUnreadOf(c); }); return n;
+}
+function chatDisplayName(key) {
+  const k = chatKey(key);
+  const m = chatMsgs.find(x => chatKey(x.from) === k) || chatMsgs.find(x => chatKey(x.to) === k);
+  if (m) return chatKey(m.from) === k ? m.from : m.to;
+  const o = chatOnlineNames.find(n => chatKey(n) === k);
+  return o || key;
+}
+function chatPeople() {
+  const me = chatKey(chatMe()), set = new Map();
+  chatOnlineNames.forEach(n => { if (chatKey(n) !== me) set.set(chatKey(n), n); });
+  chatMsgs.forEach(m => { [m.from, m.to].forEach(n => { if (n && chatKey(n) !== me && !set.has(chatKey(n))) set.set(chatKey(n), n); }); });
+  return [...set.values()].sort((a, b) => a.localeCompare(b));
+}
 function chatCss() {
   if (document.getElementById('chat-css')) return;
   const st = document.createElement('style');
@@ -16718,7 +16757,7 @@ function chatCss() {
 #chat-fab{position:fixed;right:20px;bottom:20px;z-index:9980;width:54px;height:54px;border-radius:50%;border:0;background:linear-gradient(135deg,#4338CA,#6366F1);color:#fff;font-size:24px;cursor:pointer;box-shadow:0 10px 24px rgba(67,56,202,.4);display:flex;align-items:center;justify-content:center;transition:transform .15s;}
 #chat-fab:hover{transform:scale(1.06);}
 #chat-fab .b{position:absolute;top:-3px;right:-3px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:#DC2626;color:#fff;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;border:2px solid #fff;}
-#chat-panel{position:fixed;right:20px;bottom:86px;z-index:9981;width:min(400px,calc(100vw - 24px));height:min(600px,calc(100vh - 110px));background:#fff;border-radius:18px;box-shadow:0 20px 50px rgba(17,20,40,.28);display:flex;flex-direction:column;overflow:hidden;transform:translateY(16px) scale(.98);opacity:0;pointer-events:none;transition:all .18s ease;font-family:inherit;}
+#chat-panel{position:fixed;right:20px;bottom:86px;z-index:9981;width:min(410px,calc(100vw - 24px));height:min(620px,calc(100vh - 110px));background:#fff;border-radius:18px;box-shadow:0 20px 50px rgba(17,20,40,.28);display:flex;flex-direction:column;overflow:hidden;transform:translateY(16px) scale(.98);opacity:0;pointer-events:none;transition:all .18s ease;font-family:inherit;}
 #chat-panel.on{transform:none;opacity:1;pointer-events:auto;}
 .ch-head{background:linear-gradient(135deg,#312E81,#4338CA);color:#fff;padding:12px 14px 0;}
 .ch-head .t{display:flex;align-items:center;gap:8px;font-weight:800;font-size:15px;}
@@ -16727,7 +16766,11 @@ function chatCss() {
 .ch-tabs button{flex:1;border:0;background:transparent;color:rgba(255,255,255,.75);font-weight:800;font-size:13px;padding:9px 6px;border-radius:10px 10px 0 0;cursor:pointer;}
 .ch-tabs button.on{background:#fff;color:#312E81;}
 .ch-tabs .n{background:#DC2626;color:#fff;border-radius:9px;padding:0 6px;font-size:10.5px;margin-left:4px;}
-.ch-body{flex:1;overflow:auto;padding:12px 12px 6px;background:#F7F8FC;display:flex;flex-direction:column;gap:6px;}
+.ch-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #E5E7EB;background:#fff;font-weight:800;font-size:13.5px;color:#1a1d2e;}
+.ch-bar button{border:0;background:#F1F2F6;border-radius:8px;padding:5px 9px;cursor:pointer;font-weight:800;color:#4338CA;font-size:12.5px;}
+.ch-bar .sub{font-size:11px;color:#6b7280;font-weight:600;}
+.ch-body{flex:1;overflow:auto;padding:12px 12px 6px;background:#F7F8FC;display:flex;flex-direction:column;gap:6px;position:relative;}
+.ch-body.drag{outline:3px dashed #6366F1;outline-offset:-8px;}
 .ch-day{text-align:center;font-size:10.5px;color:var(--muted,#6b7280);font-weight:700;margin:6px 0 2px;}
 .ch-m{max-width:82%;align-self:flex-start;}
 .ch-m.me{align-self:flex-end;}
@@ -16735,6 +16778,8 @@ function chatCss() {
 .ch-m.me .who{display:none;}
 .ch-m .bub{background:#fff;border:1px solid #E5E7EB;border-radius:14px 14px 14px 4px;padding:7px 11px;font-size:13px;line-height:1.4;color:#1a1d2e;white-space:pre-wrap;word-break:break-word;}
 .ch-m.me .bub{background:#4338CA;color:#fff;border-color:#4338CA;border-radius:14px 14px 4px 14px;}
+.ch-m .bub img.ph{display:block;max-width:100%;max-height:240px;border-radius:10px;cursor:zoom-in;margin:2px 0 4px;background:#eee;}
+.ch-m .bub .phl{font-size:11.5px;opacity:.8;}
 .ch-m .tm{font-size:10px;color:#9aa0ae;margin:2px 8px 0;}
 .ch-m.me .tm{text-align:right;}
 .ch-m.bot .bub{background:#fff;border-color:#C7CCF5;}
@@ -16742,17 +16787,40 @@ function chatCss() {
 .ch-m.bot .bub td,.ch-m.bot .bub th{border-bottom:1px solid #EEF0F4;padding:3px 4px;text-align:left;vertical-align:top;}
 .ch-m.bot .bub td.r,.ch-m.bot .bub th.r{text-align:right;font-family:var(--mono,monospace);white-space:nowrap;}
 .ch-m.bot .bub b{color:#312E81;}
+.ch-conv{display:flex;align-items:center;gap:10px;padding:10px 10px;border-radius:12px;background:#fff;border:1px solid #E5E7EB;cursor:pointer;}
+.ch-conv:hover{border-color:#C7CCF5;box-shadow:0 2px 8px rgba(67,56,202,.08);}
+.ch-conv .av{width:38px;height:38px;border-radius:50%;color:#fff;font-weight:800;font-size:14px;display:flex;align-items:center;justify-content:center;flex-shrink:0;position:relative;}
+.ch-conv .av .on{position:absolute;right:0;bottom:0;width:10px;height:10px;border-radius:50%;background:#22C55E;border:2px solid #fff;}
+.ch-conv .mid{flex:1;min-width:0;}
+.ch-conv .nm{font-weight:800;font-size:13.5px;color:#1a1d2e;}
+.ch-conv .pv{font-size:12px;color:#6b7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.ch-conv .rt{display:flex;flex-direction:column;align-items:flex-end;gap:4px;font-size:10.5px;color:#9aa0ae;}
+.ch-conv .u{background:#DC2626;color:#fff;border-radius:9px;padding:0 6px;font-size:10.5px;font-weight:800;}
+.ch-sec{font-size:10.5px;font-weight:800;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;margin:8px 4px 2px;}
+.ch-new{display:flex;gap:6px;margin-top:4px;}
+.ch-new input{flex:1;border:1px solid #D7DAE3;border-radius:10px;padding:7px 10px;font-size:12.5px;}
+.ch-new button{border:0;background:#4338CA;color:#fff;border-radius:10px;padding:0 12px;font-weight:800;cursor:pointer;}
 .ch-sug{display:flex;flex-wrap:wrap;gap:5px;padding:6px 12px 0;background:#F7F8FC;}
 .ch-sug button{border:1px solid #C7CCF5;background:#fff;color:#4338CA;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:700;cursor:pointer;}
+.ch-att{display:none;align-items:center;gap:8px;padding:6px 12px;background:#EEF2FF;border-top:1px solid #E0E7FF;font-size:12px;color:#3730A3;}
+.ch-att.on{display:flex;}
+.ch-att img{height:44px;border-radius:6px;}
+.ch-att button{margin-left:auto;border:0;background:transparent;color:#DC2626;font-size:16px;cursor:pointer;}
 .ch-in{display:flex;gap:8px;padding:10px 12px;border-top:1px solid #E5E7EB;background:#fff;align-items:flex-end;}
+.ch-in.hide{display:none;}
 .ch-in textarea{flex:1;border:1px solid #D7DAE3;border-radius:12px;padding:9px 11px;font-size:13px;resize:none;max-height:110px;min-height:40px;font-family:inherit;outline:none;}
 .ch-in textarea:focus{border-color:#6366F1;box-shadow:0 0 0 3px rgba(99,102,241,.15);}
 .ch-in button{border:0;background:#4338CA;color:#fff;border-radius:12px;width:42px;height:40px;font-size:17px;cursor:pointer;flex-shrink:0;}
+.ch-in button.clip{background:#F1F2F6;color:#4338CA;font-size:18px;}
 .ch-empty{margin:auto;text-align:center;color:var(--muted,#6b7280);font-size:12.5px;line-height:1.5;padding:20px;}
-.ch-online{font-size:11px;color:rgba(255,255,255,.8);font-weight:600;margin-top:2px;}
+#chat-lb{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.82);display:flex;align-items:center;justify-content:center;cursor:zoom-out;}
+#chat-lb img{max-width:94vw;max-height:90vh;border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.5);}
 `;
   document.head.appendChild(st);
 }
+const CHAT_AV = ['#4338CA', '#0EA5E9', '#16A34A', '#D97706', '#DB2777', '#7C3AED', '#0D9488'];
+function chatAvColor(n) { let h = 0; for (const ch of String(n)) h = (h * 31 + ch.charCodeAt(0)) >>> 0; return CHAT_AV[h % CHAT_AV.length]; }
+function chatInitials(n) { return String(n || '?').trim().split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase(); }
 function chatMount() {
   if (document.getElementById('chat-fab')) return;
   chatCss();
@@ -16760,29 +16828,43 @@ function chatMount() {
   fab.id = 'chat-fab'; fab.title = 'Chat tim & Asisten'; fab.innerHTML = '💬<span class="b" style="display:none"></span>';
   const pnl = document.createElement('div');
   pnl.id = 'chat-panel';
-  pnl.innerHTML = `<div class="ch-head"><div class="t">💬 Chat <span class="ch-online" id="ch-online"></span><button class="x" title="Tutup">×</button></div>
+  pnl.innerHTML = `<div class="ch-head"><div class="t">💬 Chat<button class="x" title="Tutup">×</button></div>
     <div class="ch-tabs"><button data-t="tim" class="on">👥 Chat Tim<span class="n" id="ch-n" style="display:none"></span></button><button data-t="ai">🤖 Asisten Data</button></div></div>
+    <div class="ch-bar" id="ch-bar" style="display:none"></div>
     <div class="ch-body" id="ch-body"></div><div class="ch-sug" id="ch-sug"></div>
-    <div class="ch-in"><textarea id="ch-text" rows="1" placeholder="Tulis pesan…"></textarea><button id="ch-send" title="Kirim (Enter)">➤</button></div>`;
+    <div class="ch-att" id="ch-att"><img id="ch-att-img" alt=""><span id="ch-att-t"></span><button id="ch-att-x" title="Batal lampirkan">✕</button></div>
+    <div class="ch-in" id="ch-in"><button class="clip" id="ch-clip" title="Lampirkan foto (atau tempel Ctrl+V / seret ke sini)">📎</button><input type="file" id="ch-file" accept="image/*" style="display:none"><textarea id="ch-text" rows="1" placeholder="Tulis pesan…"></textarea><button id="ch-send" title="Kirim (Enter)">➤</button></div>`;
   document.body.appendChild(fab); document.body.appendChild(pnl);
   fab.addEventListener('click', () => chatToggle(!chatOpen));
   pnl.querySelector('.x').addEventListener('click', () => chatToggle(false));
-  pnl.querySelectorAll('.ch-tabs button').forEach(b => b.addEventListener('click', () => { chatTab = b.dataset.t; chatRender(); document.getElementById('ch-text').focus(); }));
+  pnl.querySelectorAll('.ch-tabs button').forEach(b => b.addEventListener('click', () => { chatTab = b.dataset.t; chatRender(); const ta = document.getElementById('ch-text'); if (ta) ta.focus(); }));
   const ta = document.getElementById('ch-text');
   ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSubmit(); } });
   ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(110, ta.scrollHeight) + 'px'; });
-  document.getElementById('ch-send').addEventListener('click', chatSubmit);
+  ta.addEventListener('paste', e => {
+    const it = [...((e.clipboardData && e.clipboardData.items) || [])].find(x => x.type && x.type.startsWith('image/'));
+    if (it && chatTab === 'tim' && chatConv) { e.preventDefault(); chatPickImage(it.getAsFile()); }
+  });
+  document.getElementById('ch-send').addEventListener('click', () => chatSubmit());
+  document.getElementById('ch-clip').addEventListener('click', () => document.getElementById('ch-file').click());
+  document.getElementById('ch-file').addEventListener('change', e => { const f = e.target.files[0]; if (f) chatPickImage(f); e.target.value = ''; });
+  document.getElementById('ch-att-x').addEventListener('click', () => { chatAttach = null; chatAttachUi(); });
+  const body = document.getElementById('ch-body');
+  body.addEventListener('dragover', e => { if (chatTab === 'tim' && chatConv) { e.preventDefault(); body.classList.add('drag'); } });
+  body.addEventListener('dragleave', () => body.classList.remove('drag'));
+  body.addEventListener('drop', e => { body.classList.remove('drag'); if (!(chatTab === 'tim' && chatConv)) return; e.preventDefault(); const f = [...(e.dataTransfer.files || [])].find(x => x.type.startsWith('image/')); if (f) chatPickImage(f); });
 }
 function chatToggle(on) {
   chatOpen = on;
   document.getElementById('chat-panel').classList.toggle('on', on);
-  if (on) { if (chatTab === 'tim') chatUnread = 0; chatRender(); setTimeout(() => document.getElementById('ch-text').focus(), 50); if (!chatLoaded) chatLoad(); }
+  if (on) { chatRender(); setTimeout(() => { const ta = document.getElementById('ch-text'); if (ta) ta.focus(); }, 50); if (!chatLoaded) chatLoad(); }
   chatBadge();
 }
 function chatBadge() {
+  const n0 = chatTotalUnread();
   const b = document.querySelector('#chat-fab .b'), n = document.getElementById('ch-n');
-  if (b) { b.style.display = chatUnread ? 'flex' : 'none'; b.textContent = chatUnread > 99 ? '99+' : chatUnread; }
-  if (n) { n.style.display = chatUnread && chatTab !== 'tim' ? 'inline' : 'none'; n.textContent = chatUnread; }
+  if (b) { b.style.display = n0 ? 'flex' : 'none'; b.textContent = n0 > 99 ? '99+' : n0; }
+  if (n) { n.style.display = n0 ? 'inline' : 'none'; n.textContent = n0; }
 }
 function chatTime(iso) { const d = new Date(iso); return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }); }
 function chatDay(iso) {
@@ -16791,25 +16873,119 @@ function chatDay(iso) {
   if (same(d, t)) return 'Hari ini'; if (same(d, y)) return 'Kemarin';
   return d.toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long' });
 }
+function chatShortTime(iso) { const d = new Date(iso); return d.toDateString() === new Date().toDateString() ? chatTime(iso) : d.toLocaleDateString('id-ID', { day: 'numeric', month: 'short' }); }
+// ---------- foto ----------
+function chatPickImage(file) {
+  if (!file || !file.type || !file.type.startsWith('image/')) return;
+  const fr = new FileReader();
+  fr.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      // Perkecil supaya ringan dikirim & disimpan (maks 1280 px, JPEG)
+      let maxSide = 1280, q = 0.72, url = '';
+      for (let i = 0; i < 4; i++) {
+        const sc = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc);
+        const cx = c.getContext('2d'); cx.fillStyle = '#fff'; cx.fillRect(0, 0, c.width, c.height); cx.drawImage(img, 0, 0, c.width, c.height);
+        url = c.toDataURL('image/jpeg', q);
+        if (url.length < 350000) { chatAttach = { dataUrl: url, w: c.width, h: c.height, size: url.length }; break; }
+        maxSide = Math.round(maxSide * 0.75); q = Math.max(0.5, q - 0.08);
+        chatAttach = { dataUrl: url, w: c.width, h: c.height, size: url.length };
+      }
+      chatAttachUi();
+      const ta = document.getElementById('ch-text'); if (ta) ta.focus();
+    };
+    img.src = fr.result;
+  };
+  fr.readAsDataURL(file);
+}
+function chatAttachUi() {
+  const box = document.getElementById('ch-att');
+  if (!box) return;
+  box.classList.toggle('on', !!chatAttach);
+  if (chatAttach) { document.getElementById('ch-att-img').src = chatAttach.dataUrl; document.getElementById('ch-att-t').textContent = `Foto siap dikirim (${Math.round(chatAttach.size * 0.75 / 1024)} KB) — tambah keterangan lalu Enter`; }
+}
+function chatLightbox(src) {
+  const lb = document.createElement('div'); lb.id = 'chat-lb'; lb.innerHTML = `<img src="${src}" alt="">`;
+  lb.addEventListener('click', () => lb.remove()); document.body.appendChild(lb);
+}
+async function chatFetchImage(m) {
+  if (m._loading || m.img || !m.hasImg || typeof gsjSupabase === 'undefined' || !gsjSupabase) return;
+  m._loading = true;
+  try { const r = await gsjSupabase.from('gsj_settings').select('id,data').eq('id', m.id).maybeSingle(); if (r && r.data && r.data.data && r.data.data.img) { m.img = r.data.data.img; chatRender(); } }
+  catch (e) {} finally { m._loading = false; }
+}
+// ---------- tampilan ----------
+function chatConvTitle(conv) { return conv === 'grup' ? '👥 Grup Semua' : chatDisplayName(conv.slice(3)); }
+function chatRenderList(body, bar) {
+  bar.style.display = 'none';
+  const me = chatKey(chatMe());
+  const online = new Set(chatOnlineNames.map(chatKey));
+  const last = conv => chatMsgs.filter(m => chatConvOf(m) === conv).slice(-1)[0];
+  const row = (conv, title, avHtml, sub) => {
+    const l = last(conv), u = chatUnreadOf(conv);
+    const pv = l ? `${chatKey(l.from) === me ? 'Kamu: ' : (conv === 'grup' ? chatEsc(l.from) + ': ' : '')}${l.hasImg || l.img ? '📷 ' : ''}${chatEsc(l.text || (l.hasImg || l.img ? 'Foto' : ''))}` : `<i>${sub}</i>`;
+    return `<div class="ch-conv" data-conv="${chatEsc(conv)}">${avHtml}<div class="mid"><div class="nm">${title}</div><div class="pv">${pv}</div></div><div class="rt">${l ? chatShortTime(l.at) : ''}${u ? `<span class="u">${u}</span>` : ''}</div></div>`;
+  };
+  let html = row('grup', 'Grup Semua', `<div class="av" style="background:#312E81">👥</div>`, 'Obrolan untuk semua admin');
+  const dmConvs = [...new Set(chatMsgs.map(chatConvOf).filter(c => c && c !== 'grup'))]
+    .sort((a, b) => ((last(b) || {}).at || '').localeCompare((last(a) || {}).at || ''));
+  html += `<div class="ch-sec">Chat pribadi</div>`;
+  dmConvs.forEach(c => { const nm = chatDisplayName(c.slice(3)); html += row(c, chatEsc(nm), `<div class="av" style="background:${chatAvColor(nm)}">${chatEsc(chatInitials(nm))}${online.has(c.slice(3)) ? '<span class="on"></span>' : ''}</div>`, ''); });
+  const others = chatPeople().filter(n => !dmConvs.includes('dm:' + chatKey(n)));
+  others.forEach(n => { html += row('dm:' + chatKey(n), chatEsc(n), `<div class="av" style="background:${chatAvColor(n)}">${chatEsc(chatInitials(n))}${online.has(chatKey(n)) ? '<span class="on"></span>' : ''}</div>`, online.has(chatKey(n)) ? 'Sedang online — mulai chat pribadi' : 'Mulai chat pribadi'); });
+  html += `<div class="ch-sec">Chat pribadi baru</div><div class="ch-new"><input id="ch-new-name" placeholder="Ketik nama (sesuai nama login)…" list="ch-people"><datalist id="ch-people">${chatPeople().map(n => `<option value="${chatEsc(n)}">`).join('')}</datalist><button id="ch-new-go">Chat</button></div>`;
+  body.innerHTML = html;
+  body.querySelectorAll('.ch-conv').forEach(el => el.addEventListener('click', () => chatOpenConv(el.dataset.conv)));
+  const go = () => { const v = document.getElementById('ch-new-name').value.trim(); if (!v) return; if (chatKey(v) === me) { alert('Itu nama kamu sendiri 🙂'); return; } chatOpenConv('dm:' + chatKey(v), v); };
+  document.getElementById('ch-new-go').addEventListener('click', go);
+  document.getElementById('ch-new-name').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+}
+let _chatNewNames = {};
+function chatOpenConv(conv, displayName) {
+  if (displayName) _chatNewNames[conv] = displayName;
+  chatConv = conv; chatMarkRead(conv); chatRender();
+  setTimeout(() => { const ta = document.getElementById('ch-text'); if (ta) ta.focus(); }, 30);
+}
 function chatRender() {
   const body = document.getElementById('ch-body');
   if (!body) return;
   document.querySelectorAll('#chat-panel .ch-tabs button').forEach(b => b.classList.toggle('on', b.dataset.t === chatTab));
-  const ta = document.getElementById('ch-text');
-  const sug = document.getElementById('ch-sug');
-  const me = (typeof gsjCurrentUser !== 'undefined' && gsjCurrentUser && gsjCurrentUser.name) || '';
+  const ta = document.getElementById('ch-text'), sug = document.getElementById('ch-sug'), bar = document.getElementById('ch-bar'), inp = document.getElementById('ch-in');
+  const clip = document.getElementById('ch-clip');
+  const me = chatKey(chatMe());
   let html = '', lastDay = '';
   if (chatTab === 'tim') {
-    ta.placeholder = 'Tulis pesan ke tim…';
     sug.innerHTML = '';
-    if (!chatMsgs.length) html = `<div class="ch-empty">${chatLoaded ? 'Belum ada pesan. Mulai obrolan dengan tim 👋' : 'Memuat pesan…'}<br><span style="font-size:11px;">Pesan tersimpan ${CHAT_DAYS} hari terakhir.</span></div>`;
-    chatMsgs.forEach(m => {
+    if (!chatConv) {
+      inp.classList.add('hide'); chatAttach = null; chatAttachUi();
+      if (!chatLoaded) { bar.style.display = 'none'; body.innerHTML = '<div class="ch-empty">Memuat pesan…</div>'; }
+      else chatRenderList(body, bar);
+      chatBadge();
+      return;
+    }
+    inp.classList.remove('hide'); clip.style.display = '';
+    const isDm = chatConv !== 'grup';
+    const nm = isDm ? (_chatNewNames[chatConv] || chatDisplayName(chatConv.slice(3))) : 'Grup Semua';
+    const onl = isDm && chatOnlineNames.some(n => chatKey(n) === chatConv.slice(3));
+    bar.style.display = 'flex';
+    bar.innerHTML = `<button id="ch-back">← Kembali</button><div>${isDm ? '🔒 ' : '👥 '}${chatEsc(nm)}<div class="sub">${isDm ? (onl ? '● sedang online · chat pribadi' : 'chat pribadi — hanya kalian berdua') : 'semua admin'}</div></div>`;
+    document.getElementById('ch-back').addEventListener('click', () => { chatConv = null; chatRender(); });
+    ta.placeholder = isDm ? `Pesan pribadi ke ${nm}…` : 'Tulis pesan ke grup…';
+    const list = chatMsgs.filter(m => chatConvOf(m) === chatConv);
+    if (!list.length) html = `<div class="ch-empty">${isDm ? `Belum ada pesan dengan <b>${chatEsc(nm)}</b>.<br>Pesan di sini hanya terlihat oleh kalian berdua.` : 'Belum ada pesan di grup. Mulai obrolan 👋'}<br><span style="font-size:11px;">📎 Bisa lampirkan foto (klik 📎, tempel Ctrl+V, atau seret ke sini).</span></div>`;
+    list.forEach(m => {
       const day = chatDay(m.at); if (day !== lastDay) { html += `<div class="ch-day">${day}</div>`; lastDay = day; }
-      const mine = m.from && me && m.from.toLowerCase() === me.toLowerCase();
-      html += `<div class="ch-m ${mine ? 'me' : ''}"><div class="who">${chatEsc(m.from)}</div><div class="bub">${chatEsc(m.text)}</div><div class="tm">${chatTime(m.at)}${m.pending ? ' · mengirim…' : (m.failed ? ' · ⚠ gagal' : '')}</div></div>`;
+      const mine = chatKey(m.from) === me;
+      let photo = '';
+      if (m.img) photo = `<img class="ph" src="${m.img}" alt="foto" data-full="1">`;
+      else if (m.hasImg) { photo = `<div class="phl">📷 memuat foto…</div>`; chatFetchImage(m); }
+      html += `<div class="ch-m ${mine ? 'me' : ''}"><div class="who">${chatEsc(m.from)}</div><div class="bub">${photo}${chatEsc(m.text || '')}</div><div class="tm">${chatTime(m.at)}${m.pending ? ' · mengirim…' : (m.failed ? ' · ⚠ gagal' : '')}</div></div>`;
     });
-    chatUnread = 0;
+    chatMarkRead(chatConv);
   } else {
+    bar.style.display = 'none'; inp.classList.remove('hide'); clip.style.display = 'none'; chatAttach = null; chatAttachUi();
     ta.placeholder = 'Tanya soal data… mis. "stok alkohol 70% 5 liter"';
     if (!chatAsk.length) html = `<div class="ch-empty">🤖 Halo! Aku bisa bantu cek data aplikasi.<br>Contoh pertanyaan ada di bawah 👇</div>`;
     chatAsk.forEach(m => {
@@ -16820,6 +16996,8 @@ function chatRender() {
     sug.querySelectorAll('button').forEach(b => b.addEventListener('click', () => { ta.value = b.textContent; chatSubmit(); }));
   }
   body.innerHTML = html;
+  body.querySelectorAll('img.ph').forEach(im => im.addEventListener('click', () => chatLightbox(im.src)));
+  body.querySelectorAll('img.ph').forEach(im => im.addEventListener('load', () => { body.scrollTop = body.scrollHeight; }));
   body.scrollTop = body.scrollHeight;
   chatBadge();
 }
@@ -16829,9 +17007,12 @@ async function chatLoad() {
     const since = new Date(Date.now() - CHAT_DAYS * 86400000).toISOString();
     const r = await gsjSupabase.from('gsj_settings').select('id,data').like('id', CHAT_PREFIX + '%').gte('updated_at', since).order('updated_at', { ascending: false }).range(0, CHAT_LIMIT - 1);
     if (!r.error) {
-      const got = (r.data || []).map(x => x.data).filter(m => m && m.id);
       const ids = new Set(chatMsgs.map(m => m.id));
-      got.forEach(m => { if (!ids.has(m.id)) chatMsgs.push(m); });
+      (r.data || []).map(x => x.data).filter(m => m && m.id && !ids.has(m.id)).forEach(m => {
+        const mm = Object.assign({}, m);
+        if (mm.img) { mm.hasImg = true; } // foto ikut terambil
+        chatMsgs.push(mm);
+      });
       chatMsgs.sort((a, b) => (a.at < b.at ? -1 : 1));
     }
   } catch (e) { console.warn('chat load', e); }
@@ -16849,23 +17030,29 @@ function chatConnect() {
 }
 function chatReceive(m) {
   if (!m || !m.id || chatMsgs.some(x => x.id === m.id)) return;
+  const conv = chatConvOf(m);
+  if (!conv) return; // chat pribadi orang lain
   chatMsgs.push(m); chatMsgs.sort((a, b) => (a.at < b.at ? -1 : 1));
-  if (!(chatOpen && chatTab === 'tim')) {
-    chatUnread++;
-    if (typeof gsjShowToast === 'function') gsjShowToast(`💬 ${m.from}: ${String(m.text).slice(0, 60)}${String(m.text).length > 60 ? '…' : ''}`);
-  }
+  const viewing = chatOpen && chatTab === 'tim' && chatConv === conv;
+  if (!viewing && typeof gsjShowToast === 'function') gsjShowToast(`💬 ${m.from}${m.to ? ' (pribadi)' : ''}: ${m.hasImg ? '📷 ' : ''}${String(m.text || (m.hasImg ? 'Foto' : '')).slice(0, 60)}`);
   chatRender();
 }
 async function chatSendTeam(text) {
-  const me = (typeof gsjCurrentUser !== 'undefined' && gsjCurrentUser) || { name: (typeof getUserName === 'function' && getUserName()) || 'Saya', role: '' };
-  const m = { id: CHAT_PREFIX + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), from: me.name, role: me.role || '', text, at: new Date().toISOString(), pending: true };
+  const meU = (typeof gsjCurrentUser !== 'undefined' && gsjCurrentUser) || { name: chatMe(), role: '' };
+  const to = chatConv && chatConv !== 'grup' ? (_chatNewNames[chatConv] || chatDisplayName(chatConv.slice(3))) : null;
+  const img = chatAttach ? chatAttach.dataUrl : null;
+  chatAttach = null; chatAttachUi();
+  const m = { id: CHAT_PREFIX + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), from: meU.name, role: meU.role || '', to, text, at: new Date().toISOString(), img, hasImg: !!img, pending: true };
   chatMsgs.push(m); chatRender();
   try {
-    if (chatChannel) chatChannel.send({ type: 'broadcast', event: 'msg', payload: { id: m.id, from: m.from, role: m.role, text: m.text, at: m.at } });
+    const rec = { id: m.id, from: m.from, role: m.role, to: m.to, text: m.text, at: m.at };
+    if (img) rec.img = img;
     if (typeof gsjSupabase !== 'undefined' && gsjSupabase) {
-      const r = await gsjSupabase.from('gsj_settings').upsert({ id: m.id, data: { id: m.id, from: m.from, role: m.role, text: m.text, at: m.at }, updated_at: m.at, updated_by: (typeof GSJ_SESSION_ID !== 'undefined' ? GSJ_SESSION_ID : '') });
+      const r = await gsjSupabase.from('gsj_settings').upsert({ id: m.id, data: rec, updated_at: m.at, updated_by: (typeof GSJ_SESSION_ID !== 'undefined' ? GSJ_SESSION_ID : '') });
       if (r && r.error) throw r.error;
     }
+    // kabari laptop lain (foto tidak ikut di sinyal — mereka ambil dari server)
+    if (chatChannel) chatChannel.send({ type: 'broadcast', event: 'msg', payload: { id: m.id, from: m.from, role: m.role, to: m.to, text: m.text, at: m.at, hasImg: !!img } });
     m.pending = false;
   } catch (e) { m.pending = false; m.failed = true; console.warn('chat send', e); }
   chatRender();
@@ -16873,15 +17060,30 @@ async function chatSendTeam(text) {
 function chatSubmit() {
   const ta = document.getElementById('ch-text');
   const text = ta.value.trim();
+  if (chatTab === 'tim') {
+    if (!chatConv) return;
+    if (!text && !chatAttach) return;
+    ta.value = ''; ta.style.height = 'auto';
+    chatSendTeam(text); return;
+  }
   if (!text) return;
   ta.value = ''; ta.style.height = 'auto';
-  if (chatTab === 'tim') { chatSendTeam(text); return; }
   chatAsk.push({ q: text });
   let a;
   try { a = chatAnswer(text); } catch (e) { console.warn(e); a = 'Maaf, ada kendala waktu membaca data. Coba ulangi dengan kata lain.'; }
   chatAsk.push({ a });
   if (chatAsk.length > 60) chatAsk = chatAsk.slice(-60);
   chatRender();
+}
+// Ambil daftar nama yang sedang online dari tampilan "x online" di header
+if (typeof gsjRenderOnlineUsersList === 'function') {
+  const _chatPresenceOrig = gsjRenderOnlineUsersList;
+  gsjRenderOnlineUsersList = function (rawList) {
+    try { chatOnlineNames = [...new Set((rawList || []).map(u => u && u.name).filter(Boolean))]; } catch (e) {}
+    const r = _chatPresenceOrig.apply(this, arguments);
+    if (chatOpen && chatTab === 'tim' && !chatConv) chatRender();
+    return r;
+  };
 }
 
 // ======================= ASISTEN DATA (tanpa AI berbayar) =======================
@@ -16966,8 +17168,6 @@ function chatAnswer(raw) {
   const L = e => (typeof ENTITY_LABEL !== 'undefined' && ENTITY_LABEL[e]) || e;
   const pq = chProductQuery(q.trim());
   const has = re => re.test(q);
-  if (has(/\b(halo|hai|hi|pagi|siang|sore|malam|apa kabar)\b/) && !pq.replace(/\b(halo|hai|hi|pagi|siang|sore|malam|apa|kabar)\b/g, '').trim()) return 'Halo! 👋 Mau cek apa? Misalnya <b>stok</b>, <b>terjual</b>, <b>faktur</b>, <b>modal</b>, atau <b>total pembayaran</b>. Ketik <b>bantuan</b> untuk contoh.';
-  if (has(/\b(makasih|terima kasih|thanks|thx|oke|ok|sip)\b/) && pq.split(' ').length <= 2) return 'Sama-sama! 🙌';
   if (has(/\b(bantuan|help|bisa apa|contoh)\b/) || q.trim() === '') {
     return `Aku bisa jawab pertanyaan seperti:<br>• <b>stok</b> alkohol 70% 5 liter (opsional: gsm / hnh / gsj)<br>• <b>terjual</b> nitrile blue s oktober · terjual hari ini · penjualan hnh 1-15 oktober<br>• <b>faktur</b> eros makmur · faktur belum lunas · faktur glomed oktober<br>• <b>modal</b> spuit 10 cc onemed<br>• <b>total pembayaran</b> gsm 1-15 oktober (Invoice ke Glomed)<br>• <b>stok minus</b> · <b>stok habis</b> gsj`;
   }
@@ -17062,220 +17262,6 @@ function chatAnswer(raw) {
   };
   if (!tryMount()) { const iv = setInterval(() => { if (tryMount()) clearInterval(iv); }, 1500); }
 })();
-
-</script>
-<script>
-// ===== chat_ai.js =====
-// Asisten Data pakai AI (Google Gemini) lewat perantara Vercel /api/ai (API key aman di Vercel).
-// AI hanya bisa MEMBACA data lewat "alat" di bawah (dihitung di aplikasi, angkanya sama dengan yang tampil).
-// Kalau AI tidak tersambung / batas gratis habis -> otomatis jawab pakai asisten cepat (offline).
-const AI_ENDPOINT = '/api/ai';
-let aiHistory = [], aiBusy = false;
-let aiMode = (localStorage.getItem('gsj_ai_mode') || 'ai'); // 'ai' | 'cepat'
-
-function aiGuide() {
-  const today = (typeof todayISO === 'function') ? todayISO() : new Date().toISOString().slice(0, 10);
-  const user = (typeof gsjCurrentUser !== 'undefined' && gsjCurrentUser) ? `${gsjCurrentUser.name} (${gsjCurrentUser.role || ''})` : '';
-  return `Kamu adalah "Asisten Data" di aplikasi internal "Manajemen Stok & Pembukuan" milik H&H Gloves (distributor alat kesehatan online).
-Hari ini ${today}. Yang bertanya: ${user}. Jawab dalam bahasa Indonesia santai, singkat, langsung ke inti. Pakai angka format Indonesia (titik ribuan, Rp).
-
-ATURAN PENTING:
-- Untuk SEMUA angka (stok, penjualan, faktur, modal, total) WAJIB pakai alat (function) yang tersedia. Jangan pernah mengarang angka.
-- Kalau nama produk tidak jelas, pakai alat cari_produk dulu, lalu pakai nama persis hasilnya.
-- Kamu hanya bisa MEMBACA data. Kalau diminta mengubah/menghapus/input data, jelaskan langkahnya di aplikasi (menu mana, klik apa).
-- Kalau datanya tidak ada atau alat tidak bisa menjawab, bilang terus terang.
-- Tabel boleh pakai format markdown sederhana (| kolom | kolom |) kalau datanya banyak.
-
-TENTANG BISNIS & APLIKASI:
-- 3 entitas: GSM = PT Gracia Sukses Medika (Gracia), HNH = H&H Medical Supplies, GSJ = PT Glomed Sukses Jaya (Glomed). Di data, entitas ditulis "Gracia", "HNH", "Glomed".
-- Jualan di Shopee, Tokopedia, TikTok Shop. Toko: HNH (toko utama), GM = GloveMart, MD/M = Medident. Penjualan WA dan Faktur Pajak dicatat terpisah.
-- Menu: Invoice Masuk (faktur pembelian dari supplier: Faktur / Nota / Surat Jalan; ada Faktur Baru & Riwayat Faktur), Import Marketplace (upload file pesanan marketplace -> jadi Stok Terjual), Stok Terjual (rekap penjualan harian per entitas, Rekap 1-15 & 16-31), Sisa Stok (stok sekarang & nilai stok), Master Produk (pemetaan nama produk marketplace -> nama internal, entitas tetap), Produk Baru (nama produk yang belum dipetakan), Invoice ke Glomed (GSM & H&H menagih GSJ per periode 1-15 / 16-akhir bulan), Total Omset.
-- Urutan potong stok penjualan: GSM dulu -> HNH -> GSJ -> kalau semua kosong, dibebankan ke HNH dengan "tambah stok otomatis" (auto top-up). Penjualan yang dipilih manual tidak diubah.
-- Stok Awal = hasil stok opname fisik (per tanggal, mis. 30 Sep 2026). Penjualan & faktur sebelum/sama dengan tanggal Stok Awal terbaru sudah termasuk di angka fisik itu, jadi tidak dihitung ulang.
-- Tanggal stok masuk: Faktur ikut tanggal faktur; Nota & Surat Jalan ikut tanggal barang diterima.
-- Harga modal: dari Invoice Masuk = harga bersih per unit setelah diskon item & diskon global, termasuk PPN. Kalau ada "harga modal manual" (import), angka manual itu yang dipakai.
-- Invoice ke Glomed: hanya qty marketplace (Shopee+Tokopedia+TikTok, termasuk GM & MD; WA tidak dihitung). Harga = modal + markup Rp1.000/unit. Invoice H&H tanpa PPN; GSM pakai PPN 11%. Periode 1-15 dan 16-akhir bulan.
-- Bubble wrap & Biohazard 80x60 tidak ditagihkan di invoice H&H ke Glomed.
-- Data tersinkron antar laptop lewat server (Supabase). Ada Chat Tim untuk ngobrol antar admin.`;
-}
-
-const AI_TOOLS = [{
-  functionDeclarations: [
-    { name: 'cari_produk', description: 'Cari nama produk yang cocok dari katalog semua entitas. Pakai ini kalau nama produk dari user tidak persis.', parameters: { type: 'OBJECT', properties: { kata: { type: 'STRING', description: 'kata kunci nama produk' } }, required: ['kata'] } },
-    { name: 'cek_stok', description: 'Stok saat ini per entitas untuk produk yang cocok dengan kata kunci.', parameters: { type: 'OBJECT', properties: { produk: { type: 'STRING' }, entitas: { type: 'STRING', description: 'Gracia | HNH | Glomed (kosongkan = semua)' } }, required: ['produk'] } },
-    { name: 'penjualan', description: 'Jumlah barang terjual (qty) per produk & entitas dalam rentang tanggal. Bisa difilter produk & entitas. Juga memberi total per toko/marketplace.', parameters: { type: 'OBJECT', properties: { dari: { type: 'STRING', description: 'YYYY-MM-DD' }, sampai: { type: 'STRING', description: 'YYYY-MM-DD' }, entitas: { type: 'STRING' }, produk: { type: 'STRING', description: 'opsional, kata kunci produk' }, limit: { type: 'NUMBER', description: 'maks baris produk (default 30)' } }, required: ['dari', 'sampai'] } },
-    { name: 'daftar_faktur', description: 'Daftar faktur pembelian (Invoice Masuk). Filter tanggal faktur, entitas, status bayar, kata (supplier/no faktur/nama barang).', parameters: { type: 'OBJECT', properties: { dari: { type: 'STRING' }, sampai: { type: 'STRING' }, entitas: { type: 'STRING' }, status: { type: 'STRING', description: 'Lunas | Belum Lunas | DP Sebagian | belum_lunas_semua' }, kata: { type: 'STRING' } } } },
-    { name: 'harga_modal', description: 'Harga modal per unit produk per entitas (opsional untuk periode tertentu).', parameters: { type: 'OBJECT', properties: { produk: { type: 'STRING' }, entitas: { type: 'STRING' }, dari: { type: 'STRING' }, sampai: { type: 'STRING' } }, required: ['produk'] } },
-    { name: 'total_pembayaran', description: 'Total tagihan Invoice ke Glomed (GSM atau HNH) untuk satu periode.', parameters: { type: 'OBJECT', properties: { penjual: { type: 'STRING', description: 'GSM | HNH' }, tahun: { type: 'NUMBER' }, bulan: { type: 'NUMBER', description: '1-12' }, periode: { type: 'NUMBER', description: '1 = tgl 1-15, 2 = tgl 16-akhir' } }, required: ['penjual', 'tahun', 'bulan', 'periode'] } },
-    { name: 'stok_kritis', description: 'Produk dengan stok minus, habis (0), atau menipis (<= batas).', parameters: { type: 'OBJECT', properties: { tipe: { type: 'STRING', description: 'minus | habis | menipis' }, entitas: { type: 'STRING' }, batas: { type: 'NUMBER', description: 'untuk menipis, default 5' } }, required: ['tipe'] } },
-  ],
-}];
-
-function aiEnt(e) {
-  if (!e) return null;
-  const s = String(e).toLowerCase();
-  if (/gsm|gracia/.test(s)) return 'Gracia';
-  if (/hnh|h&h/.test(s)) return 'HNH';
-  if (/gsj|glomed/.test(s)) return 'Glomed';
-  return null;
-}
-function aiRunTool(name, a) {
-  a = a || {};
-  const ent = aiEnt(a.entitas);
-  const ents = ent ? [ent] : ENTITIES;
-  const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
-  switch (name) {
-    case 'cari_produk': return { hasil: chFindProducts(String(a.kata || ''), 15) };
-    case 'cek_stok': {
-      const prods = chFindProducts(String(a.produk || ''), 8);
-      const st = {}; ents.forEach(e => st[e] = chStockNow(e));
-      return { produk: prods.map(p => ({ nama: p, stok: Object.fromEntries(ents.map(e => { const v = st[e][normalizeName(p)]; return [e, v ? v.qty : null]; })) })), catatan: prods.length ? '' : 'produk tidak ditemukan' };
-    }
-    case 'penjualan': {
-      const want = a.produk ? new Set(chFindProducts(String(a.produk), 10).map(normalizeName)) : null;
-      const agg = {}, perEnt = {}, perToko = {};
-      let total = 0;
-      (state.checkerRows || []).forEach(r => {
-        if (!r.tanggal || r.tanggal < a.dari || r.tanggal > a.sampai || !ents.includes(r.entitas)) return;
-        const k = normalizeName(r.nama);
-        if (want && !want.has(k)) return;
-        const q = Number(r.qtyInternal != null ? r.qtyInternal : r.qty) || 0;
-        const x = agg[k] || (agg[k] = { nama: r.nama, total: 0, per_entitas: {} });
-        x.total += q; x.per_entitas[r.entitas] = (x.per_entitas[r.entitas] || 0) + q;
-        perEnt[r.entitas] = (perEnt[r.entitas] || 0) + q;
-        let toko = '?'; try { toko = classifyRowForPivot(r); } catch (e) {}
-        perToko[toko] = (perToko[toko] || 0) + q;
-        total += q;
-      });
-      const list = Object.values(agg).sort((x, y) => y.total - x.total);
-      return { dari: a.dari, sampai: a.sampai, total_qty: total, per_entitas: perEnt, per_toko: perToko, jumlah_produk: list.length, produk: list.slice(0, Math.min(80, Number(a.limit) || 30)) };
-    }
-    case 'daftar_faktur': {
-      let list = (state.invoices || []).slice();
-      if (ent) list = list.filter(i => i.entitas === ent);
-      if (a.dari) list = list.filter(i => (i.tanggalDokumen || i.tanggal) >= a.dari);
-      if (a.sampai) list = list.filter(i => (i.tanggalDokumen || i.tanggal) <= a.sampai);
-      if (a.status === 'belum_lunas_semua') list = list.filter(i => i.statusBayar !== 'Lunas');
-      else if (a.status) list = list.filter(i => (i.statusBayar || '').toLowerCase() === String(a.status).toLowerCase());
-      if (a.kata) { const w = chToks(a.kata); list = list.filter(i => { const h = normalizeName([i.supplier, i.sumberBeli, i.noFaktur, i.catatan, ...(i.items || []).map(it => it.nama)].join(' ')); return w.every(t => h.includes(t)); }); }
-      list.sort((x, y) => ((y.tanggalDokumen || y.tanggal) > (x.tanggalDokumen || x.tanggal) ? 1 : -1));
-      return { jumlah: list.length, total_nilai: r2(list.reduce((s, i) => s + (Number(i.grandTotal) || 0), 0)), faktur: list.slice(0, 30).map(i => ({ tanggal_faktur: i.tanggalDokumen || i.tanggal, diterima: i.tanggal, entitas: i.entitas, jenis: i.jenisDokumen, supplier: i.supplier || i.sumberBeli, no: i.noFaktur || '', status: i.statusBayar, jatuh_tempo: i.jatuhTempo || '', total: r2(i.grandTotal), barang: (i.items || []).slice(0, 8).map(it => `${it.nama} x${it.qty} ${it.satuan || ''}`) })) };
-    }
-    case 'harga_modal': {
-      const prods = chFindProducts(String(a.produk || ''), 5);
-      const rg = a.dari && a.sampai ? { from: a.dari, to: a.sampai } : null;
-      return { produk: prods.map(p => ({ nama: p, modal: Object.fromEntries(ents.map(e => [e, r2(chModal(e, p, rg))])) })) };
-    }
-    case 'total_pembayaran': {
-      const sk = /gsm|gracia/i.test(a.penjual) ? 'GSM' : 'HNH';
-      const r = t8Recap(sk, Number(a.tahun), Number(a.bulan), Number(a.periode) === 2 ? 2 : 1);
-      return { penjual: sk, dari: r.dari, sampai: r.sampai, total_qty: (r.items || []).reduce((s, x) => s + (x.qty || 0), 0), subtotal: r2(r.subtotal), ppn: r2(r.ppn), total: r2(r.total), jumlah_produk: (r.items || []).length, dikecualikan: r.excluded || [], produk_teratas: (r.items || []).slice().sort((x, y) => y.jumlah - x.jumlah).slice(0, 10).map(x => ({ nama: x.nama, qty: x.qty, harga: x.harga, jumlah: r2(x.jumlah) })) };
-    }
-    case 'stok_kritis': {
-      const out = [];
-      const lim = Number(a.batas) || 5;
-      ents.forEach(e => { Object.values(chStockNow(e)).forEach(v => { const ok = a.tipe === 'minus' ? v.qty < 0 : a.tipe === 'habis' ? v.qty === 0 : (v.qty > 0 && v.qty <= lim); if (ok) out.push({ entitas: e, nama: v.nama, stok: v.qty }); }); });
-      out.sort((x, y) => x.stok - y.stok);
-      return { jumlah: out.length, produk: out.slice(0, 60) };
-    }
-  }
-  return { error: 'alat tidak dikenal' };
-}
-// Markdown sederhana -> HTML (tebal, miring, kode, daftar, tabel)
-function aiMd(t) {
-  const lines = chatEsc(String(t || '')).split('\n');
-  let html = '', inList = false, tbl = [];
-  const inline = s => s.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/(^|[^*])\*(?!\s)(.+?)\*/g, '$1<i>$2</i>').replace(/`([^`]+)`/g, '<code>$1</code>');
-  const flushTbl = () => {
-    if (!tbl.length) return;
-    const rows = tbl.filter(r => !/^\|?\s*:?-{2,}/.test(r.replace(/\|/g, '|').trim()));
-    html += '<table>' + rows.map((r, i) => '<tr>' + r.replace(/^\||\|$/g, '').split('|').map(c => { const v = inline(c.trim()); const num = /^[-+]?Rp?[\d.,]+%?$/.test(c.trim()); return i === 0 ? `<th${num ? ' class="r"' : ''}>${v}</th>` : `<td${num ? ' class="r"' : ''}>${v}</td>`; }).join('') + '</tr>').join('') + '</table>';
-    tbl = [];
-  };
-  lines.forEach(l => {
-    if (/^\s*\|.*\|\s*$/.test(l)) { if (inList) { html += '</ul>'; inList = false; } tbl.push(l.trim()); return; }
-    flushTbl();
-    const m = l.match(/^\s*[-*•]\s+(.*)$/) || l.match(/^\s*\d+[.)]\s+(.*)$/);
-    if (m) { if (!inList) { html += '<ul style="margin:4px 0 4px 16px;padding:0;">'; inList = true; } html += `<li>${inline(m[1])}</li>`; return; }
-    if (inList) { html += '</ul>'; inList = false; }
-    if (/^#{1,4}\s+/.test(l)) { html += `<div style="font-weight:800;margin-top:4px;">${inline(l.replace(/^#+\s+/, ''))}</div>`; return; }
-    html += l.trim() ? `<div>${inline(l)}</div>` : '<div style="height:6px"></div>';
-  });
-  flushTbl(); if (inList) html += '</ul>';
-  return html;
-}
-async function aiCall(contents) {
-  const r = await fetch(AI_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ systemInstruction: { parts: [{ text: aiGuide() }] }, contents, tools: AI_TOOLS }) });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) { const e = new Error(data.error || ('HTTP ' + r.status)); e.status = r.status; throw e; }
-  return data;
-}
-async function aiAsk(text) {
-  aiHistory.push({ role: 'user', parts: [{ text }] });
-  if (aiHistory.length > 30) aiHistory = aiHistory.slice(-30);
-  while (aiHistory.length && aiHistory[0].role !== 'user') aiHistory.shift();
-  for (let step = 0; step < 6; step++) {
-    const data = await aiCall(aiHistory);
-    const cand = data.candidates && data.candidates[0];
-    const content = cand && cand.content;
-    if (!content || !content.parts) {
-      const why = (data.promptFeedback && data.promptFeedback.blockReason) || (cand && cand.finishReason) || 'kosong';
-      throw new Error('Jawaban AI ' + why);
-    }
-    aiHistory.push(content); // simpan apa adanya (termasuk tanda tangan pemikiran) supaya percakapan nyambung
-    const calls = content.parts.filter(p => p.functionCall);
-    if (!calls.length) return content.parts.map(p => p.text || '').join('').trim();
-    const responses = calls.map(c => {
-      let result;
-      try { result = aiRunTool(c.functionCall.name, c.functionCall.args || {}); } catch (e) { result = { error: String(e.message || e) }; }
-      return { functionResponse: { name: c.functionCall.name, response: { result } } };
-    });
-    aiHistory.push({ role: 'user', parts: responses });
-  }
-  throw new Error('AI terlalu lama mencari data');
-}
-// Ganti alur kirim di tab Asisten: pakai AI, cadangan asisten cepat.
-const _chatSubmitLocal = chatSubmit;
-chatSubmit = function () {
-  if (chatTab !== 'ai' || aiMode !== 'ai') return _chatSubmitLocal();
-  const ta = document.getElementById('ch-text');
-  const text = ta.value.trim();
-  if (!text || aiBusy) return;
-  ta.value = ''; ta.style.height = 'auto';
-  chatAsk.push({ q: text });
-  const pending = { a: '<span style="color:#888">🤖 sedang mencari jawaban…</span>' };
-  chatAsk.push(pending);
-  chatRender();
-  aiBusy = true;
-  const n0 = aiHistory.length;
-  aiAsk(text).then(ans => {
-    pending.a = aiMd(ans || '(tidak ada jawaban)');
-  }).catch(err => {
-    let local = '';
-    try { local = chatAnswer(text); } catch (e) {}
-    const st = err && err.status;
-    const why = st === 429 ? 'batas gratis AI sedang habis' : (st === 500 && /GEMINI_API_KEY/.test(err.message) ? 'API key belum dipasang di Vercel' : (st === 404 ? 'AI belum dipasang di server' : 'AI tidak tersambung'));
-    pending.a = `<div style="font-size:11px;color:#B45309;margin-bottom:4px;">⚡ ${why} — dijawab pakai asisten cepat</div>${local}`;
-    aiHistory.length = Math.min(aiHistory.length, n0); // percakapan yang gagal tidak disimpan
-  }).finally(() => { aiBusy = false; chatRender(); });
-};
-// Tombol pilih mode di tab Asisten
-const _chatRenderBase = chatRender;
-chatRender = function () {
-  _chatRenderBase();
-  if (chatTab !== 'ai') return;
-  const sug = document.getElementById('ch-sug');
-  if (!sug || sug.querySelector('.ai-mode')) return;
-  const b = document.createElement('button');
-  b.className = 'ai-mode';
-  b.style.cssText = 'border-color:#4338CA;background:' + (aiMode === 'ai' ? '#4338CA;color:#fff' : '#fff;color:#4338CA');
-  b.textContent = aiMode === 'ai' ? '🤖 Mode AI (Gemini)' : '⚡ Mode cepat (offline)';
-  b.title = 'Klik untuk ganti mode';
-  b.addEventListener('click', e => { e.stopPropagation(); aiMode = aiMode === 'ai' ? 'cepat' : 'ai'; try { localStorage.setItem('gsj_ai_mode', aiMode); } catch (x) {} chatRender(); });
-  sug.insertBefore(b, sug.firstChild);
-  const ta = document.getElementById('ch-text');
-  if (ta && aiMode === 'ai') ta.placeholder = 'Tanya apa saja soal data & aplikasi…';
-};
 
 </script>
 </body>
