@@ -17064,5 +17064,219 @@ function chatAnswer(raw) {
 })();
 
 </script>
+<script>
+// ===== chat_ai.js =====
+// Asisten Data pakai AI (Google Gemini) lewat perantara Vercel /api/ai (API key aman di Vercel).
+// AI hanya bisa MEMBACA data lewat "alat" di bawah (dihitung di aplikasi, angkanya sama dengan yang tampil).
+// Kalau AI tidak tersambung / batas gratis habis -> otomatis jawab pakai asisten cepat (offline).
+const AI_ENDPOINT = '/api/ai';
+let aiHistory = [], aiBusy = false;
+let aiMode = (localStorage.getItem('gsj_ai_mode') || 'ai'); // 'ai' | 'cepat'
+
+function aiGuide() {
+  const today = (typeof todayISO === 'function') ? todayISO() : new Date().toISOString().slice(0, 10);
+  const user = (typeof gsjCurrentUser !== 'undefined' && gsjCurrentUser) ? `${gsjCurrentUser.name} (${gsjCurrentUser.role || ''})` : '';
+  return `Kamu adalah "Asisten Data" di aplikasi internal "Manajemen Stok & Pembukuan" milik H&H Gloves (distributor alat kesehatan online).
+Hari ini ${today}. Yang bertanya: ${user}. Jawab dalam bahasa Indonesia santai, singkat, langsung ke inti. Pakai angka format Indonesia (titik ribuan, Rp).
+
+ATURAN PENTING:
+- Untuk SEMUA angka (stok, penjualan, faktur, modal, total) WAJIB pakai alat (function) yang tersedia. Jangan pernah mengarang angka.
+- Kalau nama produk tidak jelas, pakai alat cari_produk dulu, lalu pakai nama persis hasilnya.
+- Kamu hanya bisa MEMBACA data. Kalau diminta mengubah/menghapus/input data, jelaskan langkahnya di aplikasi (menu mana, klik apa).
+- Kalau datanya tidak ada atau alat tidak bisa menjawab, bilang terus terang.
+- Tabel boleh pakai format markdown sederhana (| kolom | kolom |) kalau datanya banyak.
+
+TENTANG BISNIS & APLIKASI:
+- 3 entitas: GSM = PT Gracia Sukses Medika (Gracia), HNH = H&H Medical Supplies, GSJ = PT Glomed Sukses Jaya (Glomed). Di data, entitas ditulis "Gracia", "HNH", "Glomed".
+- Jualan di Shopee, Tokopedia, TikTok Shop. Toko: HNH (toko utama), GM = GloveMart, MD/M = Medident. Penjualan WA dan Faktur Pajak dicatat terpisah.
+- Menu: Invoice Masuk (faktur pembelian dari supplier: Faktur / Nota / Surat Jalan; ada Faktur Baru & Riwayat Faktur), Import Marketplace (upload file pesanan marketplace -> jadi Stok Terjual), Stok Terjual (rekap penjualan harian per entitas, Rekap 1-15 & 16-31), Sisa Stok (stok sekarang & nilai stok), Master Produk (pemetaan nama produk marketplace -> nama internal, entitas tetap), Produk Baru (nama produk yang belum dipetakan), Invoice ke Glomed (GSM & H&H menagih GSJ per periode 1-15 / 16-akhir bulan), Total Omset.
+- Urutan potong stok penjualan: GSM dulu -> HNH -> GSJ -> kalau semua kosong, dibebankan ke HNH dengan "tambah stok otomatis" (auto top-up). Penjualan yang dipilih manual tidak diubah.
+- Stok Awal = hasil stok opname fisik (per tanggal, mis. 30 Sep 2026). Penjualan & faktur sebelum/sama dengan tanggal Stok Awal terbaru sudah termasuk di angka fisik itu, jadi tidak dihitung ulang.
+- Tanggal stok masuk: Faktur ikut tanggal faktur; Nota & Surat Jalan ikut tanggal barang diterima.
+- Harga modal: dari Invoice Masuk = harga bersih per unit setelah diskon item & diskon global, termasuk PPN. Kalau ada "harga modal manual" (import), angka manual itu yang dipakai.
+- Invoice ke Glomed: hanya qty marketplace (Shopee+Tokopedia+TikTok, termasuk GM & MD; WA tidak dihitung). Harga = modal + markup Rp1.000/unit. Invoice H&H tanpa PPN; GSM pakai PPN 11%. Periode 1-15 dan 16-akhir bulan.
+- Bubble wrap & Biohazard 80x60 tidak ditagihkan di invoice H&H ke Glomed.
+- Data tersinkron antar laptop lewat server (Supabase). Ada Chat Tim untuk ngobrol antar admin.`;
+}
+
+const AI_TOOLS = [{
+  functionDeclarations: [
+    { name: 'cari_produk', description: 'Cari nama produk yang cocok dari katalog semua entitas. Pakai ini kalau nama produk dari user tidak persis.', parameters: { type: 'OBJECT', properties: { kata: { type: 'STRING', description: 'kata kunci nama produk' } }, required: ['kata'] } },
+    { name: 'cek_stok', description: 'Stok saat ini per entitas untuk produk yang cocok dengan kata kunci.', parameters: { type: 'OBJECT', properties: { produk: { type: 'STRING' }, entitas: { type: 'STRING', description: 'Gracia | HNH | Glomed (kosongkan = semua)' } }, required: ['produk'] } },
+    { name: 'penjualan', description: 'Jumlah barang terjual (qty) per produk & entitas dalam rentang tanggal. Bisa difilter produk & entitas. Juga memberi total per toko/marketplace.', parameters: { type: 'OBJECT', properties: { dari: { type: 'STRING', description: 'YYYY-MM-DD' }, sampai: { type: 'STRING', description: 'YYYY-MM-DD' }, entitas: { type: 'STRING' }, produk: { type: 'STRING', description: 'opsional, kata kunci produk' }, limit: { type: 'NUMBER', description: 'maks baris produk (default 30)' } }, required: ['dari', 'sampai'] } },
+    { name: 'daftar_faktur', description: 'Daftar faktur pembelian (Invoice Masuk). Filter tanggal faktur, entitas, status bayar, kata (supplier/no faktur/nama barang).', parameters: { type: 'OBJECT', properties: { dari: { type: 'STRING' }, sampai: { type: 'STRING' }, entitas: { type: 'STRING' }, status: { type: 'STRING', description: 'Lunas | Belum Lunas | DP Sebagian | belum_lunas_semua' }, kata: { type: 'STRING' } } } },
+    { name: 'harga_modal', description: 'Harga modal per unit produk per entitas (opsional untuk periode tertentu).', parameters: { type: 'OBJECT', properties: { produk: { type: 'STRING' }, entitas: { type: 'STRING' }, dari: { type: 'STRING' }, sampai: { type: 'STRING' } }, required: ['produk'] } },
+    { name: 'total_pembayaran', description: 'Total tagihan Invoice ke Glomed (GSM atau HNH) untuk satu periode.', parameters: { type: 'OBJECT', properties: { penjual: { type: 'STRING', description: 'GSM | HNH' }, tahun: { type: 'NUMBER' }, bulan: { type: 'NUMBER', description: '1-12' }, periode: { type: 'NUMBER', description: '1 = tgl 1-15, 2 = tgl 16-akhir' } }, required: ['penjual', 'tahun', 'bulan', 'periode'] } },
+    { name: 'stok_kritis', description: 'Produk dengan stok minus, habis (0), atau menipis (<= batas).', parameters: { type: 'OBJECT', properties: { tipe: { type: 'STRING', description: 'minus | habis | menipis' }, entitas: { type: 'STRING' }, batas: { type: 'NUMBER', description: 'untuk menipis, default 5' } }, required: ['tipe'] } },
+  ],
+}];
+
+function aiEnt(e) {
+  if (!e) return null;
+  const s = String(e).toLowerCase();
+  if (/gsm|gracia/.test(s)) return 'Gracia';
+  if (/hnh|h&h/.test(s)) return 'HNH';
+  if (/gsj|glomed/.test(s)) return 'Glomed';
+  return null;
+}
+function aiRunTool(name, a) {
+  a = a || {};
+  const ent = aiEnt(a.entitas);
+  const ents = ent ? [ent] : ENTITIES;
+  const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
+  switch (name) {
+    case 'cari_produk': return { hasil: chFindProducts(String(a.kata || ''), 15) };
+    case 'cek_stok': {
+      const prods = chFindProducts(String(a.produk || ''), 8);
+      const st = {}; ents.forEach(e => st[e] = chStockNow(e));
+      return { produk: prods.map(p => ({ nama: p, stok: Object.fromEntries(ents.map(e => { const v = st[e][normalizeName(p)]; return [e, v ? v.qty : null]; })) })), catatan: prods.length ? '' : 'produk tidak ditemukan' };
+    }
+    case 'penjualan': {
+      const want = a.produk ? new Set(chFindProducts(String(a.produk), 10).map(normalizeName)) : null;
+      const agg = {}, perEnt = {}, perToko = {};
+      let total = 0;
+      (state.checkerRows || []).forEach(r => {
+        if (!r.tanggal || r.tanggal < a.dari || r.tanggal > a.sampai || !ents.includes(r.entitas)) return;
+        const k = normalizeName(r.nama);
+        if (want && !want.has(k)) return;
+        const q = Number(r.qtyInternal != null ? r.qtyInternal : r.qty) || 0;
+        const x = agg[k] || (agg[k] = { nama: r.nama, total: 0, per_entitas: {} });
+        x.total += q; x.per_entitas[r.entitas] = (x.per_entitas[r.entitas] || 0) + q;
+        perEnt[r.entitas] = (perEnt[r.entitas] || 0) + q;
+        let toko = '?'; try { toko = classifyRowForPivot(r); } catch (e) {}
+        perToko[toko] = (perToko[toko] || 0) + q;
+        total += q;
+      });
+      const list = Object.values(agg).sort((x, y) => y.total - x.total);
+      return { dari: a.dari, sampai: a.sampai, total_qty: total, per_entitas: perEnt, per_toko: perToko, jumlah_produk: list.length, produk: list.slice(0, Math.min(80, Number(a.limit) || 30)) };
+    }
+    case 'daftar_faktur': {
+      let list = (state.invoices || []).slice();
+      if (ent) list = list.filter(i => i.entitas === ent);
+      if (a.dari) list = list.filter(i => (i.tanggalDokumen || i.tanggal) >= a.dari);
+      if (a.sampai) list = list.filter(i => (i.tanggalDokumen || i.tanggal) <= a.sampai);
+      if (a.status === 'belum_lunas_semua') list = list.filter(i => i.statusBayar !== 'Lunas');
+      else if (a.status) list = list.filter(i => (i.statusBayar || '').toLowerCase() === String(a.status).toLowerCase());
+      if (a.kata) { const w = chToks(a.kata); list = list.filter(i => { const h = normalizeName([i.supplier, i.sumberBeli, i.noFaktur, i.catatan, ...(i.items || []).map(it => it.nama)].join(' ')); return w.every(t => h.includes(t)); }); }
+      list.sort((x, y) => ((y.tanggalDokumen || y.tanggal) > (x.tanggalDokumen || x.tanggal) ? 1 : -1));
+      return { jumlah: list.length, total_nilai: r2(list.reduce((s, i) => s + (Number(i.grandTotal) || 0), 0)), faktur: list.slice(0, 30).map(i => ({ tanggal_faktur: i.tanggalDokumen || i.tanggal, diterima: i.tanggal, entitas: i.entitas, jenis: i.jenisDokumen, supplier: i.supplier || i.sumberBeli, no: i.noFaktur || '', status: i.statusBayar, jatuh_tempo: i.jatuhTempo || '', total: r2(i.grandTotal), barang: (i.items || []).slice(0, 8).map(it => `${it.nama} x${it.qty} ${it.satuan || ''}`) })) };
+    }
+    case 'harga_modal': {
+      const prods = chFindProducts(String(a.produk || ''), 5);
+      const rg = a.dari && a.sampai ? { from: a.dari, to: a.sampai } : null;
+      return { produk: prods.map(p => ({ nama: p, modal: Object.fromEntries(ents.map(e => [e, r2(chModal(e, p, rg))])) })) };
+    }
+    case 'total_pembayaran': {
+      const sk = /gsm|gracia/i.test(a.penjual) ? 'GSM' : 'HNH';
+      const r = t8Recap(sk, Number(a.tahun), Number(a.bulan), Number(a.periode) === 2 ? 2 : 1);
+      return { penjual: sk, dari: r.dari, sampai: r.sampai, total_qty: (r.items || []).reduce((s, x) => s + (x.qty || 0), 0), subtotal: r2(r.subtotal), ppn: r2(r.ppn), total: r2(r.total), jumlah_produk: (r.items || []).length, dikecualikan: r.excluded || [], produk_teratas: (r.items || []).slice().sort((x, y) => y.jumlah - x.jumlah).slice(0, 10).map(x => ({ nama: x.nama, qty: x.qty, harga: x.harga, jumlah: r2(x.jumlah) })) };
+    }
+    case 'stok_kritis': {
+      const out = [];
+      const lim = Number(a.batas) || 5;
+      ents.forEach(e => { Object.values(chStockNow(e)).forEach(v => { const ok = a.tipe === 'minus' ? v.qty < 0 : a.tipe === 'habis' ? v.qty === 0 : (v.qty > 0 && v.qty <= lim); if (ok) out.push({ entitas: e, nama: v.nama, stok: v.qty }); }); });
+      out.sort((x, y) => x.stok - y.stok);
+      return { jumlah: out.length, produk: out.slice(0, 60) };
+    }
+  }
+  return { error: 'alat tidak dikenal' };
+}
+// Markdown sederhana -> HTML (tebal, miring, kode, daftar, tabel)
+function aiMd(t) {
+  const lines = chatEsc(String(t || '')).split('\n');
+  let html = '', inList = false, tbl = [];
+  const inline = s => s.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/(^|[^*])\*(?!\s)(.+?)\*/g, '$1<i>$2</i>').replace(/`([^`]+)`/g, '<code>$1</code>');
+  const flushTbl = () => {
+    if (!tbl.length) return;
+    const rows = tbl.filter(r => !/^\|?\s*:?-{2,}/.test(r.replace(/\|/g, '|').trim()));
+    html += '<table>' + rows.map((r, i) => '<tr>' + r.replace(/^\||\|$/g, '').split('|').map(c => { const v = inline(c.trim()); const num = /^[-+]?Rp?[\d.,]+%?$/.test(c.trim()); return i === 0 ? `<th${num ? ' class="r"' : ''}>${v}</th>` : `<td${num ? ' class="r"' : ''}>${v}</td>`; }).join('') + '</tr>').join('') + '</table>';
+    tbl = [];
+  };
+  lines.forEach(l => {
+    if (/^\s*\|.*\|\s*$/.test(l)) { if (inList) { html += '</ul>'; inList = false; } tbl.push(l.trim()); return; }
+    flushTbl();
+    const m = l.match(/^\s*[-*•]\s+(.*)$/) || l.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (m) { if (!inList) { html += '<ul style="margin:4px 0 4px 16px;padding:0;">'; inList = true; } html += `<li>${inline(m[1])}</li>`; return; }
+    if (inList) { html += '</ul>'; inList = false; }
+    if (/^#{1,4}\s+/.test(l)) { html += `<div style="font-weight:800;margin-top:4px;">${inline(l.replace(/^#+\s+/, ''))}</div>`; return; }
+    html += l.trim() ? `<div>${inline(l)}</div>` : '<div style="height:6px"></div>';
+  });
+  flushTbl(); if (inList) html += '</ul>';
+  return html;
+}
+async function aiCall(contents) {
+  const r = await fetch(AI_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ systemInstruction: { parts: [{ text: aiGuide() }] }, contents, tools: AI_TOOLS }) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(data.error || ('HTTP ' + r.status)); e.status = r.status; throw e; }
+  return data;
+}
+async function aiAsk(text) {
+  aiHistory.push({ role: 'user', parts: [{ text }] });
+  if (aiHistory.length > 30) aiHistory = aiHistory.slice(-30);
+  while (aiHistory.length && aiHistory[0].role !== 'user') aiHistory.shift();
+  for (let step = 0; step < 6; step++) {
+    const data = await aiCall(aiHistory);
+    const cand = data.candidates && data.candidates[0];
+    const content = cand && cand.content;
+    if (!content || !content.parts) {
+      const why = (data.promptFeedback && data.promptFeedback.blockReason) || (cand && cand.finishReason) || 'kosong';
+      throw new Error('Jawaban AI ' + why);
+    }
+    aiHistory.push(content); // simpan apa adanya (termasuk tanda tangan pemikiran) supaya percakapan nyambung
+    const calls = content.parts.filter(p => p.functionCall);
+    if (!calls.length) return content.parts.map(p => p.text || '').join('').trim();
+    const responses = calls.map(c => {
+      let result;
+      try { result = aiRunTool(c.functionCall.name, c.functionCall.args || {}); } catch (e) { result = { error: String(e.message || e) }; }
+      return { functionResponse: { name: c.functionCall.name, response: { result } } };
+    });
+    aiHistory.push({ role: 'user', parts: responses });
+  }
+  throw new Error('AI terlalu lama mencari data');
+}
+// Ganti alur kirim di tab Asisten: pakai AI, cadangan asisten cepat.
+const _chatSubmitLocal = chatSubmit;
+chatSubmit = function () {
+  if (chatTab !== 'ai' || aiMode !== 'ai') return _chatSubmitLocal();
+  const ta = document.getElementById('ch-text');
+  const text = ta.value.trim();
+  if (!text || aiBusy) return;
+  ta.value = ''; ta.style.height = 'auto';
+  chatAsk.push({ q: text });
+  const pending = { a: '<span style="color:#888">🤖 sedang mencari jawaban…</span>' };
+  chatAsk.push(pending);
+  chatRender();
+  aiBusy = true;
+  const n0 = aiHistory.length;
+  aiAsk(text).then(ans => {
+    pending.a = aiMd(ans || '(tidak ada jawaban)');
+  }).catch(err => {
+    let local = '';
+    try { local = chatAnswer(text); } catch (e) {}
+    const st = err && err.status;
+    const why = st === 429 ? 'batas gratis AI sedang habis' : (st === 500 && /GEMINI_API_KEY/.test(err.message) ? 'API key belum dipasang di Vercel' : (st === 404 ? 'AI belum dipasang di server' : 'AI tidak tersambung'));
+    pending.a = `<div style="font-size:11px;color:#B45309;margin-bottom:4px;">⚡ ${why} — dijawab pakai asisten cepat</div>${local}`;
+    aiHistory.length = Math.min(aiHistory.length, n0); // percakapan yang gagal tidak disimpan
+  }).finally(() => { aiBusy = false; chatRender(); });
+};
+// Tombol pilih mode di tab Asisten
+const _chatRenderBase = chatRender;
+chatRender = function () {
+  _chatRenderBase();
+  if (chatTab !== 'ai') return;
+  const sug = document.getElementById('ch-sug');
+  if (!sug || sug.querySelector('.ai-mode')) return;
+  const b = document.createElement('button');
+  b.className = 'ai-mode';
+  b.style.cssText = 'border-color:#4338CA;background:' + (aiMode === 'ai' ? '#4338CA;color:#fff' : '#fff;color:#4338CA');
+  b.textContent = aiMode === 'ai' ? '🤖 Mode AI (Gemini)' : '⚡ Mode cepat (offline)';
+  b.title = 'Klik untuk ganti mode';
+  b.addEventListener('click', e => { e.stopPropagation(); aiMode = aiMode === 'ai' ? 'cepat' : 'ai'; try { localStorage.setItem('gsj_ai_mode', aiMode); } catch (x) {} chatRender(); });
+  sug.insertBefore(b, sug.firstChild);
+  const ta = document.getElementById('ch-text');
+  if (ta && aiMode === 'ai') ta.placeholder = 'Tanya apa saja soal data & aplikasi…';
+};
+
+</script>
 </body>
 </html>
