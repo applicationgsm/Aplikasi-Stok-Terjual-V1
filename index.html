@@ -946,8 +946,8 @@ function setUserName(name) {
 }
 
 const STATUS_BAYAR_OPTIONS = ['Lunas', 'Belum Lunas', 'DP Sebagian'];
-const JENIS_DOKUMEN_OPTIONS = ['Faktur', 'Nota', 'Surat Jalan'];
-const JENIS_DOKUMEN_ICON = { 'Faktur': '🧾', 'Nota': '📝', 'Surat Jalan': '🚚' };
+const JENIS_DOKUMEN_OPTIONS = ['Faktur', 'Nota', 'Surat Jalan', 'Tanpa Dokumen'];
+const JENIS_DOKUMEN_ICON = { 'Faktur': '🧾', 'Nota': '📝', 'Surat Jalan': '🚚', 'Tanpa Dokumen': '📦' };
 // Beli di marketplace (Shopee/Tokopedia/TikTok Shop) TIDAK PERNAH pakai Surat Jalan — buktinya
 // nota/invoice pesanan marketplace. Kalau terlanjur dipilih "Surat Jalan", otomatis jadi "Nota"
 // (aturan tanggal stok Nota = Surat Jalan = Tanggal Barang Diterima, jadi stok TIDAK berubah).
@@ -1868,7 +1868,7 @@ function highlightMatch(text, query) {
   return `${escapeAttr(before)}<b style="color:var(--accent-dark);">${escapeAttr(match)}</b>${escapeAttr(after)}`;
 }
 
-function bindGenericAutocomplete(input, getMatches, onSelect) {
+function bindGenericAutocomplete(input, getMatches, onSelect, acOpts) {
   let debounceTimer = null;
   const showResults = () => {
     closeGenericDropdown();
@@ -1898,7 +1898,7 @@ function bindGenericAutocomplete(input, getMatches, onSelect) {
         const opt = document.createElement('div');
         opt.className = 'generic-ac-option';
         opt.dataset.val = val;
-        opt.innerHTML = highlightMatch(val, query);
+        opt.innerHTML = highlightMatch(val, query) + (acOpts && acOpts.tag ? acOpts.tag(val) : '');
         opt.style.cssText = 'padding:9px 12px; font-size:13.5px; cursor:pointer; border-radius:7px; transition:background .1s;';
         opt.addEventListener('mouseenter', () => opt.style.background = '#F0F1FE');
         opt.addEventListener('mouseleave', () => opt.style.background = '');
@@ -3872,6 +3872,22 @@ function getNamaInternalCatalog() {
 // ============================================================
 
 let currentInvoiceItems = []; // temp line-items while building a new invoice
+// Pilihan terakhir di form Faktur Baru (entitas + tanggal), disimpan per browser & hanya berlaku hari yang sama.
+const F1_LAST_KEY = 'gsj_f1_last_v1';
+function f1LastPref(k) {
+  try {
+    const o = JSON.parse(localStorage.getItem(F1_LAST_KEY) || 'null');
+    if (!o || o.day !== todayISO()) return '';
+    return o[k] || '';
+  } catch (e) { return ''; }
+}
+function f1SaveLastPref(o) {
+  try {
+    let cur = JSON.parse(localStorage.getItem(F1_LAST_KEY) || 'null');
+    if (!cur || cur.day !== todayISO()) cur = {};
+    localStorage.setItem(F1_LAST_KEY, JSON.stringify(Object.assign(cur, o, { day: todayISO() })));
+  } catch (e) {}
+}
 let tab1EntityFilter = 'Semua';
 let expandedInvoiceIds = new Set();
 let tab1SubView = 'baru'; // 'baru' | 'riwayat' — matches the reference layout's two-view toggle
@@ -3907,11 +3923,11 @@ function renderTab1FakturBaru() {
         <p class="desc">Isi info faktur dulu, lalu tambahkan barang-barangnya satu per satu (satu faktur boleh banyak barang), baru simpan.</p>
 
         <div class="form-grid">
-          <div class="field"><label>Tanggal Barang Diterima</label><input type="date" id="f1-tanggal" value="${todayISO()}"></div>
-          <div class="field"><label id="f1-tanggaldok-label">Tanggal Dokumen</label><input type="date" id="f1-tanggaldok" value="${todayISO()}"><span id="f1-bedabulan-badge"></span></div>
+          <div class="field"><label>Tanggal Barang Diterima</label><input type="date" id="f1-tanggal" value="${f1LastPref('tanggal') || todayISO()}"></div>
+          <div class="field"><label id="f1-tanggaldok-label">Tanggal Dokumen</label><input type="date" id="f1-tanggaldok" value="${f1LastPref('tanggalDokumen') || f1LastPref('tanggal') || todayISO()}"><span id="f1-bedabulan-badge"></span></div>
           <div class="field">
             <label>Entitas</label>
-            <select id="f1-entitas">${ENTITIES.map(e => `<option value="${e}">${ENTITY_LABEL[e]}</option>`).join('')}</select>
+            <select id="f1-entitas">${ENTITIES.map(e => `<option value="${e}" ${f1LastPref('entitas') === e ? 'selected' : ''}>${ENTITY_LABEL[e]}</option>`).join('')}</select>
           </div>
           <div class="field">
             <label>Jenis Dokumen</label>
@@ -4042,6 +4058,7 @@ function renderTab1FakturBaru() {
       hint.innerHTML = '';
     }
   }
+  document.getElementById('f1-tanggal').addEventListener('change', () => { if (document.getElementById('f1-jenisdok').value === 'Tanpa Dokumen') document.getElementById('f1-tanggaldok').value = document.getElementById('f1-tanggal').value; });
   document.getElementById('f1-tanggal').addEventListener('change', updateTanggalHint);
   document.getElementById('f1-tanggaldok').addEventListener('change', updateTanggalHint);
 
@@ -4052,7 +4069,10 @@ function renderTab1FakturBaru() {
     const isMarketplace = sumber !== 'Supplier';
     const nofakturLabel = document.getElementById('f1-nofaktur-wrap').querySelector('label');
     const nofakturInput = document.getElementById('f1-nofaktur');
-    if (isSuratJalan) {
+    if (jenis === 'Tanpa Dokumen') {
+      nofakturLabel.textContent = isMarketplace ? 'No. Pesanan / Resi (opsional)' : 'No. Referensi (opsional)';
+      nofakturInput.placeholder = isMarketplace ? 'cth: 2608xxxxxxxxxx (boleh kosong)' : 'boleh dikosongkan';
+    } else if (isSuratJalan) {
       nofakturLabel.textContent = 'No. Surat Jalan (opsional)';
       nofakturInput.placeholder = 'kosongkan kalau cuma terima barang tanpa nomor apapun';
     } else if (isMarketplace) {
@@ -4068,6 +4088,15 @@ function renderTab1FakturBaru() {
     const jenis = document.getElementById('f1-jenisdok').value;
     const hint = document.getElementById('f1-jenisdok-hint');
     document.getElementById('f1-tanggaldok-label').textContent = jenis === 'Surat Jalan' ? 'Tanggal Surat Jalan' : 'Tanggal Faktur/Invoice';
+    // Tanpa Dokumen: tidak ada tanggal faktur -> kolomnya disembunyikan, ikut tanggal barang diterima
+    const tdWrap = document.getElementById('f1-tanggaldok') && document.getElementById('f1-tanggaldok').closest('.field');
+    if (tdWrap) tdWrap.style.display = jenis === 'Tanpa Dokumen' ? 'none' : '';
+    if (jenis === 'Tanpa Dokumen') document.getElementById('f1-tanggaldok').value = document.getElementById('f1-tanggal').value;
+    if (jenis === 'Tanpa Dokumen') {
+      hint.innerHTML = '';
+      updateNoFakturLabel();
+      return;
+    }
     hint.innerHTML = jenis === 'Surat Jalan'
       ? `<div class="msg" style="background:#F0F3FA;color:var(--ink);border:1px solid var(--line);">🚚 <b>Surat Jalan</b> — buat barang yang datang cuma disertai surat jalan (atau bahkan tanpa nomor apapun, cuma barangnya aja), berlaku di Gracia, HNH, maupun Glomed. No. dokumen boleh dikosongin, tapi <b>"Tanggal Barang Diterima" di atas wajib diisi sesuai tanggal barangnya beneran datang</b> — itu yang dipakai buat hitung stok. Kalau nanti faktur resminya nyusul (biasanya beda bulan), tinggal edit lagi di Riwayat Faktur: isi "Tanggal Dokumen"-nya dan ganti Jenis Dokumen jadi "Faktur".</div>`
       : '';
@@ -4172,7 +4201,11 @@ function renderTab1FakturBaru() {
   // ngetik ulang "Pcs"/"Box"/dll setiap kali.
   bindSatuanAutofill(document.getElementById('f1-item-nama'), document.getElementById('f1-item-satuan'), () => document.getElementById('f1-entitas').value);
   document.getElementById('f1-entitas').addEventListener('change', () => { const n = document.getElementById('f1-item-nama'); if (n && n._satuanRefresh) n._satuanRefresh(); });
-  bindGenericAutocomplete(document.getElementById('f1-item-nama'), (q) => searchInternalProductNames(q, 40));
+  // Pilihan entitas & tanggal langsung diingat (pindah ke Riwayat lalu balik lagi tidak kembali ke GSM / hari ini)
+  document.getElementById('f1-entitas').addEventListener('change', () => f1SaveLastPref({ entitas: document.getElementById('f1-entitas').value }));
+  document.getElementById('f1-tanggal').addEventListener('change', () => f1SaveLastPref({ tanggal: document.getElementById('f1-tanggal').value }));
+  document.getElementById('f1-tanggaldok').addEventListener('change', () => f1SaveLastPref({ tanggalDokumen: document.getElementById('f1-tanggaldok').value }));
+  bindGenericAutocomplete(document.getElementById('f1-item-nama'), (q) => invItemNameSuggest(q, document.getElementById('f1-entitas').value, 40), null, { tag: (v) => invItemTag(v, document.getElementById('f1-entitas').value) });
   bindGenericAutocomplete(document.getElementById('f1-supplier'), (q) => searchSupplierNames(q, 40));
   bindGenericAutocomplete(document.getElementById('f1-item-satuan'), (q) => {
     const opts = getKnownSatuanList();
@@ -4565,6 +4598,16 @@ function addCurrentInvoiceItem() {
   const diskonMode = document.getElementById('f1-item-diskon-mode').value;
   if (!nama) { alert('Nama barang wajib diisi.'); return; }
   if (qty <= 0) { alert('Qty harus lebih dari 0.'); return; }
+  // Nama belum ada di Stok Terjual entitas ini -> konfirmasi dulu (sering cuma beda tulisan dari produk yang sudah ada)
+  const _ent = document.getElementById('f1-entitas').value;
+  if (!addCurrentInvoiceItem._ok && typeof invNameInEnt === 'function' && !invNameInEnt(nama, _ent)) {
+    invConfirmNewName(nama, _ent, (finalName) => {
+      document.getElementById('f1-item-nama').value = finalName;
+      addCurrentInvoiceItem._ok = true;
+      try { addCurrentInvoiceItem(); } finally { addCurrentInvoiceItem._ok = false; }
+    });
+    return;
+  }
 
   // Kalau nama ini benar-benar baru (belum pernah dipakai di Master Produk manapun atau
   // faktur manapun sebelumnya), tawarkan untuk didaftarkan sebagai Barang Baru — supaya
@@ -4634,10 +4677,10 @@ function renderCurrentItemsTable() {
 
 function submitInvoice() {
   const tanggal = document.getElementById('f1-tanggal').value || todayISO();
-  const tanggalDokumen = document.getElementById('f1-tanggaldok').value || tanggal;
   const entitas = document.getElementById('f1-entitas').value;
   const sumberBeli = document.getElementById('f1-sumberbeli').value;
   const jenisDokumen = normalizeJenisDokumen(document.getElementById('f1-jenisdok').value, sumberBeli);
+  const tanggalDokumen = jenisDokumen === 'Tanpa Dokumen' ? tanggal : (document.getElementById('f1-tanggaldok').value || tanggal);
   const supplier = document.getElementById('f1-supplier').value.trim();
   const noFaktur = document.getElementById('f1-nofaktur').value.trim();
   const statusBayar = document.getElementById('f1-statusbayar').value;
@@ -4686,13 +4729,15 @@ function submitInvoice() {
   if (typeof gsjRecomputeAfterInvoice === 'function') gsjRecomputeAfterInvoice(); saveStateOnly(gsjInvSaveKeys());
   const _ifpMoved = [];
   state.checkerRows.forEach(r => { const b = _ifpEntBefore.get(r.id); if (b && b !== r.entitas) _ifpMoved.push({ nama: r.nama, from: b, to: r.entitas, qty: Number(r.qtyInternal || r.qty) || 0, tanggal: r.tanggal }); });
-  const _ifpSaved = { tanggal, tanggalDokumen, tanggalStok, entitas, jenisDokumen, sumberBeli, supplier, noFaktur, statusBayar, grandTotal: summary.grandTotal, items: currentInvoiceItems.map(it => ({ ...it })), moved: _ifpMoved };
+  const _ifpSaved = { id: (state.invoices[state.invoices.length - 1] || {}).id, tanggal, tanggalDokumen, tanggalStok, entitas, jenisDokumen, sumberBeli, supplier, noFaktur, statusBayar, grandTotal: summary.grandTotal, items: currentInvoiceItems.map(it => ({ ...it })), moved: _ifpMoved };
 
   const totalBarang = currentInvoiceItems.length;
   const sumberNote = sumberBeli !== 'Supplier' ? ` via ${sumberBeli}` : '';
   const bedaBulanNote = bulanKey(tanggal) !== bulanKey(tanggalDokumen) ? ` (barang diterima ${dateLabelID(tanggal)}, dokumen ${dateLabelID(tanggalDokumen)} — beda bulan, sudah ditandai)` : '';
   msgEl.innerHTML = `<div class="msg ok">${JENIS_DOKUMEN_ICON[jenisDokumen]} ${jenisDokumen} ${noFaktur ? `"${noFaktur}" ` : ''}tersimpan dengan ${totalBarang} jenis barang ke ${ENTITY_LABEL[entitas]}${sumberNote}. Stok otomatis ke-update per tanggal ${dateLabelID(tanggalStok)}.${bedaBulanNote}</div>`;
 
+  // Entitas & tanggal yang barusan dipakai diingat untuk faktur berikutnya (berlaku sampai ganti hari)
+  f1SaveLastPref({ entitas, tanggal, tanggalDokumen: jenisDokumen === 'Tanpa Dokumen' ? '' : tanggalDokumen });
   // reset form
   if (typeof ifxDraftClear === 'function') ifxDraftClear();
   currentInvoiceItems = [];
@@ -5084,7 +5129,7 @@ function invMasukInvoiceValue(inv, key, no, entCfg) {
     case 'perusahaanGlomed': return INV_MASUK_MARKETPLACE.includes(inv.sumberBeli) ? 'Marketplace' : (inv.supplier || '-');
     case 'sumber': return INV_MASUK_MARKETPLACE.includes(inv.sumberBeli) ? inv.sumberBeli : (inv.sumberBeli === 'Lainnya' ? 'Lainnya' : 'Via Supplier');
     case 'tgl': return invMasukExcelDate(invMasukTanggalFaktur(inv));
-    case 'noInv': return isSJ ? (inv.noFaktur ? `SURAT JALAN ${inv.noFaktur}` : 'SURAT JALAN') : (inv.noFaktur || '-'); // marketplace: no. pesanan atau "-" (format rekap manual)
+    case 'noInv': return isSJ ? (inv.noFaktur ? `SURAT JALAN ${inv.noFaktur}` : 'SURAT JALAN') : ((inv.jenisDokumen === 'Tanpa Dokumen' && !isMP) ? (inv.noFaktur ? `TANPA DOKUMEN ${inv.noFaktur}` : 'TANPA DOKUMEN') : (inv.noFaktur || '-')); // marketplace: no. pesanan atau "-" (format rekap manual)
     case 'total': return total > 0 ? total : (entCfg.fileTag === 'JOSEPHINE' ? '-' : null);
     case 'ketGracia': {
       const itemList = isSJ ? (inv.items || []).map(it => it.nama).filter(Boolean).join(', ') : '';
@@ -5511,6 +5556,7 @@ function bindInvoiceCardEvents(wrap) {
           else inv.tanggalLunas = '';
         }
         if (field === 'sumberBeli' || field === 'jenisDokumen') inv.jenisDokumen = normalizeJenisDokumen(inv.jenisDokumen, inv.sumberBeli);
+        if (inv.jenisDokumen === 'Tanpa Dokumen' && (field === 'jenisDokumen' || field === 'tanggal')) inv.tanggalDokumen = inv.tanggal; // tanpa dokumen: ikut tanggal diterima
         if (field === 'tanggal' || field === 'tanggalDokumen' || field === 'jenisDokumen' || field === 'sumberBeli') {
           inv.tanggalStok = inv.jenisDokumen === 'Faktur' ? (inv.tanggalDokumen || inv.tanggal) : inv.tanggal;
         }
@@ -5525,7 +5571,8 @@ function bindInvoiceCardEvents(wrap) {
 
     bindSumberBeliDropdown(`f1-sumberbeli-riwayat-${invId}`);
     const newItemNamaInput = card.querySelector('[data-newitem="nama"]');
-    if (newItemNamaInput) bindGenericAutocomplete(newItemNamaInput, (q) => searchInternalProductNames(q, 40));
+    const _invEnt = () => { const iv = state.invoices.find(x => x.id === invId); return iv ? iv.entitas : ''; };
+    if (newItemNamaInput) bindGenericAutocomplete(newItemNamaInput, (q) => invItemNameSuggest(q, _invEnt(), 40), null, { tag: (v) => invItemTag(v, _invEnt()) });
     const newItemSatuanInput = card.querySelector('[data-newitem="satuan"]');
     if (newItemNamaInput && newItemSatuanInput) bindSatuanAutofill(newItemNamaInput, newItemSatuanInput, () => { const iv = state.invoices.find(x => x.id === invId); return iv ? iv.entitas : null; });
     if (newItemSatuanInput) bindGenericAutocomplete(newItemSatuanInput, (q) => {
@@ -5603,6 +5650,14 @@ function bindInvoiceCardEvents(wrap) {
       const diskonValue = parseRibuan(card.querySelector('[data-newitem="diskon"]')?.value || '0');
       const diskonMode = card.querySelector('[data-newitem="diskonmode"]')?.value || 'persen';
       if (!nama || qty <= 0) { ifpShowError('Barang belum lengkap', [!nama ? 'Nama barang belum diisi.' : '', qty <= 0 ? 'Qty harus lebih dari 0.' : ''].filter(Boolean)); return; }
+      if (!addBtn._ok && typeof invNameInEnt === 'function' && !invNameInEnt(nama, inv.entitas)) {
+        invConfirmNewName(nama, inv.entitas, (finalName) => {
+          card.querySelector('[data-newitem="nama"]').value = finalName;
+          addBtn._ok = true;
+          try { addBtn.click(); } finally { addBtn._ok = false; }
+        });
+        return;
+      }
       const _ifrB = ifrBegin(inv);
       inv.items = inv.items || [];
       inv.items.push({ id: uid(), nama, batch, exp, qty, satuan, harga, diskonValue, diskonMode });
@@ -15571,7 +15626,7 @@ function ifxCompleteness() {
     { ok: !!ifxVal('f1-entitas'), t: 'Entitas dipilih', id: 'f1-entitas' },
     { ok: !!ifxVal('f1-tanggal') && !!ifxVal('f1-tanggaldok'), t: 'Tanggal terisi', id: 'f1-tanggal' },
     { ok: isMp || !!ifxVal('f1-supplier').trim(), t: isMp ? 'Toko (opsional)' : 'Nama supplier', id: 'f1-supplier', soft: true },
-    { ok: jenis === 'Surat Jalan' || isMp || !!ifxVal('f1-nofaktur').trim(), t: 'No. faktur', id: 'f1-nofaktur', soft: true },
+    { ok: jenis === 'Surat Jalan' || jenis === 'Tanpa Dokumen' || isMp || !!ifxVal('f1-nofaktur').trim(), t: 'No. faktur', id: 'f1-nofaktur', soft: true },
     { ok: status !== 'DP Sebagian' || parseRibuan(ifxVal('f1-dp')) > 0, t: 'Jumlah DP', id: 'f1-dp', soft: true },
     { ok: status === 'Lunas' || !!ifxVal('f1-jatuhtempo'), t: 'Tgl jatuh tempo', id: 'f1-jatuhtempo', soft: true },
     { ok: currentInvoiceItems.length > 0, t: 'Minimal 1 barang', id: 'f1-item-nama' },
@@ -15924,7 +15979,7 @@ function ifpShowSaved(x) {
     <div class="ifp-note info">Data sudah tersimpan & tersinkron ke semua laptop. Form sudah dikosongkan untuk faktur berikutnya.</div>`;
   ifpOpen('ok', head, body, [
     { label: '＋ Input Faktur Lagi', cls: 'pri', def: true, fn: () => ifpFocusField(document.getElementById('f1-supplier') && document.getElementById('f1-supplier').offsetParent ? 'f1-supplier' : 'f1-item-nama') },
-    { label: '📚 Lihat Riwayat Faktur', cls: 'sec', fn: () => { const b = [...document.querySelectorAll('#tab1 button, #tab1 .subtab, #tab1 [data-sub]')].find(el => /riwayat faktur/i.test(el.textContent || '')); if (b) b.click(); window.scrollTo({ top: 0, behavior: 'smooth' }); } },
+    { label: '📚 Lihat di Riwayat Faktur', cls: 'sec', fn: () => ifpGoToInvoice(x.id) },
   ], { autoClose: 9000 });
 }
 
@@ -17262,6 +17317,115 @@ function chatAnswer(raw) {
   };
   if (!tryMount()) { const iv = setInterval(() => { if (tryMount()) clearInterval(iv); }, 1500); }
 })();
+
+</script>
+<script>
+// ===== nama_barang_per_entitas.js =====
+// Pilihan nama barang di Invoice Masuk mengikuti Stok Terjual entitas yang dipilih: nama yang sudah ada di
+// Stok Terjual entitas itu tampil PALING ATAS; nama lain (dari Master Produk / entitas lain) di bawahnya dengan
+// tanda "belum ada di Stok Terjual …". Kalau nama yang diketik belum ada di Stok Terjual entitas itu, muncul
+// konfirmasi + saran nama yang mirip, supaya tidak tercipta baris produk dobel karena beda tulisan.
+let _invEntCat = { sig: '', map: {} };
+function invEntStCatalog(ent) {
+  const sig = [(state.invoices || []).length, (state.adjustments || []).length, (state.checkerRows || []).length, (state.masterProduk || []).length, (state.hiddenProducts || []).length, state.lastEditedAt || ''].join('|');
+  if (_invEntCat.sig !== sig) _invEntCat = { sig, map: {} };
+  if (!_invEntCat.map[ent]) {
+    const list = ent ? getProductCatalogForEntity(ent) : [];
+    _invEntCat.map[ent] = { list, keys: new Set(list.map(normalizeName)) };
+  }
+  return _invEntCat.map[ent];
+}
+function invNameInEnt(nama, ent) { return !ent || invEntStCatalog(ent).keys.has(normalizeName(nama)); }
+function invItemNameSuggest(q, ent, limit) {
+  limit = limit || 40;
+  const qn = normalizeName(q || '');
+  const own = invEntStCatalog(ent).list;
+  const seen = new Set();
+  const others = [];
+  (typeof ENTITIES !== 'undefined' ? ENTITIES : []).forEach(e => { if (e !== ent) invEntStCatalog(e).list.forEach(n => others.push(n)); });
+  getNamaInternalCatalog().forEach(n => others.push(n));
+  const pick = (arr) => {
+    const st = [], ct = [];
+    arr.forEach(n => {
+      const k = normalizeName(n);
+      if (!k || seen.has(k)) return;
+      if (!qn || k.startsWith(qn)) { st.push(n); seen.add(k); }
+      else if (k.includes(qn)) { ct.push(n); seen.add(k); }
+    });
+    return st.concat(ct);
+  };
+  const a = pick(own);
+  if (a.length >= limit) return a.slice(0, limit);
+  return a.concat(pick(others)).slice(0, limit);
+}
+function invItemTag(val, ent) {
+  if (!ent || invNameInEnt(val, ent)) return '';
+  const lbl = ({ Gracia: 'GSM', HNH: 'HNH', Glomed: 'GSJ' })[ent] || ent;
+  return ` <span style="font-size:10.5px;font-weight:700;color:#B45309;background:#FEF3C7;border-radius:6px;padding:1px 6px;margin-left:4px;white-space:nowrap;">belum ada di Stok Terjual ${lbl}</span>`;
+}
+function invNameTokens(s) { return new Set(normalizeName(s).replace(/[^a-z0-9.,%]+/g, ' ').split(' ').filter(Boolean)); }
+function invSimilarInEnt(nama, ent, n) {
+  const a = invNameTokens(nama), loose = normalizeName(nama).replace(/[^a-z0-9]/g, '');
+  const out = [];
+  invEntStCatalog(ent).list.forEach(c => {
+    if (normalizeName(c).replace(/[^a-z0-9]/g, '') === loose) { out.push({ c, sc: 2 }); return; } // cuma beda spasi/tanda baca
+    const b = invNameTokens(c);
+    let inter = 0; a.forEach(w => { if (b.has(w)) inter++; });
+    const sc = inter ? (2 * inter) / (a.size + b.size) : 0;
+    if (sc >= 0.5) out.push({ c, sc });
+  });
+  return out.sort((x, y) => y.sc - x.sc).slice(0, n || 3).map(x => x.c);
+}
+function invConfirmNewName(nama, ent, onUse) {
+  const lbl = (typeof ENTITY_LABEL !== 'undefined' && ENTITY_LABEL[ent]) || ent;
+  const sug = invSimilarInEnt(nama, ent, 3);
+  const esc = typeof escapeAttr === 'function' ? escapeAttr : (x => x);
+  const head = `<h3 class="ifp-title">Belum ada di Stok Terjual ${esc(lbl)}</h3><div class="ifp-sub">Cek dulu, mungkin cuma beda tulisan</div>`;
+  const body = `<div class="ifp-note warn" style="font-size:13px;"><b>${esc(nama)}</b> belum pernah ada di Stok Terjual <b>${esc(lbl)}</b>. Kalau tetap ditambahkan, nanti muncul sebagai <b>baris produk baru</b> di Stok Terjual.</div>` +
+    (sug.length ? `<div style="font-size:12.5px;color:var(--muted);margin:10px 0 4px;">Produk yang mirip di Stok Terjual ${esc(lbl)}:</div>` : `<div style="font-size:12.5px;color:var(--muted);margin:10px 0 4px;">Tidak ada produk yang mirip di Stok Terjual ${esc(lbl)}.</div>`);
+  const buttons = sug.map(c => ({ label: `✔ Pakai: ${esc(c)}`, cls: 'ok', fn: () => onUse(c) }));
+  buttons.push({ label: 'Tetap pakai nama ini (produk baru)', cls: 'sec', fn: () => onUse(nama) });
+  buttons.push({ label: 'Batal', cls: 'sec', def: !sug.length });
+  if (sug.length) buttons[0].def = true;
+  ifpOpen('warn', head, body, buttons, { noConfetti: true });
+}
+
+</script>
+<script>
+
+// Buka Riwayat Faktur dan tunjukkan faktur tertentu (dibuka detailnya + disorot), mis. faktur yang barusan disimpan.
+function ifpGoToInvoice(id) {
+  if (!id || !state.invoices.some(x => x.id === id)) { tab1SubView = 'riwayat'; renderTab1(); return; }
+  // filter dikosongkan & urutan "terakhir diinput" supaya fakturnya pasti kelihatan di halaman pertama
+  tab1EntityFilter = 'Semua'; tab1SupplierFilter = ''; tab1ProdukFilter = ''; tab1SumberFilter = 'Semua';
+  tab1DateFrom = ''; tab1DateTo = ''; tab1SearchQuery = ''; tab1StatusCategoryFilter = 'Semua'; tab1SortMode = 'input';
+  try {
+    const list = sortTab1Invoices(state.invoices.slice());
+    const i = list.findIndex(x => x.id === id);
+    tab1CurrentPage = i >= 0 ? Math.floor(i / TAB1_PAGE_SIZE) + 1 : 1;
+  } catch (e) { tab1CurrentPage = 1; }
+  expandedInvoiceIds.add(id);
+  tab1SubView = 'riwayat';
+  renderTab1();
+  const show = (tries) => {
+    const card = document.querySelector(`[data-invid="${id}"]`);
+    if (!card) { if (tries > 0) setTimeout(() => show(tries - 1), 150); return; }
+    { const top = card.getBoundingClientRect().top + window.scrollY - 110; window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' }); } // kepala kartu kelihatan (di bawah header)
+    if (!document.getElementById('ifp-justsaved-css')) {
+      const st = document.createElement('style'); st.id = 'ifp-justsaved-css';
+      st.textContent = `.ifp-justsaved{animation:ifpjs 3.2s ease;position:relative;}
+@keyframes ifpjs{0%,70%{box-shadow:0 0 0 3px #16A34A,0 8px 26px rgba(22,163,74,.25);}100%{box-shadow:0 0 0 0 rgba(22,163,74,0);}}
+.ifp-justsaved-tag{position:absolute;top:6px;left:50%;transform:translateX(-50%);background:#16A34A;color:#fff;font-size:11px;font-weight:800;padding:2px 10px;border-radius:999px;z-index:3;box-shadow:0 2px 6px rgba(0,0,0,.15);transition:opacity .4s;}`;
+      document.head.appendChild(st);
+    }
+    card.classList.remove('ifp-justsaved'); void card.offsetWidth; card.classList.add('ifp-justsaved');
+    if (getComputedStyle(card).position === 'static') card.style.position = 'relative';
+    const tag = document.createElement('div'); tag.className = 'ifp-justsaved-tag'; tag.textContent = '✔ Baru disimpan';
+    card.appendChild(tag);
+    setTimeout(() => { tag.style.opacity = '0'; setTimeout(() => tag.remove(), 500); }, 4000);
+  };
+  setTimeout(() => show(10), 120);
+}
 
 </script>
 </body>
