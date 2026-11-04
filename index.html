@@ -4613,7 +4613,7 @@ function addCurrentInvoiceItem() {
   // faktur manapun sebelumnya), tawarkan untuk didaftarkan sebagai Barang Baru — supaya
   // nanti kalau produk yang sama mulai dijual online, sistem sudah "kenal" nama internalnya
   // dan tinggal dihubungkan ke listing marketplace-nya (ditandai "Perlu Mapping" di Tab 4).
-  const isKnown = getNamaInternalCatalog().some(n => normalizeName(n) === normalizeName(nama));
+  const isKnown = (typeof isKnownProductName === 'function') ? isKnownProductName(nama) : getNamaInternalCatalog().some(n => normalizeName(n) === normalizeName(nama));
   if (!isKnown) {
     const ok = confirm(`Produk "${nama}" belum ada di database. Tambahkan sebagai Barang Baru ke Master Produk?\n\n(Kalau nanti produk ini mulai dijual di Shopee/Tokopedia/TikTok, tinggal dihubungkan lewat kotak "Cari/pilih nama internal" di Tab 2 — cukup sekali, otomatis dikenali seterusnya.)`);
     if (ok) {
@@ -15472,7 +15472,7 @@ function ifxTopSuppliers(ent) {
   return Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a]).slice(0, 4);
 }
 function ifxIsKnown(nama) {
-  try { return getNamaInternalCatalog().some(n => normalizeName(n) === normalizeName(nama)); } catch (e) { return true; }
+  try { return (typeof isKnownProductName === 'function') ? isKnownProductName(nama) : getNamaInternalCatalog().some(n => normalizeName(n) === normalizeName(nama)); } catch (e) { return true; }
 }
 
 // ---------- kontrol pilihan (mengganti tampilan select, select asli tetap dipakai) ----------
@@ -17425,6 +17425,28 @@ function ifpGoToInvoice(id) {
     setTimeout(() => { tag.style.opacity = '0'; setTimeout(() => tag.remove(), 500); }, 4000);
   };
   setTimeout(() => show(10), 120);
+}
+
+</script>
+<script>
+
+// Nama barang dianggap SUDAH ADA kalau ada di: nama internal Master Produk, nama per entitas di Master Produk
+// (Nama GSM / HNH / GSJ), riwayat faktur, ATAU Stok Terjual entitas mana pun (stok awal / penjualan).
+// Dulu cuma dicek ke nama internal + faktur, jadi produk seperti "Plesterin Bulat PE Onemed" (nama GSJ-nya)
+// ditanya "belum ada di database" padahal sudah ada di Stok Terjual GSJ.
+let _knownNameCache = { sig: '', set: null };
+function isKnownProductName(nama) {
+  const sig = [(state.masterProduk || []).length, (state.invoices || []).length, (state.adjustments || []).length, (state.checkerRows || []).length, state.lastEditedAt || ''].join('|');
+  if (_knownNameCache.sig !== sig || !_knownNameCache.set) {
+    const set = new Set();
+    const add = n => { const k = normalizeName(n); if (k) set.add(k); };
+    (state.masterProduk || []).forEach(m => { add(m.namaInternal); add(m.namaGracia); add(m.namaHNH); add(m.namaGlomed); });
+    (state.invoices || []).forEach(inv => (inv.items || []).forEach(it => add(it.nama)));
+    (state.adjustments || []).forEach(a => add(a.nama));
+    (state.checkerRows || []).forEach(r => add(r.nama));
+    _knownNameCache = { sig, set };
+  }
+  return _knownNameCache.set.has(normalizeName(nama));
 }
 
 </script>
