@@ -1029,6 +1029,16 @@ function debounce(fn, delay) {
 // SEKALI (faktur lama dari sebelum field ini ditambahkan, atau data hasil import/restore),
 // JANGAN asal fallback ke Tanggal Barang Diterima — hitung ulang pakai rumus yang sama:
 // Faktur → ikut Tanggal Dokumen, Surat Jalan/Nota → ikut Tanggal Barang Diterima.
+// Faktur yang barangnya SUDAH DITERIMA sebelum/pada titik potong Stok Awal (mis. datang 28 Sep, faktur 9 Okt)
+// sudah termasuk di angka fisik Stok Awal -> tidak dihitung lagi. Aturan ini sama dengan computeStockAsOfDate;
+// dipakai juga untuk kolom "+Stok" harian supaya tampilan harian tidak menambahkannya.
+function invoiceSudahTermasukStokAwal(inv, tanggalLihat) {
+  try {
+    if ((inv.jenisDokumen || 'Faktur') !== 'Faktur' || !inv.tanggal) return false;
+    const g = (typeof iuActiveGeneration === 'function') ? iuActiveGeneration(inv.entitas, tanggalLihat || getInvoiceTanggalStok(inv)) : null;
+    return !!(g && inv.tanggal <= g.tanggal);
+  } catch (e) { return false; }
+}
 function getInvoiceTanggalStok(inv) {
   if (inv.tanggalStok) return inv.tanggalStok;
   return inv.jenisDokumen === 'Faktur' ? (inv.tanggalDokumen || inv.tanggal) : inv.tanggal;
@@ -7956,6 +7966,7 @@ function computeStokTerjualPivot(entitas, tanggal) {
   const dayInvoiceItems = [];
   state.invoices.forEach(inv => {
     if (inv.entitas !== entitas || (getInvoiceTanggalStok(inv)) !== tanggal) return;
+    if (invoiceSudahTermasukStokAwal(inv, tanggal)) return; // barang sudah datang sebelum Stok Awal -> sudah termasuk
     (inv.items || []).forEach(it => dayInvoiceItems.push({ ...it, _jenisDokumen: inv.jenisDokumen }));
   });
   const catalog = getProductCatalogForEntity(entitas);
@@ -8058,6 +8069,7 @@ function computeSingleProductPivot(entitas, tanggal, nama, stokAwalMap, dayRows,
     dayInvoiceItems = [];
     state.invoices.forEach(inv => {
       if (inv.entitas !== entitas || (getInvoiceTanggalStok(inv)) !== tanggal) return;
+      if (invoiceSudahTermasukStokAwal(inv, tanggal)) return;
       (inv.items || []).forEach(it => dayInvoiceItems.push({ ...it, _jenisDokumen: inv.jenisDokumen }));
     });
   }
@@ -10950,7 +10962,8 @@ function traceProductStock(entitas, nama) {
     if (inv.entitas !== entitas) return;
     (inv.items || []).forEach(item => {
       if (normalizeName(item.nama) === key) {
-        events.push({ tanggal: getInvoiceTanggalStok(inv), jenis: 'Faktur Masuk', ket: `${inv.supplier || '-'} ${inv.noFaktur ? '('+inv.noFaktur+')' : ''}`, qty: Number(item.qty) || 0 });
+        const _incl = invoiceSudahTermasukStokAwal(inv);
+        events.push({ tanggal: getInvoiceTanggalStok(inv), jenis: 'Faktur Masuk', ket: `${inv.supplier || '-'} ${inv.noFaktur ? '('+inv.noFaktur+')' : ''}${_incl ? ` — barang diterima ${dateLabelID(inv.tanggal)}, sudah termasuk Stok Awal (tidak ditambah lagi)` : ''}`, qty: _incl ? 0 : (Number(item.qty) || 0) });
       }
     });
   });
