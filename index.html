@@ -4154,9 +4154,12 @@ function renderTab1FakturBaru() {
     const jenisSel = document.getElementById('f1-jenisdok');
     if (jenisSel) {
       [...jenisSel.options].forEach(o => { if (o.value === 'Surat Jalan') { o.disabled = isSumberMarketplace(sumber); o.hidden = isSumberMarketplace(sumber); } });
-      if (isSumberMarketplace(sumber) && jenisSel.value === 'Surat Jalan') { jenisSel.value = 'Nota'; updateJenisDokUI(); return; }
+      // tombol pilihan jenis dokumen ikut diperbarui (dulu: setelah Shopee -> Supplier, tombol Surat Jalan tetap hilang)
+      if (typeof ifxSyncSeg === 'function') ifxSyncSeg('f1-jenisdok');
+      if (isSumberMarketplace(sumber) && jenisSel.value === 'Surat Jalan') { jenisSel.value = 'Nota'; updateJenisDokUI(); if (typeof ifxSyncSeg === 'function') ifxSyncSeg('f1-jenisdok'); return; }
     }
     updateNoFakturLabel();
+    if (typeof ifxSync === 'function') { try { ifxSync(); } catch (e) {} }
   }
   bindSumberBeliDropdown('f1-sumberbeli');
   document.getElementById('f1-sumberbeli').addEventListener('change', updateSumberBeliUI);
@@ -4242,6 +4245,42 @@ function renderTab1FakturBaru() {
   document.getElementById('f1-tanggal').addEventListener('change', () => f1SaveLastPref({ tanggal: document.getElementById('f1-tanggal').value }));
   document.getElementById('f1-tanggaldok').addEventListener('change', () => f1SaveLastPref({ tanggalDokumen: document.getElementById('f1-tanggaldok').value }));
   document.getElementById('f1-tgllunas').addEventListener('change', () => f1SaveLastPref({ tanggalLunas: document.getElementById('f1-tgllunas').value }));
+  // (1) Tanggal faktur -> tanggal barang diterima ikut otomatis, selama keduanya memang sama.
+  //     Kalau tanggal diterima diubah jadi beda, tidak diikutkan lagi (barang datang beda hari dari fakturnya).
+  (function () {
+    const tg = document.getElementById('f1-tanggal'), td = document.getElementById('f1-tanggaldok');
+    let prevDok = td.value;
+    td.addEventListener('focus', () => { prevDok = td.value; });
+    td.addEventListener('change', () => {
+      if (td.value && (!tg.value || tg.value === prevDok)) {
+        tg.value = td.value;
+        tg.dispatchEvent(new Event('input', { bubbles: true }));
+        tg.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      prevDok = td.value;
+    });
+  })();
+  // (2) Beli lewat marketplace (Shopee/Tokopedia/TikTok/...) -> otomatis Lunas, tanggal lunas = tanggal barang diterima
+  //     (ikut berubah kalau tanggal diterima diubah), kecuali tanggal lunasnya diubah manual.
+  (function () {
+    const sb = document.getElementById('f1-sumberbeli'), st = document.getElementById('f1-statusbayar');
+    const tg = document.getElementById('f1-tanggal'), tl = document.getElementById('f1-tgllunas');
+    const isMp = () => sb.value && sb.value !== 'Supplier';
+    let linked = true, auto = false;
+    const apply = () => {
+      if (!isMp()) return;
+      auto = true;
+      try {
+        if (st.value !== 'Lunas') { st.value = 'Lunas'; st.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (linked && tg.value && tl.value !== tg.value) { tl.value = tg.value; tl.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (typeof ifxSync === 'function') ifxSync();
+      } finally { auto = false; }
+    };
+    sb.addEventListener('change', () => { if (isMp()) { linked = true; apply(); } });
+    tg.addEventListener('change', () => { if (isMp() && linked) apply(); });
+    tl.addEventListener('change', () => { if (!auto) linked = !tg.value || tl.value === tg.value; });
+    if (isMp()) apply();
+  })();
   bindGenericAutocomplete(document.getElementById('f1-item-nama'), (q) => invItemNameSuggest(q, document.getElementById('f1-entitas').value, 40), null, { tag: (v) => invItemTag(v, document.getElementById('f1-entitas').value) });
   bindGenericAutocomplete(document.getElementById('f1-supplier'), (q) => searchSupplierNames(q, 40));
   bindGenericAutocomplete(document.getElementById('f1-item-satuan'), (q) => {
@@ -17521,10 +17560,18 @@ function f1ApplyJenisLayout(jenis) {
     const fieldOf = id => { const e = document.getElementById(id); return e ? e.closest('.field') : null; };
     hide(fieldOf('f1-item-harga'), noPrice);
     hide(fieldOf('f1-item-diskon'), noPrice);
-    const boxOf = id => { const e = document.getElementById(id); return e ? e.closest('div[style*="F8F9FB"]') : null; };
+    // kotak Diskon Global / PPN: ditandai sekali (data-f1box), karena setelah disembunyikan atribut style-nya
+    // berubah format warna dan tidak bisa dicari lagi lewat teks style -> dulu kotak PPN tidak muncul lagi.
+    const boxOf = id => {
+      const e = document.getElementById(id); if (!e) return null;
+      let box = e.closest('[data-f1box]');
+      if (!box) { box = e.closest('div[style*="F8F9FB"], div[style*="rgb(248, 249, 251)"]'); if (box) box.dataset.f1box = id; }
+      return box;
+    };
     hide(boxOf('f1-diskon-global'), noPrice);
     hide(boxOf('f1-ppn-enabled'), noPrice);
     hide(document.getElementById('f1-invoice-summary'), noPrice);
+    hide(document.getElementById('f1-bulk'), noPrice || !currentInvoiceItems.length);
     const tbl = tbody.closest('table'); if (tbl) tbl.classList.toggle('f1-noprice', noPrice);
     // pratinjau "= Rp..." di sebelah tombol tambah (kalau ada)
     const addBtn = document.getElementById('f1-item-add');
@@ -17533,6 +17580,303 @@ function f1ApplyJenisLayout(jenis) {
     if (typeof ifxSync === 'function') setTimeout(() => { try { ifxSync(); } catch (e) {} }, 0);
   } catch (e) { console.warn('f1ApplyJenisLayout', e); }
 }
+
+</script>
+<style>
+/* Stok Terjual: kolom Nama Produk tetap kelihatan (menempel di kiri) waktu tabel digeser ke samping */
+#t3-table-wrap table.dtable thead tr:first-child th:first-child{position:sticky;left:0;z-index:8;background:#F6F7FC;box-shadow:1px 0 0 var(--line);}
+#t3-table-wrap table.dtable tbody td:first-child{position:sticky;left:0;z-index:3;background:#fff;box-shadow:1px 0 0 var(--line),6px 0 8px -6px rgba(17,20,40,.18);min-width:190px;max-width:240px;}
+#t3-table-wrap table.dtable tbody tr:hover td:first-child{background:#F5F6FE;}
+#t3-table-wrap table.dtable tfoot td:first-child{position:sticky;left:0;z-index:3;background:#F6F7FC;}
+</style>
+<script>
+
+// ===== tabel_barang_faktur_baru_bisa_diedit.js =====
+// Tabel "Barang di Faktur Ini" (form Faktur Baru) sekarang bisa diedit langsung per baris (nama, batch, exp, qty,
+// satuan, harga, diskon), plus baris "Isi semua" untuk menerapkan satu harga / satu diskon ke semua barang sekaligus.
+function f1EnsureBulkBar(tbody) {
+  const tw = tbody.closest('.table-wrap');
+  if (!tw) return null;
+  let bar = document.getElementById('f1-bulk');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'f1-bulk';
+    bar.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px;padding:8px 10px;background:#F7F8FC;border:1px solid var(--line);border-radius:10px;font-size:12.5px;';
+    bar.innerHTML = `<b style="color:var(--ink);">Isi semua barang:</b>
+      <span style="display:inline-flex;gap:4px;align-items:center;">Harga <input type="text" inputmode="decimal" class="rp-input" id="f1-bulk-harga" placeholder="0" style="width:110px;padding:5px 8px;border:1px solid var(--line);border-radius:7px;">
+        <button type="button" class="btn secondary small" id="f1-bulk-harga-go" title="Isi harga ini ke barang yang harganya masih kosong (0)">Isi yang kosong</button>
+        <button type="button" class="btn secondary small" id="f1-bulk-harga-all" title="Ganti harga SEMUA barang">Semua</button></span>
+      <span style="display:inline-flex;gap:4px;align-items:center;margin-left:6px;">Diskon <input type="text" inputmode="decimal" class="rp-input" id="f1-bulk-diskon" placeholder="0" style="width:80px;padding:5px 8px;border:1px solid var(--line);border-radius:7px;">
+        <select id="f1-bulk-diskon-mode" style="padding:5px;border:1px solid var(--line);border-radius:7px;"><option value="persen">%</option><option value="nominal">Rp</option></select>
+        <button type="button" class="btn secondary small" id="f1-bulk-diskon-go">Terapkan ke semua</button></span>`;
+    tw.parentNode.insertBefore(bar, tw);
+    if (typeof attachRupiahFormatting === 'function') attachRupiahFormatting(bar);
+    const done = (msg) => { renderCurrentItemsTable(); if (typeof gsjShowToast === 'function') gsjShowToast(msg); };
+    bar.querySelector('#f1-bulk-harga-go').addEventListener('click', () => {
+      const h = parseRibuan(document.getElementById('f1-bulk-harga').value);
+      if (!(h > 0)) { if (typeof gsjShowToast === 'function') gsjShowToast('Isi harganya dulu'); return; }
+      let n = 0; currentInvoiceItems.forEach(it => { if (!(Number(it.harga) > 0)) { it.harga = h; n++; } });
+      done(n ? `✔ Harga ${fmtMoney(h)} diisi ke ${n} barang` : 'Semua barang sudah ada harganya');
+    });
+    bar.querySelector('#f1-bulk-harga-all').addEventListener('click', () => {
+      const h = parseRibuan(document.getElementById('f1-bulk-harga').value);
+      if (!(h > 0)) { if (typeof gsjShowToast === 'function') gsjShowToast('Isi harganya dulu'); return; }
+      currentInvoiceItems.forEach(it => { it.harga = h; });
+      done(`✔ Harga semua barang jadi ${fmtMoney(h)}`);
+    });
+    bar.querySelector('#f1-bulk-diskon-go').addEventListener('click', () => {
+      const d = parseRibuan(document.getElementById('f1-bulk-diskon').value);
+      const m = document.getElementById('f1-bulk-diskon-mode').value;
+      currentInvoiceItems.forEach(it => { it.diskonValue = d; it.diskonMode = m; });
+      done(d > 0 ? `✔ Diskon ${m === 'nominal' ? fmtMoney(d) : formatDisplayNumber(d) + '%'} diterapkan ke ${currentInvoiceItems.length} barang` : '✔ Diskon semua barang dihapus');
+    });
+  }
+  const jenis = (document.getElementById('f1-jenisdok') || {}).value;
+  bar.style.display = currentInvoiceItems.length && jenis !== 'Surat Jalan' ? 'flex' : 'none';
+  return bar;
+}
+function renderCurrentItemsTable() {
+  const tbody = document.getElementById('f1-item-tbody');
+  if (!tbody) return;
+  f1EnsureBulkBar(tbody);
+  if (!currentInvoiceItems.length) {
+    tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:14px;">Belum ada barang ditambahkan.</td></tr>`;
+    renderInvoiceSummaryBox();
+    return;
+  }
+  const { val, mode } = readCurrentDiskonGlobal();
+  const { enabled: ppnEnabled, percent: ppnPercent, inclusive: ppnInclusive } = readCurrentPpn();
+  const summary = computeInvoiceSummary(currentInvoiceItems, val, mode, ppnEnabled, ppnPercent, ppnInclusive);
+  const sub = new Map(summary.rows.map(r => [r.it, r.subtotalBersih]));
+  const inp = 'border:1px solid var(--line);background:#fff;border-radius:6px;padding:5px 6px;font-size:12.5px;width:100%;box-sizing:border-box;';
+  tbody.innerHTML = currentInvoiceItems.map((it, idx) => `<tr data-idx="${idx}">
+      <td style="min-width:130px;"><input data-f="nama" value="${escapeAttr(it.nama)}" style="${inp}"></td>
+      <td><input data-f="batch" value="${escapeAttr(it.batch || '')}" placeholder="-" style="${inp}font-family:var(--mono);font-size:11px;"></td>
+      <td><input data-f="exp" type="date" value="${escapeAttr(it.exp || '')}" style="${inp}font-size:11px;"></td>
+      <td><input data-f="qty" type="number" min="0" step="1" value="${Number(it.qty) || 0}" style="${inp}text-align:right;width:58px;"></td>
+      <td><input data-f="satuan" value="${escapeAttr(it.satuan || 'Pcs')}" style="${inp}width:58px;"></td>
+      <td><input data-f="harga" class="rp-input" inputmode="decimal" value="${formatDisplayNumber(Number(it.harga) || 0)}" style="${inp}text-align:right;width:86px;"></td>
+      <td><div style="display:flex;gap:3px;"><input data-f="diskonValue" class="rp-input" inputmode="decimal" value="${Number(it.diskonValue) > 0 ? formatDisplayNumber(it.diskonValue) : ''}" placeholder="0" style="${inp}text-align:right;width:46px;"><select data-f="diskonMode" style="${inp}width:44px;padding:3px;"><option value="persen" ${it.diskonMode !== 'nominal' ? 'selected' : ''}>%</option><option value="nominal" ${it.diskonMode === 'nominal' ? 'selected' : ''}>Rp</option></select></div></td>
+      <td class="num" style="white-space:nowrap;">${fmtMoney(sub.get(it) || 0)}</td>
+      <td><button class="icon-btn danger" data-del="${idx}" title="Hapus">🗑</button></td>
+    </tr>`).join('');
+  if (typeof attachRupiahFormatting === 'function') attachRupiahFormatting(tbody);
+  // kolom Batch & Exp disembunyikan kalau tidak ada barang yang mengisinya -> tabel muat tanpa geser ke samping
+  const tbl = tbody.closest('table');
+  if (tbl) tbl.classList.toggle('f1-nobe', !currentInvoiceItems.some(it => it.batch || it.exp));
+  tbody.querySelectorAll('tr[data-idx]').forEach(tr => {
+    const it = currentInvoiceItems[Number(tr.dataset.idx)];
+    tr.querySelectorAll('[data-f]').forEach(el => el.addEventListener('change', () => {
+      const f = el.dataset.f;
+      if (f === 'qty') it.qty = Math.max(0, Number(el.value) || 0);
+      else if (f === 'harga') it.harga = parseRibuan(el.value);
+      else if (f === 'diskonValue') it.diskonValue = parseRibuan(el.value);
+      else if (f === 'nama') { const v = el.value.trim().replace(/\s+/g, ' '); if (v) it.nama = v; }
+      else it[f] = el.value;
+      renderCurrentItemsTable();
+      // kembalikan fokus ke sel berikutnya supaya enak lanjut mengetik
+      const next = document.querySelector(`#f1-item-tbody tr[data-idx="${tr.dataset.idx}"] [data-f="${f}"]`);
+      if (next && document.activeElement === document.body) { try { next.focus(); } catch (e) {} }
+    }));
+    tr.querySelectorAll('input[data-f]').forEach(el => el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); el.blur(); } }));
+  });
+  tbody.querySelectorAll('button[data-del]').forEach(btn => btn.addEventListener('click', () => {
+    currentInvoiceItems.splice(Number(btn.dataset.del), 1);
+    renderCurrentItemsTable();
+  }));
+  renderInvoiceSummaryBox();
+  if (typeof ifxSync === 'function') { try { ifxSync(); } catch (e) {} }
+}
+
+</script>
+<style>
+/* kolom form tidak ikut melebar walaupun tabel barang lebar -> tabel yang di-scroll ke samping, panel kanan tetap kelihatan */
+.invoice-layout > *{min-width:0;}
+#f1-item-tbody input, #f1-item-tbody select{min-width:0;}
+.f1-nobe th:nth-child(2),.f1-nobe td:nth-child(2),.f1-nobe th:nth-child(3),.f1-nobe td:nth-child(3){display:none;}
+</style>
+<script>
+
+// ===== chat_hapus_notif.js =====
+// (1) Hapus pesan: pesan sendiri bisa dihapus (untuk semua orang); chat pribadi bisa dihapus seluruhnya.
+// (2) Notifikasi lebih kelihatan: kartu pesan masuk di pojok + bunyi "ting" + judul tab berkedip
+//     + notifikasi Windows/HP (kalau diizinkan) + tombol chat berdenyut selama ada pesan belum dibaca.
+const CHAT_SOUND_KEY = 'gsj_chat_sound';
+function chatSoundOn() { try { return localStorage.getItem(CHAT_SOUND_KEY) !== '0'; } catch (e) { return true; } }
+function chatDing() {
+  if (!chatSoundOn()) return;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    const ac = chatDing._ac || (chatDing._ac = new AC());
+    if (ac.state === 'suspended') ac.resume();
+    [[880, 0], [1320, 0.13]].forEach(([f, t]) => {
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, ac.currentTime + t);
+      g.gain.exponentialRampToValueAtTime(0.25, ac.currentTime + t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + t + 0.35);
+      o.connect(g); g.connect(ac.destination); o.start(ac.currentTime + t); o.stop(ac.currentTime + t + 0.4);
+    });
+  } catch (e) {}
+}
+// judul tab berkedip selama ada pesan belum dibaca & aplikasi tidak sedang dilihat
+let _chatTitleBase = null, _chatTitleTimer = null;
+function chatTitleBlink() {
+  const n = (typeof chatTotalUnread === 'function') ? chatTotalUnread() : 0;
+  if (_chatTitleBase === null) _chatTitleBase = document.title;
+  clearInterval(_chatTitleTimer);
+  if (!n || (!document.hidden && chatOpen)) { document.title = _chatTitleBase; return; }
+  let on = false;
+  _chatTitleTimer = setInterval(() => {
+    const m = chatTotalUnread();
+    if (!m || (!document.hidden && chatOpen)) { clearInterval(_chatTitleTimer); document.title = _chatTitleBase; return; }
+    on = !on; document.title = on ? `(${m}) 💬 Pesan baru` : _chatTitleBase;
+  }, 1200);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) setTimeout(chatTitleBlink, 300); });
+function chatSysNotify(m, conv) {
+  try {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    if (!document.hidden && document.hasFocus()) return; // sedang dilihat -> cukup kartu di aplikasi
+    const n = new Notification(`💬 ${m.from}${m.to ? ' (pribadi)' : ' — Grup'}`, { body: m.hasImg && !m.text ? '📷 Foto' : String(m.text || '').slice(0, 140), tag: 'gsj-chat-' + conv, renotify: true });
+    n.onclick = () => { window.focus(); try { chatConv = conv; chatTab = 'tim'; chatToggle(true); } catch (e) {} n.close(); };
+  } catch (e) {}
+}
+function chatPopCard(m, conv) {
+  let host = document.getElementById('chat-pops');
+  if (!host) {
+    host = document.createElement('div'); host.id = 'chat-pops';
+    host.style.cssText = 'position:fixed;right:20px;bottom:86px;z-index:9985;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none;';
+    document.body.appendChild(host);
+    const st = document.createElement('style');
+    st.textContent = `.chpop{pointer-events:auto;width:min(330px,calc(100vw - 40px));background:#fff;border-radius:14px;box-shadow:0 14px 36px rgba(17,20,40,.28);border-left:4px solid #4338CA;padding:10px 12px;display:flex;gap:10px;cursor:pointer;transform:translateX(24px);opacity:0;transition:all .25s cubic-bezier(.2,.9,.3,1.2);}
+.chpop.on{transform:none;opacity:1;}
+.chpop .av{width:34px;height:34px;border-radius:50%;color:#fff;font-weight:800;font-size:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.chpop .nm{font-size:12.5px;font-weight:800;color:var(--ink);}
+.chpop .nm small{font-weight:600;color:var(--muted);margin-left:4px;}
+.chpop .tx{font-size:12.5px;color:var(--ink);margin-top:2px;line-height:1.35;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;}
+.chpop .op{font-size:11px;color:#4338CA;font-weight:800;margin-top:4px;}
+.chpop .x{margin-left:auto;border:0;background:none;color:#9aa0ae;font-size:16px;cursor:pointer;align-self:flex-start;}
+#chat-fab.ch-pulse{animation:chpulse 1.6s ease-out infinite;}
+@keyframes chpulse{0%{box-shadow:0 0 0 0 rgba(220,38,38,.55),0 8px 22px rgba(67,56,202,.4);}70%{box-shadow:0 0 0 16px rgba(220,38,38,0),0 8px 22px rgba(67,56,202,.4);}100%{box-shadow:0 0 0 0 rgba(220,38,38,0),0 8px 22px rgba(67,56,202,.4);}}
+.ch-m .del{display:none;border:0;background:#fff;color:#DC2626;border-radius:6px;font-size:11px;font-weight:700;padding:2px 6px;cursor:pointer;margin-top:2px;box-shadow:0 1px 3px rgba(0,0,0,.12);}
+.ch-m.me:hover .del{display:inline-block;}
+.ch-tools{display:flex;gap:6px;margin-left:auto;}
+.ch-tools button{border:0;background:rgba(255,255,255,.18);color:#fff;border-radius:8px;padding:3px 8px;font-size:11.5px;font-weight:700;cursor:pointer;}
+#ch-bar .ch-delall{margin-left:auto;border:1px solid #FCA5A5;background:#FEF2F2;color:#B91C1C;border-radius:8px;padding:4px 9px;font-size:11.5px;font-weight:700;cursor:pointer;}`;
+    document.head.appendChild(st);
+  }
+  while (host.children.length >= 3) host.firstChild.remove();
+  const c = document.createElement('div'); c.className = 'chpop';
+  const col = (typeof chatAvColor === 'function') ? chatAvColor(m.from) : '#4338CA';
+  c.innerHTML = `<div class="av" style="background:${col}">${chatEsc(chatInitials(m.from))}</div><div style="flex:1;min-width:0;"><div class="nm">${chatEsc(m.from)}<small>${m.to ? '🔒 pribadi' : '👥 grup'}</small></div><div class="tx">${m.hasImg ? '📷 ' : ''}${chatEsc(m.text || (m.hasImg ? 'Foto' : ''))}</div><div class="op">Klik untuk buka & balas</div></div><button class="x" title="Tutup">×</button>`;
+  host.appendChild(c);
+  requestAnimationFrame(() => c.classList.add('on'));
+  const close = () => { c.classList.remove('on'); setTimeout(() => c.remove(), 250); };
+  let t = setTimeout(close, 9000);
+  c.addEventListener('mouseenter', () => clearTimeout(t));
+  c.addEventListener('mouseleave', () => { t = setTimeout(close, 3000); });
+  c.querySelector('.x').addEventListener('click', e => { e.stopPropagation(); close(); });
+  c.addEventListener('click', () => { close(); chatTab = 'tim'; chatConv = conv; chatToggle(true); });
+}
+// pesan masuk: kartu + bunyi + notifikasi sistem + judul berkedip
+chatReceive = function (m) {
+  if (!m || !m.id || chatMsgs.some(x => x.id === m.id)) return;
+  const conv = chatConvOf(m);
+  if (!conv) return;
+  chatMsgs.push(m); chatMsgs.sort((a, b) => (a.at < b.at ? -1 : 1));
+  const viewing = chatOpen && chatTab === 'tim' && chatConv === conv && !document.hidden;
+  if (!viewing) { chatPopCard(m, conv); chatDing(); chatSysNotify(m, conv); }
+  chatRender();
+  chatTitleBlink();
+};
+// badge: tombol chat berdenyut selama ada yang belum dibaca
+const _chatBadgeOrig = chatBadge;
+chatBadge = function () {
+  _chatBadgeOrig.apply(this, arguments);
+  const fab = document.getElementById('chat-fab');
+  if (fab) fab.classList.toggle('ch-pulse', chatTotalUnread() > 0);
+};
+// hapus pesan (untuk semua orang)
+function chatRemoveLocal(ids) {
+  const set = new Set(ids || []);
+  if (!set.size) return;
+  chatMsgs = chatMsgs.filter(m => !set.has(m.id));
+  chatRender();
+}
+async function chatDeleteMsgs(ids) {
+  if (!ids.length) return;
+  chatRemoveLocal(ids);
+  try {
+    if (typeof gsjSupabase !== 'undefined' && gsjSupabase) {
+      for (let i = 0; i < ids.length; i += 100) {
+        const r = await gsjSupabase.from('gsj_settings').delete().in('id', ids.slice(i, i + 100));
+        if (r && r.error) throw r.error;
+      }
+    }
+    if (chatChannel) chatChannel.send({ type: 'broadcast', event: 'del', payload: { ids } });
+    if (typeof gsjShowToast === 'function') gsjShowToast(ids.length > 1 ? `🗑 ${ids.length} pesan dihapus` : '🗑 Pesan dihapus');
+  } catch (e) { console.warn('chat delete', e); if (typeof gsjShowToast === 'function') gsjShowToast('Gagal menghapus di server — coba lagi'); }
+}
+chatConnect = function () {
+  if (chatChannel || typeof gsjSupabase === 'undefined' || !gsjSupabase) return;
+  try {
+    chatChannel = gsjSupabase.channel('gsj_team_chat', { config: { broadcast: { self: false } } })
+      .on('broadcast', { event: 'msg' }, ({ payload }) => chatReceive(payload))
+      .on('broadcast', { event: 'del' }, ({ payload }) => chatRemoveLocal(payload && payload.ids))
+      .subscribe();
+  } catch (e) { console.warn('chat connect', e); }
+  chatLoad();
+};
+// tombol hapus di tiap pesan sendiri + "Hapus chat" untuk chat pribadi + tombol bunyi/notifikasi
+const _chatRenderOrig = chatRender;
+chatRender = function () {
+  _chatRenderOrig.apply(this, arguments);
+  try {
+    // tombol 🔔 / 🔕 di kepala panel
+    const head = document.querySelector('#chat-panel .ch-head .t');
+    if (head && !head.querySelector('.ch-tools')) {
+      const tools = document.createElement('div'); tools.className = 'ch-tools';
+      head.insertBefore(tools, head.querySelector('.x'));
+    }
+    const tools = head && head.querySelector('.ch-tools');
+    if (tools) {
+      const perm = ('Notification' in window) ? Notification.permission : 'denied';
+      tools.innerHTML = `<button data-k="snd" title="Bunyi pesan masuk">${chatSoundOn() ? '🔔 Bunyi' : '🔕 Bunyi'}</button>${perm === 'default' ? '<button data-k="perm" title="Tampilkan notifikasi Windows/HP walau aplikasi tidak sedang dibuka">🔔 Aktifkan notifikasi</button>' : ''}`;
+      tools.querySelector('[data-k="snd"]').onclick = () => { try { localStorage.setItem(CHAT_SOUND_KEY, chatSoundOn() ? '0' : '1'); } catch (e) {} if (chatSoundOn()) chatDing(); chatRender(); };
+      const pb = tools.querySelector('[data-k="perm"]');
+      if (pb) pb.onclick = () => { try { Notification.requestPermission().then(() => chatRender()); } catch (e) {} };
+    }
+    if (chatTab !== 'tim' || !chatConv) return;
+    const me = chatKey(chatMe());
+    const list = chatMsgs.filter(m => chatConvOf(m) === chatConv);
+    const els = [...document.querySelectorAll('#ch-body .ch-m')];
+    els.forEach((el, i) => {
+      const m = list[i];
+      if (!m || chatKey(m.from) !== me || m.pending) return;
+      const b = document.createElement('button'); b.className = 'del'; b.textContent = '🗑 Hapus';
+      b.addEventListener('click', () => {
+        const go = () => chatDeleteMsgs([m.id]);
+        if (typeof ifpConfirm === 'function') ifpConfirm('Hapus pesan ini?', `"${chatEsc(String(m.text || (m.hasImg ? 'Foto' : '')).slice(0, 120))}"<br>Pesan akan hilang untuk semua orang.`, '🗑 Hapus', go);
+        else if (confirm('Hapus pesan ini untuk semua orang?')) go();
+      });
+      el.appendChild(b);
+    });
+    const bar = document.getElementById('ch-bar');
+    if (bar && chatConv !== 'grup' && list.length && !bar.querySelector('.ch-delall')) {
+      const b = document.createElement('button'); b.className = 'ch-delall'; b.textContent = '🗑 Hapus chat';
+      b.title = 'Hapus semua pesan di chat pribadi ini (untuk kalian berdua)';
+      b.addEventListener('click', () => {
+        const ids = chatMsgs.filter(m => chatConvOf(m) === chatConv).map(m => m.id);
+        const go = () => chatDeleteMsgs(ids);
+        if (typeof ifpConfirm === 'function') ifpConfirm('Hapus seluruh chat ini?', `${ids.length} pesan di chat pribadi ini akan dihapus untuk kalian berdua.`, '🗑 Hapus semua', go);
+        else if (confirm('Hapus seluruh chat ini?')) go();
+      });
+      bar.appendChild(b);
+    }
+  } catch (e) { console.warn('chat extra', e); }
+  chatTitleBlink();
+};
 
 </script>
 </body>
