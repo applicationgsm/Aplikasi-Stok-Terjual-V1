@@ -6331,6 +6331,7 @@ function renderTab2Table() {
   const activeColumnFilters = mpKey ? tab2ColumnFiltersRich : tab2ColumnFiltersSimple;
   rows = applyColumnFilters(rows, activeColumnDefs, activeColumnFilters);
   rows = applySortState(rows, activeColumnDefs, tab2SortState);
+  window._t2AllFilteredRows = rows; // hanya dipakai untuk baris Subtotal di tampilan (lihat t2SubtotalRows)
 
   if (tab2LoadedCount > rows.length) tab2LoadedCount = Math.max(TAB2_PAGE_SIZE, rows.length);
   const visibleRows = rows.slice(0, tab2LoadedCount);
@@ -9264,12 +9265,12 @@ function renderTab3Table() {
           <th rowspan="2" style="width:200px;vertical-align:middle;">Nama Produk${renderFilterIcon('nama', tab3ColumnFilters, tab3SortState)}</th>
           <th rowspan="2" style="width:65px;vertical-align:middle;">Satuan${renderFilterIcon('satuan', tab3ColumnFilters, tab3SortState)}</th>
           <th rowspan="2" style="width:75px;vertical-align:middle;">Stok Awal${renderFilterIcon('stokAwal', tab3ColumnFilters, tab3SortState)}</th>
-          <th colspan="3" style="text-align:center;background:#e2e8f0;">Terjual HNH</th>
-          <th rowspan="2" style="width:80px;vertical-align:middle;">Total HNH${renderFilterIcon('totalOwn', tab3ColumnFilters, tab3SortState)}</th>
-          <th colspan="2" style="text-align:center;background:#fde9d9;">Terjual GM</th>
-          <th colspan="2" style="text-align:center;background:#e2f5e5;">Terjual MD</th>
-          <th rowspan="2" style="width:65px;vertical-align:middle;">Total GM${renderFilterIcon('totalGM', tab3ColumnFilters, tab3SortState)}</th>
-          <th rowspan="2" style="width:65px;vertical-align:middle;">Total M${renderFilterIcon('totalM', tab3ColumnFilters, tab3SortState)}</th>
+          <th colspan="3" style="text-align:center;background:#e2e8f0;" title="Toko/akun tempat barang laku (bukan entitas stok)">Laku di Toko HNH</th>
+          <th rowspan="2" style="width:80px;vertical-align:middle;" title="Total laku di toko HNH">Total Toko HNH${renderFilterIcon('totalOwn', tab3ColumnFilters, tab3SortState)}</th>
+          <th colspan="2" style="text-align:center;background:#fde9d9;" title="Toko Glovemart (bukan entitas stok)">Laku di Toko GM</th>
+          <th colspan="2" style="text-align:center;background:#e2f5e5;" title="Toko Medident (bukan entitas stok)">Laku di Toko MD</th>
+          <th rowspan="2" style="width:65px;vertical-align:middle;">Total Toko GM${renderFilterIcon('totalGM', tab3ColumnFilters, tab3SortState)}</th>
+          <th rowspan="2" style="width:65px;vertical-align:middle;">Total Toko MD${renderFilterIcon('totalM', tab3ColumnFilters, tab3SortState)}</th>
           <th rowspan="2" style="width:75px;vertical-align:middle;">Grand Total${renderFilterIcon('grandTotal', tab3ColumnFilters, tab3SortState)}</th>
           <th rowspan="2" style="width:95px;vertical-align:middle;">Harga Modal${renderFilterIcon('hargaModal', tab3ColumnFilters, tab3SortState)}</th>
           <th rowspan="2" style="width:110px;vertical-align:middle;">Total Pembayaran${renderFilterIcon('totalPembayaran', tab3ColumnFilters, tab3SortState)}</th>
@@ -15194,6 +15195,15 @@ function gsjBootMainApp() {
         // hitung ulang supaya penjualan Oktober yang terlanjur pindah ke HNH (mis. Alkohol 70% 5 Liter) kembali
         // ke entitas yang stoknya ada (GSJ). Penjualan sebelum Stok Awal terbaru tidak berubah.
         try {
+          // Sekali jalan: kembalikan kunci manual HNH yang sempat dilepas versi sebelumnya
+          try {
+            if (!state.settings.fixRestoreManualHnhV1 && typeof gsjRestoreManualHnh === 'function') {
+              const res = gsjRestoreManualHnh();
+              state.settings.fixRestoreManualHnhV1 = true;
+              saveState();
+              if (res && res.fixed) setTimeout(() => { if (typeof gsjShowToast === 'function') gsjShowToast(`✔ ${res.fixed} penjualan dikembalikan ke HNH (kunci manual) seperti semula`); }, 1500);
+            }
+          } catch (e) { console.warn(e); }
           if (!state.settings.fixStokAwalCutoffV1) {
             recomputeAllCheckerRows();
             state.settings.fixStokAwalCutoffV1 = true;
@@ -17877,6 +17887,204 @@ chatRender = function () {
   } catch (e) { console.warn('chat extra', e); }
   chatTitleBlink();
 };
+
+</script>
+<script>
+
+// ===== subtotal_import_marketplace.js =====
+// Import Marketplace: baris SUBTOTAL per produk (hanya tampilan di layar). Muncul kalau tabel diurutkan
+// berdasarkan Nama Produk (A-Z / Z-A) atau hasil filter tinggal 1 produk. Tidak mengubah data, cara import,
+// aturan potong stok, maupun format Download Excel. Pengali Stok ikut ditampilkan ("dipotong stok …").
+function t2SubQty(r) { return Number(r.qty) || 0; }
+function t2SubCut(r) {
+  if (r.qtyInternal !== undefined && r.qtyInternal !== null && r.qtyInternal !== '' && !isNaN(Number(r.qtyInternal))) return Number(r.qtyInternal);
+  return (Number(r.qty) || 0) * (Number(r.qtyMultiplier) || 1);
+}
+function t2SubNameKey() {
+  try {
+    const mp = MARKETPLACE_KEY_BY_SUMBER[tab2MarketplaceFilter];
+    const defs = mp ? buildRichColumnDefs(MARKETPLACE_SPECS[mp]) : TAB2_SIMPLE_COLUMN_DEFS;
+    const d = defs.find(d => d.key === 'nama' || /nama produk/i.test(d.label || ''));
+    return d ? d.key : null;
+  } catch (e) { return null; }
+}
+function t2SubtotalRows() {
+  const tbody = document.querySelector('#t2-table-container tbody');
+  if (!tbody) return;
+  tbody.querySelectorAll('tr.t2-subtotal').forEach(x => x.remove());
+  if (!document.getElementById('t2sub-css')) {
+    const st = document.createElement('style'); st.id = 't2sub-css';
+    st.textContent = `#t2-table-container tr.t2-subtotal td{background:#EEF0F8 !important;border-top:2px solid #94A3B8 !important;border-bottom:2px solid #94A3B8 !important;font-weight:800;color:var(--ink);padding:7px 12px;font-size:13px;}
+#t2-table-container tr.t2-subtotal .nm{color:#3730A3;}
+#t2-table-container tr.t2-subtotal .ps{font-size:11px;font-weight:600;color:var(--muted);margin-left:10px;}`;
+    document.head.appendChild(st);
+  }
+  const all = window._t2AllFilteredRows || [];
+  const per = new Map();
+  all.forEach(r => { const k = normalizeName(r.nama || ''); const o = per.get(k) || { nama: r.nama, q: 0, c: 0, n: 0 }; o.q += t2SubQty(r); o.c += t2SubCut(r); o.n++; per.set(k, o); });
+  const k0 = t2SubNameKey();
+  const sorted = !!(k0 && typeof tab2SortState !== 'undefined' && tab2SortState.key === k0);
+  if (!sorted && per.size !== 1) return;
+  const trs = [...tbody.querySelectorAll('tr[data-id]')];
+  const byId = new Map(state.checkerRows.map(r => [r.id, r]));
+  const esc = typeof escapeAttr === 'function' ? escapeAttr : (x => x);
+  trs.forEach((tr, i) => {
+    const r = byId.get(tr.dataset.id); if (!r) return;
+    const k = normalizeName(r.nama || '');
+    const nx = trs[i + 1] && byId.get(trs[i + 1].dataset.id);
+    if (nx && normalizeName(nx.nama || '') === k) return; // belum baris terakhir produk ini
+    const o = per.get(k); if (!o) return;
+    const cells = [...tr.children], cols = cells.length;
+    const qInp = tr.querySelector('input[data-field="qty"], input[data-slot-key="qty"]');
+    const qIdx = qInp ? cells.indexOf(qInp.closest('td')) : -1;
+    const shown = trs.filter(t => { const x = byId.get(t.dataset.id); return x && normalizeName(x.nama || '') === k; }).length;
+    const partial = i === trs.length - 1 && o.n > shown;
+    const label = `<span class="nm">Subtotal ${esc(o.nama)}</span><span class="ps">${fmtNum(o.n)} pesanan${partial ? ' · sebagian baris belum dimuat, scroll ke bawah' : ''}</span>`;
+    const tot = `<span style="font-family:var(--mono);font-size:14px;">${fmtNum(o.q)}</span>${o.c !== o.q ? `<div style="font-size:10.5px;color:#B45309;font-weight:700;white-space:nowrap;">dipotong stok ${fmtNum(o.c)} (× pengali)</div>` : ''}`;
+    const st = document.createElement('tr');
+    st.className = 't2-subtotal';
+    st.innerHTML = qIdx > 0
+      ? `<td colspan="${qIdx}" style="text-align:right;">${label}</td><td>${tot}</td>${cols - qIdx - 1 > 0 ? `<td colspan="${cols - qIdx - 1}"></td>` : ''}`
+      : `<td colspan="${cols}">${label} ${tot}</td>`;
+    tr.after(st);
+  });
+}
+if (typeof renderTab2Table === 'function') {
+  const _oSub = renderTab2Table;
+  renderTab2Table = function () { const out = _oSub.apply(this, arguments); try { t2SubtotalRows(); } catch (e) { console.warn('subtotal', e); } return out; };
+}
+document.addEventListener('change', e => {
+  if (e.target && e.target.closest && e.target.closest('#t2-table-container') && /^(qty|nama|tanggal|entitas)$/.test(e.target.dataset.field || e.target.dataset.slotKey || ''))
+    setTimeout(() => { try { t2SubtotalRows(); } catch (err) {} }, 120);
+});
+
+</script>
+<script>
+
+// ===== posisi_scroll_tetap.js =====
+// Import Marketplace & Stok Terjual: posisi scroll (tabel & halaman) TIDAK balik ke atas waktu tabel dibangun
+// ulang — baik karena kita edit sesuatu, ada perubahan dari device/tab lain, maupun waktu pindah tab lalu balik
+// lagi. Posisi hanya dikembalikan kalau "tampilannya" sama (filter/tanggal/entitas/urutan tidak berubah);
+// kalau filter diganti, tabel memang mulai dari atas seperti biasa.
+function gsjViewCtx(tab) {
+  try {
+    if (tab === 'tab2') return JSON.stringify([tab2ChannelFilter, tab2MarketplaceFilter, tab2StatusFilter, tab2DateFilter, tab2SortState && tab2SortState.key, tab2SortState && tab2SortState.dir]);
+    if (tab === 'tab3') { const se = document.getElementById('t3-search'); return JSON.stringify([tab3Entity, tab3Date, tab3Period, se ? se.value : '', tab3SortState && tab3SortState.key, tab3SortState && tab3SortState.dir]); }
+  } catch (e) {}
+  return '';
+}
+function gsjScrollSnap(tab) {
+  const panel = document.getElementById(tab);
+  if (!panel) return null;
+  const wraps = [...panel.querySelectorAll('.table-wrap')].map((el, i) => ({ id: el.id || null, i, top: el.scrollTop, left: el.scrollLeft }));
+  return { winY: window.scrollY, wraps, ctx: gsjLastViewCtx[tab] !== undefined ? gsjLastViewCtx[tab] : gsjViewCtx(tab) };
+}
+// "tampilan" (filter/tanggal/entitas/urutan) waktu tabel TERAKHIR dibangun -> kalau berubah, jangan kembalikan posisi
+const gsjLastViewCtx = {};
+function gsjScrollRestore(tab, snap) {
+  if (!snap || snap.ctx !== gsjViewCtx(tab)) return false;
+  const panel = document.getElementById(tab);
+  if (!panel) return false;
+  const now = [...panel.querySelectorAll('.table-wrap')];
+  snap.wraps.forEach(w => {
+    const el = (w.id && document.getElementById(w.id)) || now[w.i];
+    if (el) { if (w.top) el.scrollTop = w.top; if (w.left) el.scrollLeft = w.left; }
+  });
+  if (Math.abs(window.scrollY - snap.winY) > 2) window.scrollTo(0, snap.winY);
+  return true;
+}
+// 1) render ulang di tab yang sama -> posisi tetap
+['renderTab2', 'renderTab2Table', 'renderTab3', 'renderTab3Table'].forEach(fn => {
+  if (typeof window[fn] !== 'function') return;
+  const tab = /Tab2/.test(fn) ? 'tab2' : 'tab3';
+  const orig = window[fn];
+  const wrapped = function () {
+    const panel = document.getElementById(tab);
+    const visible = panel && panel.classList.contains('active');
+    const snap = visible && !gsjScrollRestoreBusy ? gsjScrollSnap(tab) : null;
+    const out = orig.apply(this, arguments);
+    if (snap) { gsjScrollRestore(tab, snap); requestAnimationFrame(() => gsjScrollRestore(tab, snap)); }
+    gsjLastViewCtx[tab] = gsjViewCtx(tab);
+    return out;
+  };
+  window[fn] = wrapped;
+  try { eval(fn + ' = wrapped'); } catch (e) {}
+});
+let gsjScrollRestoreBusy = false;
+// 2) pindah tab lalu balik lagi -> posisi terakhir di tab itu dikembalikan
+const gsjTabScrollMem = {};
+document.addEventListener('click', e => {
+  const btn = e.target.closest && e.target.closest('.tab-btn');
+  if (!btn) return;
+  const cur = document.querySelector('.tab-btn.active');
+  if (cur && (cur.dataset.tab === 'tab2' || cur.dataset.tab === 'tab3') && cur !== btn) gsjTabScrollMem[cur.dataset.tab] = gsjScrollSnap(cur.dataset.tab);
+}, true);
+document.addEventListener('click', e => {
+  const btn = e.target.closest && e.target.closest('.tab-btn');
+  if (!btn) return;
+  const tab = btn.dataset.tab, snap = gsjTabScrollMem[tab];
+  if (!snap) return;
+  // tab mungkin dibangun ulang 1-2 frame kemudian (data berubah), dan ada animasi scroll ke atas -> coba beberapa kali
+  [60, 160, 350, 650].forEach(ms => setTimeout(() => { if (btn.classList.contains('active')) gsjScrollRestore(tab, snap); }, ms));
+});
+
+</script>
+<script>
+
+// Stok Terjual: keterangan jelas stok entitas mana yang sedang dilihat, karena kolom "Toko HNH/GM/MD" adalah
+// toko tempat barang laku — BUKAN entitas stok. (Contoh: laku di toko HNH tapi stoknya dipotong dari GSJ
+// -> muncul di tabel GSJ pada kolom "Laku di Toko HNH".)
+function t3EntityNote() {
+  const wrap = document.getElementById('t3-table-wrap');
+  if (!wrap || typeof tab3Period !== 'undefined' && tab3Period) return;
+  const sw = document.getElementById('t3-scrollwrap');
+  if (!sw || wrap.querySelector('.t3-entnote')) return;
+  const lbl = (typeof ENTITY_LABEL !== 'undefined' && ENTITY_LABEL[tab3Entity]) || tab3Entity;
+  const d = document.createElement('div');
+  d.className = 't3-entnote';
+  d.style.cssText = 'margin:0 0 8px;padding:7px 12px;border-radius:10px;background:#EEF2FF;border:1px solid #C7CCF5;color:#3730A3;font-size:12.5px;';
+  d.innerHTML = `Menampilkan stok <b>${escapeAttr(lbl)}</b> — semua angka di tabel ini dipotong dari stok <b>${escapeAttr(lbl)}</b>. Kolom <b>"Laku di Toko HNH / GM / MD"</b> = toko tempat barangnya laku, bukan entitas stok.`;
+  sw.parentNode.insertBefore(d, sw);
+}
+if (typeof renderTab3Table === 'function') {
+  const _oNote = renderTab3Table;
+  renderTab3Table = function () { const out = _oNote.apply(this, arguments); try { t3EntityNote(); } catch (e) {} return out; };
+}
+
+</script>
+<script>
+
+// ===== kembalikan_kunci_manual_hnh.js =====
+// Versi sebelumnya sempat MELEPAS kunci manual HNH pada 168 penjualan Oktober (Nitrile Exam Blue S & L) dan
+// memotongnya ulang otomatis (sebagian jadi ke GSM). Sesuai keputusan "yang dikunci manual jangan diapa-apain",
+// penjualan itu dikembalikan persis seperti semula: entitas HNH, terkunci manual, qty asli. Sekali jalan.
+const GSJ_RESTORE_MANUAL_HNH = [["idmw01aht710iq9y",2,2,"Glomed","OK"],["idmw01aht7qhb1uu",8,8,"Glomed","OK"],["idmw01aht8awmswo",3,3,"Glomed","OK"],["idmw01aht8bj662o",2,2,"Glomed","OK"],["idmw01aht8ku39cy",1,1,"Glomed","OK"],["idmw01aht8n9h36o",10,10,"Glomed","OK"],["idmw01aht9i0zj1k",1,1,"Glomed","OK"],["idmw01ahtiaij1nf",1,1,"Glomed","OK"],["idmw01ahtiqyn1x2",10,10,"Glomed","OK"],["idmw01ahtjg8rh3f",10,10,"Glomed","OK"],["idmw01ahtjgm9mi8",10,10,"Glomed","OK"],["idmw01ahtjrfwsh1",16,16,"Glomed","OK"],["idmw01ahtjxd6tsd",3,3,"Glomed","OK"],["idmw01ahtk8umh34",2,2,"Glomed","OK"],["idmw01ahtko2fewc",10,10,"Glomed","OK"],["idmw01ahtkuux2qc",2,2,"Glomed","OK"],["idmw01ahtsiy910q",2,2,"Glomed","OK"],["idmw01ahttjd06zd",2,2,"Glomed","OK"],["idmw01ahtu5sr901",2,2,"Glomed","OK"],["idmw01ahu068dze7",6,6,"Glomed","OK"],["idmw01ahu0maonuy",1,1,"Glomed","OK"],["idmw01ahu1tptdia",1,1,"Glomed","OK"],["idmw01ahua1kkd0e",2,2,"Glomed","OK"],["idmw01ahua95kqpu",1,1,"Glomed","OK"],["idmw01ahuadplzim",3,3,"Glomed","OK"],["idmw01ahuawcn9yk",1,1,"Glomed","OK"],["idmw01ahuc158o1l",4,4,"Glomed","OK"],["idmw01ahuct8x29e",1,1,"Glomed","OK"],["idmw01ahucvtiaqn",2,2,"Glomed","OK"],["idmw01ahud0g3vkp",1,1,"Glomed","OK"],["idmw01ahud614v4o",2,2,"Glomed","OK"],["idmw01ahue0ei2dw",1,1,"Glomed","OK"],["idmw01ahue93r5yc",10,10,"Glomed","OK"],["idmw01ahuekhofkr",2,2,"Glomed","OK"],["idmw01ahuekl2vfe",5,5,"Glomed","OK"],["idmw01ahuf8f2352",3,3,"Glomed","OK"],["idmw01ahugffa6w1",2,2,"Glomed","OK"],["idmw01ahuhbv5knt",2,2,"HNH","OK"],["idmw01ahuhdcaz7a",10,10,"Glomed","OK"],["idmw01ahui5ru2vw",8,8,"Glomed","OK"],["idmw01ahuijxokzf",3,3,"Glomed","OK"],["idmw01ahuikk64wv",2,2,"HNH","OK"],["idmw01ahuj5vu54w",4,4,"Glomed","OK"],["idmw01ahujf3rk9c",3,3,"Glomed","OK"],["idmw01ahulrzo8g4",1,1,"Glomed","OK"],["idmw01ahulw228pq",2,2,"Glomed","OK"],["idmw01ahum7x6ian",1,1,"Glomed","OK"],["idmw01ahumla58ig",1,1,"Glomed","OK"],["idmw01ahun7sh5ji",1,1,"HNH","OK"],["idmw01ahuot0hwpl",3,3,"HNH","OK"],["idmw01ahuoz065y4",1,1,"Glomed","OK"],["idmw01ahx5712pvr",1,1,"HNH","OK"],["idmw01ahx5o559wq",5,5,"Glomed","OK"],["idmw01ahx9skfmik",1,1,"HNH","OK"],["idmw01ahx9vb9gtc",1,1,"Glomed","OK"],["idmw01ahxarlui5m",1,1,"Glomed","OK"],["idmw01ahxax9zawj",2,2,"HNH","OK"],["idmw01ahxbm15t4s",5,5,"Glomed","OK"],["idmw01ahxbzen1yo",1,1,"Glomed","OK"],["idmw01ahxc256tvy",1,1,"Glomed","OK"],["idmw01ahxc358c5l",1,1,"HNH","OK"],["idmw01ahxc4wox4e",20,20,"Glomed","OK"],["idmw01ahxcb7kbja",1,1,"Glomed","OK"],["idmw01ahxco9fi4z",3,3,"Glomed","OK"],["idmw01ahxdfizhms",2,2,"Glomed","OK"],["idmw01ahzsnhtzur",1,1,"HNH","OK"],["idmw01ai04pv0nfp",5,5,"HNH","OK"],["idmw01ai05icoueq",1,1,"HNH","OK"],["idmw01ai06133q5f",3,3,"HNH","OK"],["idmw01ai064yna3l",7,7,"Glomed","OK"],["idmw01ai066cezc1",20,20,"HNH","OK"],["idmw01ai07xu0l0g",6,6,"HNH","OK"],["idmw01ai08ca7g74",2,2,"Glomed","OK"],["idmw01ai0983llnk",2,2,"Glomed","OK"],["idmw01ai0aqefhol",5,5,"HNH","OK"],["idmw01ai0b0hl3wo",1,1,"Glomed","OK"],["idmw01ai0bazr3l4",3,3,"Glomed","OK"],["idmw01ai0c086zq3",2,2,"Glomed","OK"],["idmw01ai0cpp9qbt",8,8,"Glomed","OK"],["idmw01ai0csjbltn",1,1,"HNH","OK"],["idmw01ai0cv5660f",10,10,"Glomed","OK"],["idmw01ai0dpovm7q",2,2,"Glomed","OK"],["idmw01ai0e86bevj",1,1,"HNH","OK"],["idmw01ai0e9lydj6",10,10,"Glomed","OK"],["idmw01ai0ea7ecqd",2,2,"Glomed","OK"],["idmw01ai0elkeimr",3,3,"Glomed","OK"],["idmw01ai0eqz09is",1,1,"HNH","OK"],["idmw01ai0f4bdh4u",2,2,"Glomed","OK"],["idmw01ai0f8wkdhc",4,4,"Glomed","OK"],["idmw01ai0fi5sl0r",1,1,"Glomed","OK"],["idmw01ai0gzmmuut",1,1,"Glomed","OK"],["idmw01ai0m756c83",1,1,"Glomed","OK"],["idmw01ai0mqvq2e9",6,6,"Glomed","OK"],["idmw01ai0n85eld8",7,7,"HNH","OK"],["idmw01ai0neu6lqp",2,2,"Glomed","OK"],["idmw01ai0o5fv41q",1,1,"Glomed","OK"],["idmw01ai0p7m18hk",2,2,"Glomed","OK"],["idmw01ai0qx8yvlo",2,2,"Glomed","OK"],["idmw01ai0sdqd09i",6,6,"Glomed","OK"],["idmw01ai0t9dyc39",1,1,"Glomed","OK"],["idmw01ai0to2mo1i",10,10,"Glomed","OK"],["idmw01ai0ua1yejr",2,2,"Glomed","OK"],["idmw01ai0ysqi6x2",10,10,"Glomed","OK"],["idmw01ai2uuiee19",1,1,"Glomed","OK"],["idmw01ai2v0c1i1d",2,2,"Glomed","OK"],["idmw01ai2vn88fcq",2,2,"Glomed","OK"],["idmw01ai3l77zh9p",9,9,"Glomed","OK"],["idmw01ai3lb4rp94",1,1,"Glomed","OK"],["idmw01ai3m0bstd6",12,12,"Glomed","OK"],["idmw01ai3n7scxkv",1,1,"Glomed","OK"],["idmw01ai3ndplphx",2,2,"Glomed","OK"],["idmw01ai3o4waajk",1,1,"Glomed","OK"],["idmw01ai3okokieu",1,1,"Glomed","OK"],["idmw01ai3okvcauh",1,1,"Glomed","OK"],["idmw01ai3qddeixp",2,2,"Glomed","OK"],["idmw01ai3r4q7nud",1,1,"Glomed","OK"],["idmw01ai3r5gfwfq",10,10,"Glomed","OK"],["idmw01ai3rw3iml0",6,6,"Glomed","OK"],["idmw01ai3rwkfxyt",4,4,"Glomed","OK"],["idmw01ai3s5y92qv",6,6,"Glomed","OK"],["idmw01ai3scik3y5",10,10,"Glomed","OK"],["idmw01ai3t74y2ou",1,1,"Glomed","OK"],["idmw01ai3tghs0lm",1,1,"Glomed","OK"],["idmw01ai3tqk05hr",3,3,"Gracia","OK"],["idmw01ai3tvcvmho",3,3,"Glomed","OK"],["idmw01ccmw5cajta",12,12,"Glomed","OK"],["idmw01ccr5r4rqnu",3,3,"Glomed","OK"],["idmw01ccr6drv0fg",3,3,"Glomed","OK"],["idmw01ccsu2lpc8t",3,3,"Glomed","OK"],["idmw01ccswczgwg7",20,20,"Glomed","OK"],["idmw01ccswg80c9w",1,1,"Glomed","OK"],["idmw01cct3yh9r9o",1,1,"Glomed","OK"],["idmw01ccz63cyvpm",3,3,"Glomed","OK"],["idmw01ccz6kz32e2",2,2,"HNH","OK"],["idmw01ccz7naun42",10,10,"Glomed","OK"],["idmw01ccz8ocpugt",3,3,"HNH","OK"],["idmw01ccz8sshw2r",5,5,"Glomed","OK"],["idmw01ccz9thp8w8",4,4,"HNH","OK"],["idmw01cczdnrh6p7",4,4,"Glomed","OK"],["idmw01cd28cdwr03",4,4,"HNH","OK"],["idmw01cd28pty4se",15,15,"Glomed","OK"],["idmw01cd28rzmrim",4,4,"Glomed","OK"],["idmw01cd3tden1u7",4,4,"Glomed","OK"],["idmw01cd3tdu3507",3,3,"Glomed","OK"],["idmw01cd3u9sl23d",1,1,"Glomed","OK"],["idmw01cd3v9bj8br",8,8,"Glomed","OK"],["idmw01cd3vgkx01f",10,10,"Glomed","OK"],["idmw01cd8wm5kogn",10,10,"Glomed","OK"],["idmw01cd8wzt16y0",6,6,"Glomed","OK"],["idmw01cd8xekwe7t",1,1,"Glomed","OK"],["idmw01cdapcsrl1r",10,10,"Glomed","OK"],["idmw01cdapudgbzc",2,2,"Glomed","OK"],["idmw01cdapxe0ful",10,10,"Glomed","OK"],["idmw01cdarglimly",4,4,"Glomed","OK"],["idmw01cdarx2yk2z",1,1,"Glomed","OK"],["idmw01cdci41cfnw",2,2,"Glomed","OK"],["idmw01cdholl5lvo",5,5,"Glomed","OK"],["idmw01cdhotpx06i",5,5,"Glomed","OK"],["idmw01cdje3zbcht",2,2,"Glomed","OK"],["idmw01cdmwh8a50a",20,20,"Glomed","OK"],["idmw02igf3lnl742",3,3,"Glomed","OK"],["idmw3hp8wevsm0fv",2,2,null,"OK"],["idmw3hp8wey8mhak",10,10,"HNH","OK"],["idmw3hp94p276czl",2,2,"Glomed","OK"],["idmw3hp98ct21qxj",3,3,"Glomed","OK"],["idmw3hp98emwx2mc",3,3,"Glomed","OK"],["idmw3hp98gx0qfzi",1,1,null,"OK"],["idmw3hp9e5o2sd0x",10,10,null,"OK"]];
+function gsjRestoreManualHnh() {
+  const byId = new Map(state.checkerRows.map(r => [r.id, r]));
+  const ids = new Set(GSJ_RESTORE_MANUAL_HNH.map(x => x[0]));
+  let fixed = 0;
+  // pecahan baris (split) yang sempat dibuat dari baris-baris ini dibuang dulu
+  const before = state.checkerRows.length;
+  state.checkerRows = state.checkerRows.filter(r => !(r.splitOf && ids.has(r.splitOf)));
+  const removedSplits = before - state.checkerRows.length;
+  GSJ_RESTORE_MANUAL_HNH.forEach(([id, qty, qtyInternal, autoEnt, status]) => {
+    const r = byId.get(id);
+    if (!r) return;
+    const need = r.entitas !== 'HNH' || !r.entitasManual || r.qty !== qty || r.qtyInternal !== qtyInternal || r.splitTotalQty != null;
+    if (!need) return;
+    r.entitas = 'HNH'; r.entitasManual = true; r.qty = qty;
+    if (qtyInternal === null || qtyInternal === undefined) delete r.qtyInternal; else r.qtyInternal = qtyInternal;
+    if (autoEnt === null || autoEnt === undefined) delete r.autoEnt; else r.autoEnt = autoEnt;
+    if (status) r.status = status;
+    delete r.splitTotalQty;
+    fixed++;
+  });
+  if (fixed || removedSplits) {
+    recomputeAllCheckerRows();
+    if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`mengembalikan ${fixed} penjualan Nitrile Exam Blue S/L Oktober ke HNH (kunci manual) seperti semula${removedSplits ? `, ${removedSplits} pecahan baris dihapus` : ''}`);
+  }
+  return { fixed, removedSplits };
+}
 
 </script>
 </body>
