@@ -2627,13 +2627,34 @@ function recomputeAllCheckerRows() {
     // current `nama` — because `nama` gets overwritten below to whichever entity-specific
     // name was used for stock accounting, and re-looking-up Master Produk from THAT would
     // fail once it no longer matches the canonical internal name.
+    // Baris tanpa nama marketplace (WA / diketik manual): kalau namanya belum diubah orang sejak hitungan
+    // terakhir, cari dari nama baku (namaCanonical) — dulu dicari dari nama tampilan, sehingga nama bisa
+    // bolak-balik tiap dihitung ulang (mis. "Endo Block" <-> "Endo Measuring Block") dan terkirim ulang ke server.
     const sourceNama = row.namaAsli || row.nama;
+    // Baris tanpa nama marketplace (WA / diketik) yang namanya tidak diubah orang sejak hitungan terakhir:
+    // namanya dipertahankan apa adanya. Dulu dicari ulang tiap hitungan -> nama bisa bolak-balik
+    // ("Endo Block" <-> "Endo Measuring Block") dan terus terkirim ulang ke server.
+    const stableManual = !row.namaAsli && !row.namaOverride && !row.paketDari && !!row.nama && (!row._namaHasil || row.nama === row._namaHasil);
     // Baris isi paket (dibuat dari paketIsi Master Produk) sudah pasti nama produknya — jangan dicari
     // ulang dari judul marketplace (judulnya milik produk utama paket).
-    const resolved = row.paketDari
+    // Barang DIGANTI khusus pesanan ini (mis. pembeli pesan Hitam, kosong, diganti Hijau): pakai nama
+    // pengganti itu, tanpa mengubah Master Produk listing-nya.
+    let resolved = row.namaOverride
+      ? (typeof gsjOverrideResolve === 'function' ? gsjOverrideResolve(row.namaOverride) : { matched: true, namaInternal: row.namaOverride, entitasTetap: '', catatan: '' })
+      : row.paketDari
       ? { matched: true, namaInternal: row.namaCanonical || row.nama, entitasTetap: '', catatan: '' }
       : resolveInternalName(sourceNama, row.variasi);
-    const genericNama = resolved.matched ? resolved.namaInternal : (row.namaCanonical || row.nama);
+    // Master Produk untuk listing ini masih "mentah" (nama internal = judul marketplace, belum dirapikan) tapi
+    // baris ini sudah diberi nama produk yang benar (dipilih orang) -> pertahankan nama itu, jangan dikembalikan
+    // ke judul marketplace tiap dihitung ulang.
+    let resolvedUse = resolved;
+    const _keepNm = (row.namaCanonical && normalizeName(row.namaCanonical) !== normalizeName(row.namaAsli || '')) ? row.namaCanonical : row.nama;
+    if (row.namaAsli && !row.namaOverride && resolved.matched && normalizeName(resolved.namaInternal) === normalizeName(row.namaAsli)
+        && _keepNm && normalizeName(_keepNm) !== normalizeName(row.namaAsli)) {
+      resolvedUse = (typeof gsjOverrideResolve === 'function') ? gsjOverrideResolve(_keepNm) : { matched: true, namaInternal: _keepNm, entitasTetap: '', catatan: '' };
+    }
+    resolved = resolvedUse;
+    const genericNama = stableManual ? (row.namaCanonical || row.nama) : (resolved.matched ? resolved.namaInternal : (row.namaCanonical || row.nama));
 
     // PATCH — unit multiplication (e.g. "1 box isinya 200 pcs"): Stok Terjual gets cut by
     // (order qty × multiplier), but the Checker/Excel Quantity column must keep showing the
@@ -2654,9 +2675,10 @@ function recomputeAllCheckerRows() {
     // and still deduct this row's qty from ITS CHOSEN entity's running stock, so later rows'
     // automatic decisions still see an accurate remaining balance.
     if (row.entitasManual) {
-      const nameInChosenEntity = nameForEntity(resolved, row.entitas) || genericNama;
+      const nameInChosenEntity = stableManual ? row.nama : (nameForEntity(resolved, row.entitas) || genericNama);
       row.nama = nameInChosenEntity;
       row.namaCanonical = genericNama;
+      if (!row.namaAsli) row._namaHasil = row.nama;
       row.catatan = resolved.catatan || row.catatanManual || row.catatan || '';
       row.fuzzyMatched = !!resolved.fuzzy;
       row.fuzzyScore = resolved.fuzzy ? resolved.fuzzyScore : undefined;
@@ -2676,7 +2698,7 @@ function recomputeAllCheckerRows() {
     row.autoTopUpQty = decision.autoTopUp > 0 ? decision.autoTopUp : undefined; // utk tanda "stok kurang" di tabel
     if (decision.status === 'OK') { productCursor[curKey] = decision.entitas; row.autoEnt = decision.entitas; }
     else row.autoEnt = undefined;
-    const finalNama = decision.namaUntukEntitas || genericNama;
+    const finalNama = (stableManual && decision.entitas === row.entitas) ? row.nama : (decision.namaUntukEntitas || genericNama);
 
     // Stok tidak ada yang cukup utuh tapi ada SEBAGIAN (mis. GSJ 14, terjual 15) -> pecah pesanan:
     // potong yang ada di GSM/HNH/GSJ (urut), sisanya ke HNH + tambah stok HNH. Baris tambahan
@@ -2733,6 +2755,7 @@ function recomputeAllCheckerRows() {
 
     row.nama = finalNama;
     row.namaCanonical = genericNama;
+    if (!row.namaAsli) row._namaHasil = row.nama;
     row.entitas = decision.entitas;
     row.status = decision.status;
     row.catatan = decision.catatanMaster || resolved.catatan || row.catatanManual || '';
@@ -14474,15 +14497,42 @@ async function gsjReconcileWithServer(onlyKeys, force) {
   gsjLastReconcileAt = Date.now();
   let changed = false;
   try {
-    for (const key of (onlyKeys || Object.keys(GSJ_SYNC_TABLES))) {
-      if (GSJ_OPTIONAL_TABLES[key] && window.__gsjMissing[key]) continue;
+    const keysAll = (onlyKeys || Object.keys(GSJ_SYNC_TABLES)).filter(key => !(GSJ_OPTIONAL_TABLES[key] && window.__gsjMissing[key]));
+    // Cek jumlah baris semua tabel SEKALIGUS (dulu satu per satu -> 2-5 detik menunggu server tiap kali cek).
+    const counts = {};
+    if (!force) {
+      const rs = await Promise.all(keysAll.map(key => gsjSupabase.from(GSJ_SYNC_TABLES[key]).select('id', { count: 'exact', head: true }).then(r => r, () => null)));
+      keysAll.forEach((key, i) => { const r = rs[i]; counts[key] = r && !r.error && typeof r.count === 'number' ? r.count : null; });
+    }
+    for (const key of keysAll) {
       // Ada perubahan lokal yang belum terkirim -> jangan ditimpa data server.
       if (gsjSyncDebounceTimers[key] || gsjSyncRetryTimers[key] || gsjPushInFlight[key]) continue;
       const table = GSJ_SYNC_TABLES[key];
       if (!force) {
-        const cnt = await gsjSupabase.from(table).select('id', { count: 'exact', head: true });
-        if (cnt.error || typeof cnt.count !== 'number') continue;
-        if (cnt.count === (state[key] || []).length) continue;
+        if (counts[key] === null || counts[key] === undefined) continue;
+        if (counts[key] === (state[key] || []).length) continue;
+        // Jumlah beda: ambil daftar id saja (ringan), lalu ambil baris yang kurang & buang yang sudah dihapus
+        // di server — tidak perlu unduh ulang seluruh tabel (dulu ±7 detik).
+        if (typeof gsjFetchIds === 'function' && typeof gsjFetchByIds === 'function') {
+          try {
+            const ids = await gsjFetchIds(table);
+            if (gsjSyncDebounceTimers[key] || gsjSyncRetryTimers[key] || gsjPushInFlight[key]) continue;
+            const srv = new Set(ids);
+            const local = new Set((state[key] || []).map(r => r && r.id).filter(Boolean));
+            const missing = ids.filter(id => !local.has(id));
+            const got = missing.length ? await gsjFetchByIds(table, missing) : [];
+            gsjIsApplyingRemoteChange = true;
+            gsjRemoteTouchedKeys.add(key);
+            const base = gsjSyncBaseline[key] || (gsjSyncBaseline[key] = {});
+            let arr = (state[key] || []).filter(r => !r || !r.id || srv.has(r.id) || base[r.id] === undefined);
+            Object.keys(base).forEach(id => { if (!srv.has(id)) delete base[id]; });
+            got.forEach(x => { if (x && x.data && x.data.id) { arr.push(x.data); base[x.data.id] = JSON.stringify(x.data); } });
+            state[key] = arr;
+            gsjIsApplyingRemoteChange = false;
+            changed = true;
+            continue;
+          } catch (e) { gsjIsApplyingRemoteChange = false; /* gagal -> pakai cara lama di bawah */ }
+        }
       }
       const res = await gsjFetchAll(table);
       if (res.error || !res.data) continue;
@@ -15249,6 +15299,16 @@ function gsjBootMainApp() {
               saveState();
             }
           } catch (e) { console.warn(e); }
+          // Sekali jalan: pesanan yang barangnya diganti (versi sebelumnya) masih terkunci ke entitas barang lama -> pilih ulang
+          try {
+            if (!state.settings.fixOverrideEntV1) {
+              let n = 0;
+              state.checkerRows.forEach(r => { if (r.namaOverride && r.entitasManual) { delete r.entitasManual; delete r.autoEnt; n++; } });
+              if (n) { recomputeAllCheckerRows(); if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`memilih ulang entitas ${n} pesanan yang barangnya diganti (sesuai stok barang pengganti)`); }
+              state.settings.fixOverrideEntV1 = true;
+              saveState();
+            }
+          } catch (e) { console.warn(e); }
           if (!state.settings.fixStokAwalCutoffV1) {
             recomputeAllCheckerRows();
             state.settings.fixStokAwalCutoffV1 = true;
@@ -15274,6 +15334,7 @@ function gsjBootMainApp() {
     if (document.visibilityState === 'hidden') return;
     const ae = document.activeElement;
     if (ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) return; // lagi mengetik -> tunda ke putaran berikutnya
+    if (typeof gsjUserBusy === 'function' && gsjUserBusy()) return; // baru saja mengetik/klik -> tunda
     const run = () => saveState();
     if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 5000 }); else run();
   }, 60000);
@@ -15713,7 +15774,7 @@ function ifxEnhance() {
   }
 
   // 7) semua perubahan -> segarkan tampilan + simpan draft
-  card.addEventListener('input', () => { ifxSync(); ifxDraftSave(); });
+  card.addEventListener('input', () => { clearTimeout(window._ifxSyncT); window._ifxSyncT = setTimeout(() => { try { ifxSync(); } catch (e) {} }, 150); ifxDraftSave(); });
   card.addEventListener('change', () => { ifxSync(); ifxDraftSave(); });
 
   // 8) draft yang belum disimpan
@@ -16697,6 +16758,7 @@ function gsjCacheSaveSoon(delay) {
 async function gsjCacheSaveNow() {
   if (!_gsjCacheReady || !gsjSupabaseOnline) return;
   if (!gsjNoPendingPush()) { gsjCacheSaveSoon(5000); return; } // masih ada yang belum terkirim -> nanti
+  if (typeof gsjUserBusy === 'function' && gsjUserBusy()) { gsjCacheSaveSoon(15000); return; } // jangan ganggu yang lagi mengetik
   const snap = undoHistory && undoHistory[undoIndex];
   if (!snap) return;
   const sig = Object.keys(snap).map(k => k + ':' + snap[k].length).join('|') + '|' + (state.lastEditedAt || '') + '|' + (gsjLastRemoteRenderAt || 0);
@@ -16706,7 +16768,7 @@ async function gsjCacheSaveNow() {
   await gsjIdbPut(GSJ_CACHE_KEY, { v: 1, savedAt: now, syncedAt: now, snap: Object.assign({}, snap), lastEditedBy: state.lastEditedBy || null, lastEditedAt: state.lastEditedAt || null });
   _gsjCacheSig = sig;
 }
-setInterval(() => { if (document.visibilityState !== 'hidden') gsjCacheSaveSoon(0); }, 45000);
+setInterval(() => { if (document.visibilityState !== 'hidden') gsjCacheSaveSoon(0); }, 180000); // tiap 3 menit, hanya saat tidak sedang dipakai
 window.addEventListener('beforeunload', () => { try { if (_gsjCacheReady && gsjNoPendingPush()) gsjCacheSaveNow(); } catch (e) {} });
 
 // ---------- banner kecil "memuat perubahan terbaru" ----------
@@ -17463,7 +17525,7 @@ function chatAnswer(raw) {
 // konfirmasi + saran nama yang mirip, supaya tidak tercipta baris produk dobel karena beda tulisan.
 let _invEntCat = { sig: '', map: {} };
 function invEntStCatalog(ent) {
-  const sig = [(state.invoices || []).length, (state.adjustments || []).length, (state.checkerRows || []).length, (state.masterProduk || []).length, (state.hiddenProducts || []).length, state.lastEditedAt || ''].join('|');
+  const sig = String(window.gsjCatVer || 0); // naik hanya kalau data produk/penjualan berubah (bukan per ketikan)
   if (_invEntCat.sig !== sig) _invEntCat = { sig, map: {} };
   if (!_invEntCat.map[ent]) {
     const list = ent ? getProductCatalogForEntity(ent) : [];
@@ -17572,7 +17634,7 @@ function ifpGoToInvoice(id) {
 // ditanya "belum ada di database" padahal sudah ada di Stok Terjual GSJ.
 let _knownNameCache = { sig: '', set: null };
 function isKnownProductName(nama) {
-  const sig = [(state.masterProduk || []).length, (state.invoices || []).length, (state.adjustments || []).length, (state.checkerRows || []).length, state.lastEditedAt || ''].join('|');
+  const sig = String(window.gsjCatVer || 0);
   if (_knownNameCache.sig !== sig || !_knownNameCache.set) {
     const set = new Set();
     const add = n => { const k = normalizeName(n); if (k) set.add(k); };
@@ -17724,15 +17786,27 @@ function renderCurrentItemsTable() {
     const it = currentInvoiceItems[Number(tr.dataset.idx)];
     tr.querySelectorAll('[data-f]').forEach(el => el.addEventListener('change', () => {
       const f = el.dataset.f;
-      if (f === 'qty') it.qty = Math.max(0, Number(el.value) || 0);
-      else if (f === 'harga') it.harga = parseRibuan(el.value);
-      else if (f === 'diskonValue') it.diskonValue = parseRibuan(el.value);
-      else if (f === 'nama') { const v = el.value.trim().replace(/\s+/g, ' '); if (v) it.nama = v; }
-      else it[f] = el.value;
-      renderCurrentItemsTable();
-      // kembalikan fokus ke sel berikutnya supaya enak lanjut mengetik
-      const next = document.querySelector(`#f1-item-tbody tr[data-idx="${tr.dataset.idx}"] [data-f="${f}"]`);
-      if (next && document.activeElement === document.body) { try { next.focus(); } catch (e) {} }
+      let nv;
+      if (f === 'qty') nv = Math.max(0, Number(el.value) || 0);
+      else if (f === 'harga' || f === 'diskonValue') nv = parseRibuan(el.value);
+      else if (f === 'nama') { nv = el.value.trim().replace(/\s+/g, ' '); if (!nv) { el.value = it.nama; return; } }
+      else nv = el.value;
+      // Nilai sama (mis. cuma ditambah nol di belakang koma waktu kursor pindah) -> tidak ada yang berubah.
+      // Dulu tabel selalu dibangun ulang + kursor dikembalikan ke kolom ini -> tidak bisa klik kolom lain /
+      // tombol Simpan ("nyangkut").
+      const old = it[f];
+      if ((typeof nv === 'number' && Number(old) === nv) || String(old ?? '') === String(nv)) return;
+      it[f] = nv;
+      // Perbarui subtotal baris ini & ringkasan TANPA membangun ulang tabel (kursor/klik tidak terganggu)
+      try {
+        const { val, mode } = readCurrentDiskonGlobal();
+        const pp = readCurrentPpn();
+        const sm = computeInvoiceSummary(currentInvoiceItems, val, mode, pp.enabled, pp.percent, pp.inclusive);
+        const row = sm.rows.find(r => r.it === it);
+        const cell = tr.querySelector('td.num'); if (cell && row) cell.textContent = fmtMoney(row.subtotalBersih || 0);
+      } catch (e) {}
+      renderInvoiceSummaryBox();
+      if (typeof ifxSync === 'function') { try { ifxSync(); } catch (e) {} }
     }));
     tr.querySelectorAll('input[data-f]').forEach(el => el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); el.blur(); } }));
   });
@@ -18159,6 +18233,200 @@ function qeEntityNameSlot(row, newNama) {
   invalidateMasterProdukIndex();
   qeAfterChange(`mengisi <b>Nama ${escapeAttr(lbl)}</b> untuk "${escapeAttr(row.namaAsli)}"${row.variasi ? ' (' + escapeAttr(row.variasi) + ')' : ''}: "${escapeAttr(old || cur)}" → <b>${escapeAttr(newNama)}</b> (nama di entitas lain tetap "${escapeAttr(cur)}")`);
   return true;
+}
+
+</script>
+<script>
+
+// Penanda "lagi dipakai": pekerjaan latar yang berat (simpan cadangan ke browser, simpan otomatis) ditunda
+// selama orang masih mengetik/klik, supaya mengetik tidak patah-patah di laptop yang lebih lambat.
+let gsjLastUserInputAt = 0;
+['keydown', 'input', 'pointerdown', 'wheel'].forEach(ev => document.addEventListener(ev, () => { gsjLastUserInputAt = Date.now(); }, { capture: true, passive: true }));
+function gsjUserBusy() { return Date.now() - gsjLastUserInputAt < 8000; }
+
+</script>
+<script>
+
+// ===== cek_lag_tambahan.js =====
+// "⏱️ Cek lag" ikut mencatat proses waktu MENGETIK di Invoice Masuk & pekerjaan latar (cadangan, riwayat,
+// Google Sheets, chat) — dicatat kalau > 80 ms, supaya ketahuan apa yang bikin lemot di laptop ini.
+(function () {
+  const LOG = window.__lagLog;
+  if (!LOG) return;
+  const add = (name, ms, note) => { LOG.push({ at: new Date(), name, ms: Math.round(ms), note: note || '' }); if (LOG.length > 300) LOG.shift(); };
+  const fns = ['ifxSync', 'ifxItemInfo', 'ifxDraftSave', 'invItemNameSuggest', 'invEntStCatalog', 'isKnownProductName', 'renderCurrentItemsTable', 'renderInvoiceSummaryBox',
+    'addCurrentInvoiceItem', 'submitInvoice', 'computeStockAsOfDate', 'gsjCacheSaveNow', 'gsjAuditPull', 'gsheetFetchRemoteStatus', 'renderGsheetBox', 'gsjRenderOnlineUsers',
+    'gsjApplyRemoteSettingsChange', 'renderTab1InvoiceList', 'searchInternalProductNames', 'getProductCatalogForEntity', 'getNamaInternalCatalog', 'snapTake', 'persistLocalSoon',
+    'chatRender', 'chatRenderList', 'chatPull', 'chatLoad', 'renderChat'];
+  fns.forEach(fn => {
+    const orig = window[fn];
+    if (typeof orig !== 'function' || orig.__lagWrapped2) return;
+    const w = function () {
+      const t0 = performance.now();
+      const r = orig.apply(this, arguments);
+      const ms = performance.now() - t0;
+      if (ms > 80 && !(r && typeof r.then === 'function')) add(fn, ms, document.activeElement && document.activeElement.id ? 'fokus di ' + document.activeElement.id : '');
+      if (r && typeof r.then === 'function') r.then(() => { const m2 = performance.now() - t0; if (m2 > 1500) add(fn + ' (server)', m2, 'menunggu jaringan'); }, () => {});
+      return r;
+    };
+    w.__lagWrapped2 = true;
+    try { window[fn] = w; } catch (e) {}
+  });
+  // jeda antar ketikan: kalau 1 huruf baru muncul > 150 ms setelah ditekan, catat
+  document.addEventListener('keydown', e => {
+    const t = e.target; if (!t || !/^(INPUT|TEXTAREA)$/.test(t.tagName)) return;
+    const t0 = performance.now();
+    requestAnimationFrame(() => setTimeout(() => { const ms = performance.now() - t0; if (ms > 150) add('(ketikan tertahan)', ms, 'kolom ' + (t.id || t.name || t.dataset.f || t.placeholder || t.tagName)); }, 0));
+  }, true);
+})();
+
+</script>
+<script>
+
+// ===== katalog_nama_cepat.js =====
+// Daftar nama barang (untuk pilihan nama di Invoice Masuk & cek "nama sudah ada") dulu dibangun ulang setiap
+// kali ada perubahan data apa pun — di laptop lambat bisa ±0,5 detik dan terjadi SAAT mengetik. Sekarang:
+//  - hanya dibangun ulang kalau data produk/penjualan/faktur benar-benar berubah (versi naik),
+//  - dan langsung disiapkan di latar saat aplikasi sedang longgar, jadi waktu mengetik tinggal pakai.
+window.gsjCatVer = window.gsjCatVer || 1;
+let _gsjCatSig = '', _gsjCatWarmT = null;
+function gsjCatDataSig() {
+  const a = state.invoices || [], c = state.checkerRows || [], d = state.adjustments || [], m = state.masterProduk || [];
+  // cukup ringan: jumlah + nama di beberapa posisi + versi undo (berubah tiap ada simpan)
+  const pick = (arr, f) => arr.length ? [0, (arr.length / 3) | 0, (arr.length * 2 / 3) | 0, arr.length - 1].map(i => f(arr[i] || {})).join('~') : '';
+  return [a.length, c.length, d.length, m.length, (state.hiddenProducts || []).length, typeof undoIndex !== 'undefined' ? undoIndex : '', typeof undoHistory !== 'undefined' ? undoHistory.length : '',
+    pick(c, r => r.nama + r.entitas), pick(m, x => x.namaInternal + x.namaGlomed + x.namaHNH + x.namaGracia)].join('|');
+}
+function gsjCatCheck() {
+  const sg = gsjCatDataSig();
+  if (sg !== _gsjCatSig) { _gsjCatSig = sg; window.gsjCatVer++; gsjCatWarmSoon(); }
+}
+function gsjCatWarmSoon() {
+  clearTimeout(_gsjCatWarmT);
+  _gsjCatWarmT = setTimeout(() => {
+    if (typeof gsjUserBusy === 'function' && gsjUserBusy() && !(document.activeElement && document.activeElement.id === 'f1-item-nama')) { gsjCatWarmSoon(); return; }
+    const run = () => { try { ENTITIES.forEach(e => invEntStCatalog(e)); isKnownProductName('__warm__'); } catch (e) {} };
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 3000 }); else run();
+  }, 600);
+}
+// versi naik setelah simpan / perubahan dari laptop lain
+['saveState', 'saveStateOnly', 'gsjApplyRemoteRowChange', 'recomputeAllCheckerRows'].forEach(fn => {
+  const orig = window[fn];
+  if (typeof orig !== 'function') return;
+  const w = function () { const r = orig.apply(this, arguments); try { gsjCatCheck(); } catch (e) {} return r; };
+  Object.keys(orig).forEach(k => { try { w[k] = orig[k]; } catch (e) {} });
+  window[fn] = w;
+});
+// siapkan di awal & saat kolom nama barang difokus
+document.addEventListener('focusin', e => { if (e.target && (e.target.id === 'f1-item-nama' || e.target.dataset && e.target.dataset.newitem === 'nama')) { try { gsjCatCheck(); ENTITIES.forEach(en => invEntStCatalog(en)); isKnownProductName('__warm__'); } catch (er) {} } });
+setTimeout(() => { try { gsjCatCheck(); } catch (e) {} }, 3000);
+
+</script>
+<script>
+
+// ===== jangan_ganti_tombol_saat_diklik.js =====
+// Waktu kursor pindah dari kolom isian ke tombol (mis. "Simpan Faktur"), kolom itu memicu perubahan ->
+// panel ringkasan kanan dibangun ulang, termasuk tombol Simpan-nya. Kalau itu terjadi DI ANTARA tombol mouse
+// ditekan dan dilepas, klik-nya hilang (tombol yang ditekan sudah diganti) -> "Simpan" tidak jalan.
+// Sekarang selama tombol mouse masih ditekan, pembaruan panel ditunda sampai mouse dilepas.
+let _gsjPtrDown = false, _gsjDeferred = [];
+document.addEventListener('pointerdown', () => { _gsjPtrDown = true; }, true);
+const _gsjPtrUp = () => {
+  if (!_gsjPtrDown) return;
+  _gsjPtrDown = false;
+  const q = _gsjDeferred.splice(0);
+  if (q.length) setTimeout(() => q.forEach(fn => { try { fn(); } catch (e) {} }), 30);
+};
+document.addEventListener('pointerup', _gsjPtrUp, true);
+document.addEventListener('pointercancel', _gsjPtrUp, true);
+function gsjAfterPointer(fn) { if (_gsjPtrDown) { if (!_gsjDeferred.includes(fn)) _gsjDeferred.push(fn); return true; } return false; }
+['ifxSync', 'renderInvoiceSummaryBox'].forEach(name => {
+  const orig = window[name];
+  if (typeof orig !== 'function') return;
+  const w = function () {
+    const args = arguments, self = this;
+    if (gsjAfterPointer(w._run || (w._run = () => orig.apply(self, args)))) return;
+    return orig.apply(this, arguments);
+  };
+  window[name] = w;
+});
+
+</script>
+<script>
+
+// ===== ganti_barang_per_pesanan.js =====
+// Import Marketplace: ganti nama barang KHUSUS 1 pesanan (barang ditukar ke varian lain karena kosong, dsb.)
+// tanpa mengubah Master Produk. Waktu nama di kolom "Cari/pilih nama internal" diganti, muncul pilihan:
+//   • Hanya pesanan ini (barang diganti)  -> disimpan di baris itu saja (namaOverride), stok yang dipotong ikut ganti
+//   • Semua pesanan listing ini            -> cara lama: disimpan ke Master Produk
+function gsjOverrideResolve(nama) {
+  const k = normalizeName(nama);
+  const m = (state.masterProduk || []).find(x => normalizeName(x.namaInternal) === k);
+  return { matched: true, namaInternal: nama, entitasTetap: m ? (m.entitasTetap || '') : '', catatan: m ? (m.catatan || '') : '' };
+}
+document.addEventListener('change', e => {
+  const linker = e.target && e.target.closest && e.target.closest('#t2-table-container [data-nama-linker]');
+  if (!linker || linker.dataset.passthrough === '1' || linker.disabled) return;
+  const v = linker.value.trim();
+  const tr = linker.closest('tr[data-id]');
+  const row = tr && state.checkerRows.find(x => x.id === tr.dataset.id);
+  if (!v || !row || !row.namaAsli) return;
+  e.stopImmediatePropagation();
+  const esc = escapeAttr;
+  const head = `<h3 class="ifp-title" style="font-size:17px;">Ganti barang untuk apa?</h3><div class="ifp-sub">${esc(row.namaAsli.slice(0, 80))}${row.variasi ? ' · variasi ' + esc(row.variasi) : ''}</div>`;
+  const body = `<div class="ifp-note info" style="font-size:13px;">Dari <b>${esc(row.nama || '-')}</b> menjadi <b>${esc(v)}</b></div>
+    <div style="font-size:12.5px;color:var(--muted);line-height:1.5;">• <b>Hanya pesanan ini</b> — mis. pembeli pesan Hitam tapi kosong, diganti Hijau. Stok yang dipotong ikut ganti, Master Produk <b>tidak</b> berubah.<br>• <b>Semua pesanan listing ini</b> — nama listing ini memang salah petakan; disimpan ke Master Produk.</div>`;
+  ifpOpen('warn', head, body, [
+    { label: '🔁 Hanya pesanan ini', cls: 'ok', def: true, fn: () => {
+      const lama = row.nama;
+      row.namaOverride = v; row.nama = v; row.namaCanonical = v; row.status = 'OK'; row.fuzzyMatched = false;
+      // Barangnya ganti -> entitas dipilih ulang otomatis dari stok barang PENGGANTI (GSM -> HNH -> GSJ).
+      // Pilihan entitas lama (manual) dibuat untuk barang yang lama, jadi tidak dipakai lagi.
+      delete row.entitasManual; delete row.autoEnt; row.entitas = '';
+      recomputeAllCheckerRows();
+      if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`mengganti barang <b>khusus pesanan ${esc(row.noPesanan || row.id)}</b> (tgl ${esc(row.tanggal)}) dari "${esc(lama || '')}" menjadi <b>${esc(v)}</b> — Master Produk tidak diubah`);
+      saveState();
+      try { renderTab2TableKeepScroll(); } catch (er) { try { renderTab2Table(); } catch (er2) {} }
+      if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+      if (typeof gsjShowToast === 'function') gsjShowToast(`🔁 Pesanan ini diganti ke ${v}`);
+    } },
+    { label: 'Semua pesanan listing ini', cls: 'sec', fn: () => {
+      linker.dataset.passthrough = '1';
+      linker.value = v;
+      linker.dispatchEvent(new Event('change', { bubbles: true }));
+      delete linker.dataset.passthrough;
+    } },
+    { label: 'Batal', cls: 'sec', fn: () => { linker.value = ''; } },
+  ], { noConfetti: true });
+}, true);
+// Tanda di baris yang barangnya diganti khusus pesanan itu + tombol batalkan
+function gsjOverrideBadges() {
+  document.querySelectorAll('#t2-table-container tr[data-id]').forEach(tr => {
+    const row = state.checkerRows.find(x => x.id === tr.dataset.id);
+    tr.querySelectorAll('.ovr-badge').forEach(x => x.remove());
+    if (!row || !row.namaOverride) return;
+    const ta = tr.querySelector('textarea[data-field="nama"]');
+    if (!ta) return;
+    const d = document.createElement('div');
+    d.className = 'ovr-badge';
+    d.style.cssText = 'font-size:10.5px;font-weight:700;color:#7C3AED;margin-top:2px;';
+    d.innerHTML = `🔁 diganti khusus pesanan ini <a href="#" style="color:#B91C1C;margin-left:4px;">batalkan</a>`;
+    d.querySelector('a').onclick = ev => {
+      ev.preventDefault();
+      if (!confirm('Kembalikan barang pesanan ini ke nama sesuai listing (Master Produk)?')) return;
+      const lama = row.namaOverride; delete row.namaOverride;
+      recomputeAllCheckerRows();
+      if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`membatalkan ganti barang khusus pesanan ${escapeAttr(row.noPesanan || row.id)} (tadinya "${escapeAttr(lama)}")`);
+      saveState();
+      try { renderTab2TableKeepScroll(); } catch (er) {}
+      if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+    };
+    ta.parentNode.insertBefore(d, ta.nextSibling);
+  });
+}
+if (typeof renderTab2Table === 'function') {
+  const _oOvr = renderTab2Table;
+  renderTab2Table = function () { const out = _oOvr.apply(this, arguments); try { gsjOverrideBadges(); } catch (e) {} return out; };
 }
 
 </script>
