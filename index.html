@@ -6599,6 +6599,16 @@ function bindTab2RichFieldEdits(tbody, spec) {
         if (String(oldVal) !== String(value)) {
           gsjDetailedAudit(`mengubah <b>${escapeAttr(key)}</b> — ${escapeAttr(row.nama || row.namaAsli || '')} (Import Marketplace) dari "${escapeAttr(String(oldVal))}" menjadi "${escapeAttr(String(value))}"`);
         }
+        if (store === 'row' && key === 'qty' && String(oldVal) !== String(value)) {
+          // Qty diubah -> hitung ulang supaya Stok Terjual langsung ikut (dulu baru ikut setelah ada hitung ulang
+          // lain, dan pesanan yang dibagi malah kembali ke jumlah awal).
+          if (row.splitOf || row.splitTotalQty != null) gsjFreezeSplitOnQty(row, oldVal);
+          recomputeAllCheckerRows();
+          saveState();
+          renderTab2TableKeepScroll();
+          if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+          return;
+        }
         saveState();
         // Only Qty/Harga affect the derived Pembayaran & Pemotongan Fee cells — patch just
         // those two cells in THIS row instead of re-rendering the whole table, so focus/Tab
@@ -6856,6 +6866,24 @@ function bindNamaLinkerAutocomplete(input) {
   });
 }
 
+// Qty salah satu bagian PESANAN YANG DIBAGI diubah (mis. pesan 200, dikirim 169: GSM 120 + HNH 49).
+// Dulu pesanan dibagi ulang dari jumlah awal (200) tiap dihitung ulang -> qty balik sendiri & Stok Terjual
+// tidak ikut. Sekarang bagian-bagiannya DIKUNCI apa adanya (entitas & qty masing-masing tetap).
+function gsjFreezeSplitOnQty(row, oldVal) {
+  const pid = row.splitOf || row.id;
+  const left = state.checkerRows.filter(x => x.id === pid || x.splitOf === pid);
+  const total = left.reduce((a2, x) => a2 + (Number(x.qty) || 0), 0);
+  const info = left.map(x => `${ENTITY_LABEL[x.entitas] || x.entitas} ${x.qty}`).join(' + ') + ` (dikirim ${total})`;
+  left.forEach(x => {
+    delete x.splitOf; delete x.splitTotalQty;
+    x.qtyInternal = Number(x.qty) || 0;
+    x.entitasManual = true; x.status = 'OK'; x.autoEnt = undefined; x.autoTopUpQty = undefined;
+    x.splitInfo = left.length > 1 ? info : undefined;
+    x.qtyEditManual = true;
+  });
+  gsjDetailedAudit(`mengubah qty pesanan dibagi <b>${escapeAttr(row.nama || '')}</b> tgl ${escapeAttr(row.tanggal)}: ${escapeAttr(String(oldVal))} → <b>${fmtNum(row.qty)}</b> — sekarang ${escapeAttr(info)}`);
+}
+
 function bindTab2RowActions(tbody) {
   tbody.querySelectorAll('tr[data-id]').forEach(tr => {
     const id = tr.dataset.id;
@@ -6868,6 +6896,14 @@ function bindTab2RowActions(tbody) {
         const oldVal = input.dataset.oldValue || '';
         const prevStatus = row.status;
         row[field] = (field === 'qty') ? Number(input.value)||0 : input.value;
+        if (field === 'qty' && (row.splitOf || row.splitTotalQty != null)) {
+          gsjFreezeSplitOnQty(row, oldVal);
+          recomputeAllCheckerRows();
+          saveState();
+          renderTab2TableKeepScroll();
+          if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+          return;
+        }
         if (field === 'entitas' && ENTITIES.includes(row.entitas) && (row.splitOf || row.splitTotalQty != null)) {
           // Baris bagian dari PESANAN YANG DIBAGI: pilihan entitas berlaku untuk bagian ini saja.
           // Kalau entitasnya sama dengan bagian lain -> digabung jadi satu baris lagi.
@@ -15310,6 +15346,23 @@ function gsjBootMainApp() {
               saveState();
             }
           } catch (e) { console.warn(e); }
+          // Sekali jalan: Wrapping Paper SMS 50X50 (10 Okt) pesan 200, dikirim 169 (31 refund) -> GSM 120 + HNH 49, dikunci
+          try {
+            if (!state.settings.fixWrappingRefundV1) {
+              const P = state.checkerRows.find(r => r.id === 'idmw01ahulpiaq4m');
+              const C = state.checkerRows.find(r => r.id === 'idmw01ahulpiaq4m~HNH');
+              if (P && C && !P.entitasManual) {
+                [P, C].forEach(x => { delete x.splitOf; delete x.splitTotalQty; x.entitasManual = true; x.status = 'OK'; x.autoEnt = undefined; x.autoTopUpQty = undefined; x.qtyEditManual = true; });
+                P.entitas = 'Gracia'; P.qty = 120; P.qtyInternal = 120;
+                C.entitas = 'HNH'; C.qty = 49; C.qtyInternal = 49;
+                P.splitInfo = C.splitInfo = 'GSM (Gracia) 120 + HNH 49 (dikirim 169)';
+                recomputeAllCheckerRows();
+                if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit('memperbaiki pesanan Wrapping Paper SMS 50X50 CM tgl 10 Okt: pesan 200, dikirim 169 (31 refund) — GSM 120 + HNH 49');
+              }
+              state.settings.fixWrappingRefundV1 = true;
+              saveState();
+            }
+          } catch (e) { console.warn(e); }
           if (!state.settings.fixStokAwalCutoffV1) {
             recomputeAllCheckerRows();
             state.settings.fixStokAwalCutoffV1 = true;
@@ -18402,8 +18455,13 @@ document.addEventListener('change', e => {
 }, true);
 // Tanda di baris yang barangnya diganti khusus pesanan itu + tombol batalkan
 function gsjOverrideBadges() {
+  // cepat: hanya baris yang memang diganti (biasanya sedikit sekali) yang dicari
+  const ovr = new Map(); state.checkerRows.forEach(x => { if (x.namaOverride) ovr.set(x.id, x); });
+  document.querySelectorAll('#t2-table-container .ovr-badge').forEach(x => { if (!ovr.has((x.closest('tr') || {}).dataset && x.closest('tr').dataset.id)) x.remove(); });
+  if (!ovr.size) return;
   document.querySelectorAll('#t2-table-container tr[data-id]').forEach(tr => {
-    const row = state.checkerRows.find(x => x.id === tr.dataset.id);
+    const row = ovr.get(tr.dataset.id);
+    if (!row) return;
     tr.querySelectorAll('.ovr-badge').forEach(x => x.remove());
     if (!row || !row.namaOverride) return;
     const ta = tr.querySelector('textarea[data-field="nama"]');
@@ -18511,6 +18569,47 @@ function t3HiddenButton() {
 if (typeof renderTab3 === 'function') {
   const _oHid = renderTab3;
   renderTab3 = function () { const out = _oHid.apply(this, arguments); try { t3HiddenButton(); } catch (e) {} return out; };
+}
+
+</script>
+<script>
+
+// ===== label_isi_paket.js =====
+// Import Marketplace: baris "isi paket" (mis. listing "Lampu Spirtus" variasi "LAMPU + BUBBLE" = 1 pesanan memotong
+// Lampu Spiritus DAN Bubble wrap) diberi keterangan jelas + nama barang utamanya, dan kolom nama dikunci
+// (diubahnya lewat Master Produk -> Isi Paket), supaya tidak dikira pesanannya cuma memotong Bubble wrap.
+function t2PaketLabels() {
+  // cepat: peta induk -> isi paket dibuat sekali (dulu dicari ulang di semua penjualan untuk tiap baris)
+  const byId = new Map(), kidsOf = new Map();
+  state.checkerRows.forEach(r => { byId.set(r.id, r); if (r.paketDari) { const a = kidsOf.get(r.paketDari) || []; a.push(r); kidsOf.set(r.paketDari, a); } });
+  document.querySelectorAll('#t2-table-container tr[data-id]').forEach(tr => {
+    const r = byId.get(tr.dataset.id);
+    tr.querySelectorAll('.pk-badge').forEach(x => x.remove());
+    if (!r) return;
+    const esc = escapeAttr;
+    const anchor = tr.querySelector('textarea[data-field="nama"]') || tr.querySelector('[data-nama-linker]');
+    if (!anchor) return;
+    const d = document.createElement('div');
+    d.className = 'pk-badge';
+    d.style.cssText = 'font-size:11px;font-weight:700;margin-top:3px;line-height:1.35;';
+    if (r.paketDari) {
+      const induk = byId.get(r.paketDari);
+      d.style.color = '#15803D';
+      d.innerHTML = `✔ Isi paket varian "${esc(r.variasi || '')}" — sudah ikut dipotong bersama <b>${esc(induk ? induk.nama : '?')}</b>`;
+      const lk = tr.querySelector('[data-nama-linker]');
+      if (lk) { lk.disabled = true; lk.placeholder = '🔒 isi paket'; }
+    } else {
+      const kids = kidsOf.get(r.id) || [];
+      if (!kids.length) return;
+      d.style.color = '#15803D';
+      d.innerHTML = `✔ ${kids.map(k => `<b>${esc(k.nama)}</b> ×${fmtNum(k.qtyInternal != null ? k.qtyInternal : k.qty)}`).join(', ')} juga sudah dipotong`;
+    }
+    anchor.parentNode.insertBefore(d, anchor.nextSibling);
+  });
+}
+if (typeof renderTab2Table === 'function') {
+  const _oPk = renderTab2Table;
+  renderTab2Table = function () { const out = _oPk.apply(this, arguments); try { t2PaketLabels(); } catch (e) {} return out; };
 }
 
 </script>
