@@ -7495,6 +7495,7 @@ const TAB3_COLUMN_DEFS = [
   { key: 'grandTotal', label: 'Grand Total', type: 'numeric', getter: r => r.grandTotal },
   { key: 'hargaModal', label: 'Harga Modal', type: 'numeric', getter: r => r.hargaModal },
   { key: 'totalPembayaran', label: 'Total Pembayaran', type: 'numeric', getter: r => r.totalPembayaran },
+  { key: 'totalPembayaranMD', label: 'Total Pembayaran MD', type: 'numeric', getter: r => r.totalPembayaranMD },
   { key: 'fakturPajak', label: 'Faktur Pajak', type: 'numeric', getter: r => r.fakturPajak },
   { key: 'wa', label: 'WA', type: 'numeric', getter: r => r.wa },
   { key: 'penambahan', label: '+Stok', type: 'numeric', getter: r => r.penambahan },
@@ -8365,7 +8366,12 @@ function computeSingleProductPivot(entitas, tanggal, nama, stokAwalMap, dayRows,
   const penambahanManual = dayAdjustments.filter(a => normalizeName(a.nama) === key).reduce((s,a) => s + (Number(a.qty)||0), 0);
   const penambahan = penambahanInvoice + penambahanManual;
   const hargaModal = avgModalFromInvoice(entitas, nama);
-  const totalPembayaran = grandTotal * (hargaModal + markup);
+  // Pisahkan Medident (centang di Rekap Stok Terjual): penjualan Medident yang dipisah TIDAK masuk Total Pembayaran
+  // (= omset Gracia / H&H), tapi masuk Total Pembayaran MD (= Total Omset "H&H beli ke ..."). Rumus sama.
+  const _sp = getRekapSplit(tanggal);
+  const qtyMD = (_sp.shopee ? b.mShopee : 0) + (_sp.tokped ? b.mTokopedia : 0);
+  const totalPembayaran = (grandTotal - qtyMD) * (hargaModal + markup);
+  const totalPembayaranMD = qtyMD * (hargaModal + markup);
   const stokAkhir = stokAwal + penambahan - grandTotal - b.fakturPajak - b.wa;
   const namaCustomer = getNamaCustomer(entitas, tanggal, nama);
   // Kalau salah satu barang yang nambah stok hari ini datangnya dari faktur yang MASIH Surat
@@ -8373,7 +8379,7 @@ function computeSingleProductPivot(entitas, tanggal, nama, stokAwalMap, dayRows,
   // dipercaya dari kalkulasi tanggalStok di belakang layar saja.
   const hasPendingFaktur = matchingInvoiceItems.some(it => it._jenisDokumen === 'Surat Jalan');
   const satuan = getProductSatuan(entitas, nama);
-  return { nama, stokAwal, ...b, totalOwn, totalGM, totalM, grandTotal, hargaModal, totalPembayaran, penambahan, penambahanInvoice, stokAkhir, namaCustomer, fuzzyContributors, hasPendingFaktur, satuan };
+  return { nama, stokAwal, ...b, totalOwn, totalGM, totalM, grandTotal, hargaModal, totalPembayaran, totalPembayaranMD, qtyMD, penambahan, penambahanInvoice, stokAkhir, namaCustomer, fuzzyContributors, hasPendingFaktur, satuan };
 }
 
 // ---------- Nama mentah marketplace -> nama internal yang benar (otomatis + manual) ----------
@@ -9403,6 +9409,7 @@ function buildTab3RowHTML(r) {
       <td class="num" data-cell="grandTotal" data-action="quickedit" title="Klik untuk cek transaksi" style="cursor:pointer;text-decoration:underline dotted;font-family:var(--mono); font-weight:700;">${fmtNum(r.grandTotal)}</td>
       <td class="num editable-cell"><input type="number" data-field="hargaModal" value="${Math.round(r.hargaModal)}"></td>
       <td class="num" data-cell="totalPembayaran" style="font-family:var(--mono);">${fmtMoney(Math.round(r.totalPembayaran))}</td>
+      <td class="num" data-cell="totalPembayaranMD" style="font-family:var(--mono);background:#FFF7ED;">${fmtMoney(Math.round(r.totalPembayaranMD || 0))}</td>
       <td class="num editable-cell"><input type="number" data-platform="fakturPajak" value="${r.fakturPajak||0}"></td>
       <td class="num editable-cell"><input type="number" data-platform="wa" value="${r.wa||0}"></td>
       <td class="num editable-cell" data-cell="penambahanWrap" style="${r.penambahan ? 'background:#eef8ee;' : ''}position:relative;">
@@ -9462,13 +9469,15 @@ function renderTab3TableInner() {
   pivot = applySortState(pivot, TAB3_COLUMN_DEFS, tab3SortState);
 
   const grand = pivot.reduce((acc, r) => {
-    acc.terjual += r.grandTotal; acc.pembayaran += r.totalPembayaran; acc.penambahan += r.penambahan;
+    acc.terjual += r.grandTotal; acc.pembayaran += r.totalPembayaran; acc.pembayaranMD += r.totalPembayaranMD || 0; acc.penambahan += r.penambahan;
     return acc;
-  }, { terjual: 0, pembayaran: 0, penambahan: 0 });
+  }, { terjual: 0, pembayaran: 0, pembayaranMD: 0, penambahan: 0 });
+  const _spD = getRekapSplit(tab3Date);
   document.getElementById('t3-summary').innerHTML = `
     <div class="stat-box"><div class="label">Jumlah SKU</div><div class="value">${fmtNum(pivot.length)}</div></div>
     <div class="stat-box"><div class="label">Total Terjual (${entitas})</div><div class="value">${fmtNum(grand.terjual)}</div></div>
-    <div class="stat-box"><div class="label">Total Pembayaran</div><div class="value">${fmtMoney(grand.pembayaran)}</div></div>
+    <div class="stat-box"><div class="label">Total Pembayaran${_spD.any ? ' (tanpa ' + rekapMdLabel(_spD) + ')' : ''}</div><div class="value">${fmtMoney(Math.round(grand.pembayaran))}</div></div>
+    ${_spD.any ? '<div class="stat-box" style="border-color:#FDBA74;"><div class="label" style="color:#C2410C;">Total Pembayaran ' + rekapMdLabel(_spD) + '</div><div class="value">' + fmtMoney(Math.round(grand.pembayaranMD)) + '</div></div>' : ''}
     <div class="stat-box"><div class="label">Penambahan Stok</div><div class="value">${fmtNum(grand.penambahan)}</div></div>
   `;
 
@@ -9496,7 +9505,8 @@ function renderTab3TableInner() {
           <th rowspan="2" style="width:65px;vertical-align:middle;">Total Toko MD${renderFilterIcon('totalM', tab3ColumnFilters, tab3SortState)}</th>
           <th rowspan="2" style="width:75px;vertical-align:middle;">Grand Total${renderFilterIcon('grandTotal', tab3ColumnFilters, tab3SortState)}</th>
           <th rowspan="2" style="width:95px;vertical-align:middle;">Harga Modal${renderFilterIcon('hargaModal', tab3ColumnFilters, tab3SortState)}</th>
-          <th rowspan="2" style="width:110px;vertical-align:middle;">Total Pembayaran${renderFilterIcon('totalPembayaran', tab3ColumnFilters, tab3SortState)}</th>
+          <th rowspan="2" style="width:110px;vertical-align:middle;">Total Pembayaran${getRekapSplit(tab3Date).any ? '<div style="font-weight:400;font-size:10px;">(tanpa ' + rekapMdLabel(getRekapSplit(tab3Date)) + ')</div>' : ''}${renderFilterIcon('totalPembayaran', tab3ColumnFilters, tab3SortState)}</th>
+          <th rowspan="2" style="width:110px;vertical-align:middle;background:#FFEDD5;color:#C2410C;" title="Penjualan Medident yang dipisah × (Harga Modal + markup) — masuk Total Omset H&amp;H beli ke Gracia / Glomed">Total Pembayaran ${getRekapSplit(tab3Date).any ? rekapMdLabel(getRekapSplit(tab3Date)) : 'MD (tidak dipisah)'}${renderFilterIcon('totalPembayaranMD', tab3ColumnFilters, tab3SortState)}</th>
           <th rowspan="2" style="width:65px;vertical-align:middle;">Faktur Pajak${renderFilterIcon('fakturPajak', tab3ColumnFilters, tab3SortState)}</th>
           <th rowspan="2" style="width:60px;vertical-align:middle;">WA${renderFilterIcon('wa', tab3ColumnFilters, tab3SortState)}</th>
           <th rowspan="2" style="width:65px;vertical-align:middle;">+Stok${renderFilterIcon('penambahan', tab3ColumnFilters, tab3SortState)}</th>
@@ -9693,6 +9703,7 @@ function patchTab3Row(tr, entitas, nama) {
   set('[data-cell="totalM"]', fmtNum(r.totalM));
   set('[data-cell="grandTotal"]', fmtNum(r.grandTotal));
   set('[data-cell="totalPembayaran"]', fmtMoney(Math.round(r.totalPembayaran)));
+  set('[data-cell="totalPembayaranMD"]', fmtMoney(Math.round(r.totalPembayaranMD || 0)));
   set('[data-cell="stokAkhir"]', fmtNum(r.stokAkhir), r.stokAkhir < 0);
   const penambahanCell = tr.querySelector('[data-cell="penambahanWrap"]');
   if (penambahanCell) {
@@ -9818,7 +9829,6 @@ function addStokTerjualRekapSheet(wb, entitas, monthKey, half, dailySheetNames, 
   const sp = getRekapSplit(rg.start);
   const mdLbl = rekapMdLabel(sp);
   const _rkLock = getRekapLock(entitas, rg.start, rg.end);
-  if (_rkLock && _rkLock.markup != null) markup = Number(_rkLock.markup) || 0;
   // Kolom (huruf ikut otomatis): Nama | Toko | [MD] | WA | Total | HM | Bayar | [Bayar MD] | Satuan
   const COLS = [
     { header: 'Nama Produk', key: 'nama', width: 38 },
@@ -9843,10 +9853,12 @@ function addStokTerjualRekapSheet(wb, entitas, monthKey, half, dailySheetNames, 
     c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
   });
   const q = n => "'" + String(n).replace(/'/g, "''") + "'";
-  // Kolom sheet harian: I = Terjual Shopee M, J = Terjual Tokopedia M, M = Grand Total, Q = WA
+  // Kolom sheet harian: I = Terjual Shopee M, J = Terjual Tokopedia M, M = Grand Total, R = WA
+  // (P = Total Pembayaran MD, Q = Faktur Pajak, R = WA). Rekap SELALU pakai rumus supaya bisa dicek dari sheet harian.
   const sumDaily = (letter, dr) => 'SUM(' + dailySheetNames.map(s => q(s) + '!' + letter + dr).join(',') + ')';
   const mdParts = dr => [sp.shopee ? sumDaily('I', dr) : null, sp.tokped ? sumDaily('J', dr) : null].filter(Boolean);
-  const rows = computeStokTerjualRekap(entitas, rg.start, rg.end);
+  // Baris produk = urutan katalog yang sama dengan sheet harian (hitungan dari data sekarang).
+  const rows = computeStokTerjualRekapLive(entitas, rg.start, rg.end);
   const thin = { style: 'thin', color: { argb: 'FFE3E7EE' } };
   rows.forEach((r, i) => {
     const rn = i + 2;
@@ -9854,9 +9866,9 @@ function addStokTerjualRekapSheet(wb, entitas, monthKey, half, dailySheetNames, 
     const row = ws.getRow(rn);
     const _hm = Number(r.hargaModal) || 0;
     row.getCell(col('nama')).value = r.nama;
-    row.getCell(col('mp')).value = _rkLock ? r.terjualMP : { formula: sumDaily('M', dr) + mdParts(dr).map(x => '-' + x).join(''), result: r.terjualMP };
-    if (sp.any) row.getCell(col('md')).value = _rkLock ? r.terjualMD : { formula: mdParts(dr).join('+'), result: r.terjualMD };
-    row.getCell(col('wa')).value = _rkLock ? r.wa : { formula: sumDaily('Q', dr), result: r.wa };
+    row.getCell(col('mp')).value = { formula: sumDaily('M', dr) + mdParts(dr).map(x => '-' + x).join(''), result: r.terjualMP };
+    if (sp.any) row.getCell(col('md')).value = { formula: mdParts(dr).join('+'), result: r.terjualMD };
+    row.getCell(col('wa')).value = { formula: sumDaily('R', dr), result: r.wa };
     row.getCell(col('total')).value = { formula: col('mp') + rn + (sp.any ? '+' + col('md') + rn : '') + '+' + col('wa') + rn, result: r.totalTerjual };
     // Harga modal ditulis APA ADANYA (dengan koma) supaya Total Pembayaran di Excel = di aplikasi.
     row.getCell(col('hm')).value = _hm;
@@ -9878,15 +9890,34 @@ function addStokTerjualRekapSheet(wb, entitas, monthKey, half, dailySheetNames, 
     if (sp.any && r.terjualMD > 0) row.getCell(col('md')).font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FFC2410C' } };
   });
   const last = rows.length + 1;
-  const tr = ws.getRow(last + 1);
+  const trN = last + 1;
+  const tr = ws.getRow(trN);
   tr.getCell(1).value = 'TOTAL';
-  ['mp', 'md', 'wa', 'total', 'bayar', 'bayarMD'].forEach(k => { if (COLS.some(c => c.key === k)) tr.getCell(col(k)).value = { formula: 'SUM(' + col(k) + '2:' + col(k) + last + ')' }; });
-  for (let c = 1; c <= NC; c++) {
-    const cell = tr.getCell(c);
-    cell.font = { name: 'Calibri', size: 10.5, bold: true };
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLS[c - 1].md ? 'FFFFE699' : 'FFD9D9D9' } };
-    cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
-    if (COLS[c - 1].key === 'bayar' || COLS[c - 1].key === 'bayarMD') cell.numFmt = '#,##0';
+  const sumKeys = ['mp', 'md', 'wa', 'total', 'bayar', 'bayarMD'].filter(k => COLS.some(c => c.key === k));
+  sumKeys.forEach(k => { tr.getCell(col(k)).value = { formula: 'SUM(' + col(k) + '2:' + col(k) + last + ')' }; });
+  const styleRow = (rw, fillArgb, mdFill) => {
+    for (let c = 1; c <= NC; c++) {
+      const cell = rw.getCell(c);
+      cell.font = { name: 'Calibri', size: 10.5, bold: true };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLS[c - 1].md ? mdFill : fillArgb } };
+      cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
+      if (COLS[c - 1].key === 'bayar' || COLS[c - 1].key === 'bayarMD') cell.numFmt = '#,##0';
+    }
+  };
+  styleRow(tr, 'FFD9D9D9', 'FFFFE699');
+  // Rekap TERKUNCI: tampilkan angka saat dikunci + selisih (TOTAL rumus − angka terkunci). Selisih 0 = data harian masih sama.
+  if (_rkLock) {
+    const lt = rekapTotals(computeStokTerjualRekap(entitas, rg.start, rg.end));
+    const lockedVal = { mp: lt.mp, md: lt.md, wa: lt.wa, total: lt.total, bayar: Math.round(lt.bayar * 100) / 100, bayarMD: Math.round(lt.bayarMD * 100) / 100 };
+    const r1 = ws.getRow(trN + 1), r2 = ws.getRow(trN + 2);
+    r1.getCell(1).value = '🔒 ANGKA TERKUNCI (' + (_rkLock.by || '-') + ')';
+    r2.getCell(1).value = 'SELISIH (TOTAL − TERKUNCI)';
+    sumKeys.forEach(k => {
+      r1.getCell(col(k)).value = lockedVal[k];
+      r2.getCell(col(k)).value = { formula: col(k) + trN + '-' + col(k) + (trN + 1) };
+    });
+    styleRow(r1, 'FFDBEAFE', 'FFFFE699');
+    styleRow(r2, 'FFF3F4F6', 'FFFFF2CC');
   }
   ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: NC } };
   ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 1 }];
@@ -9904,6 +9935,10 @@ function buildStokTerjualWorkbookAndDownload(entitas, dates, filenameBase, opts)
     const pivot = computeStokTerjualPivot(entitas, tanggal);
     const markup = state.settings.markupPerUnit || 0;
     const sheetName = dateLabelID(tanggal).slice(0, 31);
+    // Pisahkan Medident: kolom I (Shopee M) / J (Tokped M) yang dipisah dikeluarkan dari Total Pembayaran
+    // dan dihitung di kolom P "Total Pembayaran MD" (rumus sama: qty x (Harga Modal + markup)).
+    const _spX = getRekapSplit(tanggal);
+    const _mdCols = [_spX.shopee ? 'I' : null, _spX.tokped ? 'J' : null].filter(Boolean);
     const ws = wb.addWorksheet(safeSheetName(sheetName));
     const COLS = [
       { header: 'Nama Produk', key: 'nama', width: 30 },
@@ -9920,7 +9955,8 @@ function buildStokTerjualWorkbookAndDownload(entitas, dates, filenameBase, opts)
       { header: 'Total M', key: 'totalM', width: 10 },
       { header: 'Grand Total Terjual', key: 'grandTotal', width: 12 },
       { header: 'Harga Modal', key: 'hargaModal', width: 13 },
-      { header: 'Total Pembayaran', key: 'totalPembayaran', width: 15 },
+      { header: _spX.any ? 'Total Pembayaran (tanpa ' + rekapMdLabel(_spX) + ')' : 'Total Pembayaran', key: 'totalPembayaran', width: 15 },
+      { header: 'Total Pembayaran ' + (_spX.any ? rekapMdLabel(_spX) : 'MD (tidak dipisah)'), key: 'totalPembayaranMD', width: 15 },
       { header: 'Faktur Pajak', key: 'fakturPajak', width: 11 },
       { header: 'WA', key: 'wa', width: 8 },
       { header: '+Stok', key: 'penambahan', width: 8 },
@@ -9990,6 +10026,7 @@ function buildStokTerjualWorkbookAndDownload(entitas, dates, filenameBase, opts)
       });
     });
 
+    { const hc = headerRow.getCell('totalPembayaranMD'); hc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFF9900' } }; hc.font = { name: 'Calibri', size: 10.5, bold: true, color: { argb: 'FFFFFFFF' } }; }
     // ---- Baris data (mulai baris 4) — nilai & RUMUS perhitungan persis seperti semula ----
     const thinBorder = { style: 'thin', color: { argb: 'FFE3E7EE' } };
     pivot.forEach((r, idx) => {
@@ -9998,7 +10035,7 @@ function buildStokTerjualWorkbookAndDownload(entitas, dates, filenameBase, opts)
         ownTikTok: r.ownTikTok, totalOwn: r.totalOwn,
         gmShopee: r.gmShopee, gmTokopedia: r.gmTokopedia, mShopee: r.mShopee, mTokopedia: r.mTokopedia,
         totalGM: r.totalGM, totalM: r.totalM, grandTotal: r.grandTotal,
-        hargaModal: Number(r.hargaModal) || 0, totalPembayaran: Number(r.totalPembayaran) || 0,
+        hargaModal: Number(r.hargaModal) || 0, totalPembayaran: Number(r.totalPembayaran) || 0, totalPembayaranMD: Number(r.totalPembayaranMD) || 0,
         fakturPajak: r.fakturPajak, wa: r.wa, penambahan: r.penambahan, stokAkhir: r.stokAkhir,
         namaCustomer: r.namaCustomer || '',
         satuan: r.satuan || 'Pcs',
@@ -10012,9 +10049,11 @@ function buildStokTerjualWorkbookAndDownload(entitas, dates, filenameBase, opts)
       row.getCell('totalGM').value = { formula: `G${rn}+H${rn}`, result: r.totalGM };
       row.getCell('totalM').value = { formula: `I${rn}+J${rn}`, result: r.totalM };
       row.getCell('grandTotal').value = { formula: `F${rn}+K${rn}+L${rn}`, result: r.grandTotal };
-      row.getCell('totalPembayaran').value = { formula: `M${rn}*(N${rn}+${markup})`, result: Number(r.totalPembayaran) || 0 };
+      row.getCell('totalPembayaran').value = { formula: _mdCols.length ? `(M${rn}-${_mdCols.map(c => c + rn).join('-')})*(N${rn}+${markup})` : `M${rn}*(N${rn}+${markup})`, result: Number(r.totalPembayaran) || 0 };
+      row.getCell('totalPembayaranMD').value = _mdCols.length ? { formula: `(${_mdCols.map(c => c + rn).join('+')})*(N${rn}+${markup})`, result: Number(r.totalPembayaranMD) || 0 } : 0;
       if (!Number.isInteger(Number(r.hargaModal) || 0)) row.getCell('hargaModal').numFmt = '#,##0.00';
-      row.getCell('stokAkhir').value = { formula: `B${rn}+R${rn}-M${rn}-P${rn}-Q${rn}`, result: r.stokAkhir };
+      // kolom: Q = Faktur Pajak, R = WA, S = +Stok (bergeser 1 karena kolom P Total Pembayaran MD)
+      row.getCell('stokAkhir').value = { formula: `B${rn}+S${rn}-M${rn}-Q${rn}-R${rn}`, result: r.stokAkhir };
 
       const zebraOn = idx % 2 === 1;
       COLS.forEach(col => {
@@ -10024,7 +10063,8 @@ function buildStokTerjualWorkbookAndDownload(entitas, dates, filenameBase, opts)
         cell.alignment = (col.key === 'nama' || col.key === 'namaCustomer')
           ? { horizontal: 'left', vertical: 'middle' }
           : { horizontal: 'center', vertical: 'middle' };
-        if (col.key === 'totalPembayaran') cell.numFmt = '#,##0';
+        if (col.key === 'totalPembayaran' || col.key === 'totalPembayaranMD') cell.numFmt = '#,##0';
+        if (col.key === 'totalPembayaranMD') cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF2CC' } };
         if (col.key === 'hargaModal') cell.numFmt = Number.isInteger(Number(cell.value) || 0) ? '#,##0' : '#,##0.00';
         if (NEUTRAL_KEYS.includes(col.key) && zebraOn) {
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ZEBRA } };
