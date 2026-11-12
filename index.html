@@ -7746,7 +7746,7 @@ function renderTab3RekapTable() {
     <div class="stat-box"><div class="label">Terjual Tokped/Shopee/TikTok</div><div class="value">${fmtNum(tot.mp)}</div></div>
     <div class="stat-box"><div class="label">Terjual WA</div><div class="value">${fmtNum(tot.wa)}</div></div>
     <div class="stat-box"><div class="label">Total Pembayaran</div><div class="value">${fmtMoney(Math.round(tot.bayar))}</div></div>
-    ${(computeStokTerjualRekap._hidden || []).length ? `<div style="grid-column:1/-1;font-size:12px;color:#92400E;background:#FEF3C7;border:1px solid #FDE68A;border-radius:8px;padding:6px 10px;">⚠️ Tidak ikut dihitung karena produknya disembunyikan dari daftar: ${(computeStokTerjualRekap._hidden).map(h => `${escapeAttr(h.k)} (${fmtNum(h.mp + h.wa)})`).join(', ')}</div>` : ''}
+    ${(computeStokTerjualRekap._hidden || []).length ? `<div style="grid-column:1/-1;font-size:12px;color:#92400E;background:#FEF3C7;border:1px solid #FDE68A;border-radius:8px;padding:6px 10px;">👁 Disembunyikan & tidak dihitung (atur lewat tombol <b>👁 Disembunyikan</b>): ${(computeStokTerjualRekap._hidden).map(h => `${escapeAttr(h.k)} (${fmtNum(h.mp + h.wa)})`).join(', ')}</div>` : ''}
   `;
   const d = `${String(rg.d1).padStart(2, '0')}-${rg.d2}`;
   wrap.innerHTML = `
@@ -12337,7 +12337,7 @@ function t8RenderRiwayat() {
 const T9_DPP_DIV = 1.11;
 const T9_PPN_RATE = 0.11;
 const T9_ENT = {
-  GSM: { key: 'GSM', entitas: 'Gracia', label: 'Gracia (GSM)', short: 'Gracia', pill: 'gracia', color: '#111827', fileTag: 'GRACIA', sheetTag: 'OMSET GRACIA', extra: true },
+  GSM: { key: 'GSM', entitas: 'Gracia', label: 'Gracia (GSM)', short: 'Gracia', pill: 'gracia', color: '#111827', fileTag: 'GRACIA', sheetTag: 'OMSET GRACIA', extra: false }, // baris 'TOTAL Pembelian Glomed ke GSM' & 'PPN 11% GLOMED ke GSM' tidak ditampilkan lagi
   HNH: { key: 'HNH', entitas: 'HNH', label: 'H&H', short: 'H&H', pill: 'hnh', color: '#EF4444', fileTag: 'H_H', sheetTag: 'OMSET H&H', extra: false },
 };
 const T9_KEYS = ['GSM', 'HNH'];
@@ -12441,6 +12441,7 @@ function t9Compute(sellerKey, year, month, ctx) {
       return;
     }
     if (!r.nama || !String(r.nama).trim()) return;
+    if (t9HiddenSet(s.entitas).has(normalizeName(r.nama))) return; // produk disembunyikan -> tidak dihitung (sama dengan Stok Terjual)
     const key = day + '||' + normalizeName(r.nama);
     const a = agg[key] || (agg[key] = { day, nama: r.nama, qty: 0 });
     a.qty += q;
@@ -18427,6 +18428,89 @@ function gsjOverrideBadges() {
 if (typeof renderTab2Table === 'function') {
   const _oOvr = renderTab2Table;
   renderTab2Table = function () { const out = _oOvr.apply(this, arguments); try { gsjOverrideBadges(); } catch (e) {} return out; };
+}
+
+</script>
+<script>
+
+// ===== produk_disembunyikan.js =====
+// Produk yang disembunyikan (tombol ✕ di Stok Terjual) = tidak tampil & TIDAK DIHITUNG di Stok Terjual maupun
+// Total Omset (dua-duanya selalu sama). Tombol "👁 Disembunyikan" di Stok Terjual untuk mengatur per produk:
+//   👁 Tampilkan lagi      -> muncul & dihitung lagi
+//   🔗 Gabung ke ...      -> untuk nama dobel: penjualan/stok/faktur dipindah ke nama yang benar, lalu ikut dihitung
+function t9HiddenSet(entitas) {
+  return new Set((state.hiddenProducts || []).filter(h => h.entitas === entitas).map(h => normalizeName(h.nama)));
+}
+function t3HiddenManager() {
+  const ent = tab3Entity;
+  const lbl = (typeof ENTITY_LABEL !== 'undefined' && ENTITY_LABEL[ent]) || ent;
+  const list = (state.hiddenProducts || []).filter(h => h.entitas === ent);
+  const ym = (tab3Date || todayISO()).slice(0, 7);
+  const stat = new Map();
+  state.checkerRows.forEach(r => {
+    if (r.entitas !== ent) return;
+    const k = normalizeName(r.nama || ''); const o = stat.get(k) || { all: 0, bln: 0 };
+    const q = Number(r.qtyInternal != null ? r.qtyInternal : r.qty) || 0;
+    o.all += q; if ((r.tanggal || '').startsWith(ym)) o.bln += q; stat.set(k, o);
+  });
+  const esc = escapeAttr;
+  const visible = getProductCatalogForEntity(ent);
+  const rows = list.map((h, i) => { const st = stat.get(normalizeName(h.nama)) || { all: 0, bln: 0 }; return `<tr data-i="${i}">
+      <td>${esc(h.nama)}</td><td class="n">${fmtNum(st.bln)}</td><td class="n">${fmtNum(st.all)}</td>
+      <td style="white-space:nowrap;"><button class="btn small" data-show="${i}">👁 Tampilkan lagi</button>
+        <span style="display:inline-flex;gap:4px;margin-left:6px;"><input list="t3hid-dl" data-to="${i}" placeholder="gabung ke nama…" style="width:190px;padding:4px 8px;border:1px solid var(--line);border-radius:7px;font-size:12px;"><button class="btn secondary small" data-merge="${i}">🔗 Gabung</button></span></td></tr>`; }).join('');
+  const head = `<h3 class="ifp-title" style="font-size:17px;">👁 Produk Disembunyikan — ${esc(lbl)}</h3><div class="ifp-sub">Tidak tampil & tidak dihitung di Stok Terjual dan Total Omset</div>`;
+  const body = list.length ? `<datalist id="t3hid-dl">${visible.map(n => `<option value="${esc(n)}">`).join('')}</datalist>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Kalau disembunyikan karena <b>nama dobel</b>, pakai <b>🔗 Gabung</b> ke nama yang benar supaya penjualannya tidak hilang. Kalau memang bukan barang (mis. bubble wrap), biarkan tersembunyi.</div>
+    <div style="max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:10px;"><table class="t2s-tbl" style="width:100%;border-collapse:collapse;font-size:12.5px;"><thead><tr><th style="text-align:left;padding:6px 8px;">Produk</th><th style="padding:6px 8px;">Terjual ${ym.slice(5)}/${ym.slice(0, 4)}</th><th style="padding:6px 8px;">Semua</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
+    : '<div class="ifp-note info">Tidak ada produk yang disembunyikan di entitas ini.</div>';
+  const m = ifpOpen('ok', head, body, [{ label: 'Tutup', cls: 'sec', def: true }], { noConfetti: true });
+  const box = m.querySelector('.ifp-box'); if (box) box.style.width = 'min(860px,100%)';
+  m.querySelectorAll('td.n').forEach(td => { td.style.textAlign = 'right'; td.style.fontFamily = 'var(--mono)'; td.style.padding = '6px 8px'; });
+  m.querySelectorAll('tbody td').forEach(td => { td.style.borderBottom = '1px solid #F0F2F7'; if (!td.style.padding) td.style.padding = '6px 8px'; });
+  const after = (msg) => {
+    saveState();
+    try { renderTab3(); } catch (e) {}
+    if (typeof onGlobalDataChange === 'function') onGlobalDataChange();
+    if (typeof gsjShowToast === 'function') gsjShowToast(msg);
+    setTimeout(t3HiddenManager, 50);
+  };
+  m.querySelectorAll('[data-show]').forEach(b => b.onclick = () => {
+    const h = list[Number(b.dataset.show)];
+    state.hiddenProducts = (state.hiddenProducts || []).filter(x => !(x.entitas === h.entitas && normalizeName(x.nama) === normalizeName(h.nama)));
+    // ikut dihitung lagi juga di Invoice ke Glomed (keluarkan dari daftar pengecualian invoice entitas ini)
+    try { Object.keys(T8_SELLERS).forEach(k => { if (T8_SELLERS[k].entitas === h.entitas) t8SetExcluded(k, h.nama, false); }); } catch (e) {}
+    if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`menampilkan lagi produk <b>${esc(h.nama)}</b> di Stok Terjual ${esc(lbl)}`);
+    after(`👁 ${h.nama} ditampilkan lagi`);
+  });
+  m.querySelectorAll('[data-merge]').forEach(b => b.onclick = () => {
+    const i = Number(b.dataset.merge), h = list[i];
+    const inp = m.querySelector(`[data-to="${i}"]`);
+    const target = visible.find(n => normalizeName(n) === normalizeName(inp.value || ''));
+    if (!target) { alert('Pilih nama tujuan dari daftar (nama produk yang sudah ada).'); return; }
+    if (!confirm(`Gabungkan "${h.nama}" ke "${target}"?\n\nSemua penjualan, stok & faktur dengan nama "${h.nama}" dipindah ke "${target}" dan ikut dihitung.`)) return;
+    const c = mergeProductNames(h.nama, target);
+    try { Object.keys(T8_SELLERS).forEach(k => { if (T8_SELLERS[k].entitas === h.entitas) t8SetExcluded(k, h.nama, false); }); } catch (e) {}
+    state.hiddenProducts = (state.hiddenProducts || []).filter(x => normalizeName(x.nama) !== normalizeName(h.nama));
+    recomputeAllCheckerRows();
+    if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`menggabungkan produk tersembunyi <b>${esc(h.nama)}</b> ke <b>${esc(target)}</b> (${c.checkerRows} penjualan, ${c.adjustments} stok, ${c.invoiceItems} barang faktur)`);
+    after(`🔗 ${h.nama} digabung ke ${target}`);
+  });
+}
+function t3HiddenButton() {
+  const pg = document.getElementById('t3-pengali');
+  if (!pg || document.getElementById('t3-hidden-btn')) return;
+  const n = (state.hiddenProducts || []).filter(h => h.entitas === tab3Entity).length;
+  const b = document.createElement('button');
+  b.className = 'btn secondary small'; b.id = 't3-hidden-btn'; b.type = 'button';
+  b.title = 'Atur produk yang disembunyikan: tampilkan lagi atau gabung ke nama yang benar';
+  b.textContent = `👁 Disembunyikan (${n})`;
+  b.onclick = t3HiddenManager;
+  pg.after(b);
+}
+if (typeof renderTab3 === 'function') {
+  const _oHid = renderTab3;
+  renderTab3 = function () { const out = _oHid.apply(this, arguments); try { t3HiddenButton(); } catch (e) {} return out; };
 }
 
 </script>
