@@ -7734,8 +7734,109 @@ function tab3RekapLabel(monthKey, half) {
   const rg = tab3HalfRange(monthKey, half);
   return `${rg.d1}–${rg.d2} ${bulanLabelID(monthKey + '-01')}`;
 }
+// ---------- Pisah Medident (MD) di Rekap 1–15 / 16–akhir bulan ----------
+// Penjualan Medident yang dipisah TIDAK masuk kolom "Stok Terjual Tokped Shopee Tiktok", tapi punya
+// kolom & Total Pembayaran sendiri (rumus sama: Qty × (Harga Modal + markup)) karena masuk total omset lain.
+// Pengaturan di state.settings.rekapPisahMD = { shopee, tokped, mulai:'YYYY-MM' } (tersinkron, berlaku
+// untuk semua entitas, mulai bulan 'mulai'). Mau ikut pisah Tokped MD? Cukup centang di tampilan rekap.
+const REKAP_PISAH_MD_DEFAULT = { shopee: true, tokped: false, mulai: '2026-10' };
+function getRekapPisahConfig() { return Object.assign({}, REKAP_PISAH_MD_DEFAULT, (state.settings && state.settings.rekapPisahMD) || {}); }
+function getRekapSplit(start) {
+  const c = getRekapPisahConfig();
+  if (!start || String(start).slice(0, 7) < (c.mulai || '0000-00')) return { shopee: false, tokped: false, any: false };
+  return { shopee: !!c.shopee, tokped: !!c.tokped, any: !!(c.shopee || c.tokped) };
+}
+function rekapMdLabel(sp) { return sp.shopee && sp.tokped ? 'Shopee + Tokped MD' : sp.tokped ? 'Tokped MD' : 'Shopee MD'; }
+// Satu baris rekap dari angka per-kelas (own = semua toko selain MD yang dipisah-able, ms = Shopee MD, mt = Tokped MD)
+function rekapRowFromParts(nama, satuan, o, ms, mt, wa, hm, markup, sp, locked) {
+  o = Number(o) || 0; ms = Number(ms) || 0; mt = Number(mt) || 0; wa = Number(wa) || 0; hm = Number(hm) || 0;
+  const md = (sp.shopee ? ms : 0) + (sp.tokped ? mt : 0);
+  const mp = o + ms + mt - md;
+  return { nama, satuan: satuan || 'Pcs', terjualMP: mp, terjualMD: md, wa, totalTerjual: o + ms + mt + wa, hargaModal: hm,
+    totalPembayaran: mp * (hm + markup), totalPembayaranMD: md * (hm + markup), _o: o, _ms: ms, _mt: mt, _locked: !!locked };
+}
+function rekapTotals(rows) {
+  return rows.reduce((a, r) => { a.mp += r.terjualMP; a.md += r.terjualMD || 0; a.wa += r.wa; a.total += r.totalTerjual; a.bayar += r.totalPembayaran; a.bayarMD += r.totalPembayaranMD || 0; return a; }, { mp: 0, md: 0, wa: 0, total: 0, bayar: 0, bayarMD: 0 });
+}
+
+// ---------- 🔒 Kunci Rekap (1–15 / 16–akhir bulan) ----------
+// Rekap yang DIKUNCI memakai SNAPSHOT angka saat dikunci (per produk: terjual toko, Shopee MD, Tokped MD,
+// WA, harga modal, markup) — disimpan di state.settings.rekapLocks, tersinkron ke semua device lewat
+// gsj_settings. Edit / import / hitung ulang / pindah entitas di tanggal harian TIDAK mengubah angka rekap
+// terkunci (tampilan rekap, Excel rekap, Google Sheets) sampai kuncinya dibuka. Pembagian kolom MD tetap
+// ikut pengaturan Pisah MD (angka per-kelas yang disimpan tidak berubah).
+function rekapLockKey(entitas, start, end) { return entitas + '|' + start + '|' + end; }
+function getRekapLock(entitas, start, end) {
+  const L = state.settings && state.settings.rekapLocks;
+  return (L && L[rekapLockKey(entitas, start, end)]) || null;
+}
+function rekapLockLabelFromKey(key) {
+  const p = String(key).split('|');
+  return Number(p[1].slice(8)) + '–' + Number(p[2].slice(8)) + ' ' + bulanLabelID(p[1].slice(0, 7) + '-01');
+}
+function findRekapLockForDate(entitas, d) {
+  const L = state.settings && state.settings.rekapLocks;
+  if (!L || !d) return null;
+  for (const k of Object.keys(L)) {
+    const p = k.split('|');
+    if (p[0] === entitas && d >= p[1] && d <= p[2] && L[k]) return { key: k, lock: L[k], label: rekapLockLabelFromKey(k) };
+  }
+  return null;
+}
+function buildRekapLockSnapshot(entitas, start, end) {
+  const rows = computeStokTerjualRekapLive(entitas, start, end);
+  const hidden = (computeStokTerjualRekap._hidden || []).slice();
+  const sold = rows.filter(r => r.totalTerjual).map(r => ({ n: r.nama, s: r.satuan, o: r._o, ms: r._ms, mt: r._mt, wa: r.wa, hm: r.hargaModal }));
+  const t = rekapTotals(rows);
+  return { v: 2, rows: sold, hidden, tot: { mp: t.mp, md: t.md, wa: t.wa, bayar: t.bayar, bayarMD: t.bayarMD }, markup: state.settings.markupPerUnit || 0, by: getUserName() || 'Tanpa nama', at: new Date().toISOString() };
+}
 function computeStokTerjualRekap(entitas, start, end) {
+  const lock = getRekapLock(entitas, start, end);
+  if (!lock) return computeStokTerjualRekapLive(entitas, start, end);
+  const sp = getRekapSplit(start);
+  const markup = lock.markup != null ? Number(lock.markup) || 0 : (state.settings.markupPerUnit || 0);
+  // v1 (kunci lama): hanya total toko -> dianggap tanpa rincian MD
+  const fromSnap = x => lock.v === 2
+    ? rekapRowFromParts(x.n, x.s, x.o, x.ms, x.mt, x.wa, x.hm, markup, sp, true)
+    : rekapRowFromParts(x.n, x.s, x.mp, 0, 0, x.wa, x.hm, markup, sp, true);
+  const snap = new Map((lock.rows || []).map(x => [normalizeName(x.n), x]));
+  const out = [], seen = new Set();
+  getProductCatalogForEntity(entitas).forEach(nama => {
+    const k = normalizeName(nama);
+    seen.add(k);
+    const x = snap.get(k);
+    out.push(x ? fromSnap(x) : rekapRowFromParts(nama, getProductSatuan(entitas, nama), 0, 0, 0, 0, avgModalFromInvoice(entitas, nama), markup, sp, true));
+  });
+  // Produk di snapshot yang sekarang tidak ada di katalog (diganti nama / disembunyikan) tetap ikut, supaya total tidak berubah.
+  snap.forEach((x, k) => { if (!seen.has(k)) out.push(fromSnap(x)); });
+  computeStokTerjualRekap._hidden = lock.hidden || [];
+  return out;
+}
+function toggleRekapLock(entitas, rg, label) {
+  state.settings.rekapLocks = Object.assign({}, state.settings.rekapLocks || {});
+  const key = rekapLockKey(entitas, rg.start, rg.end);
+  const cur = state.settings.rekapLocks[key];
+  const ent = ENTITY_LABEL[entitas] || entitas;
+  const sp = getRekapSplit(rg.start);
+  if (cur) {
+    const ct = rekapTotals(computeStokTerjualRekap(entitas, rg.start, rg.end));
+    if (!confirm('Buka kunci Rekap ' + ent + ' ' + label + '?\n\nAngka terkunci sekarang: ' + fmtNum(ct.mp) + ' pcs · ' + fmtMoney(Math.round(ct.bayar)) + (sp.any ? '\n' + rekapMdLabel(sp) + ': ' + fmtNum(ct.md) + ' pcs · ' + fmtMoney(Math.round(ct.bayarMD)) : '') + '.\nSetelah dibuka, rekap dihitung ulang dari tanggal harian dan angkanya BISA berubah.')) return;
+    delete state.settings.rekapLocks[key];
+    gsjDetailedAudit('membuka kunci 🔓 Rekap <b>' + escapeAttr(ent) + '</b> ' + escapeAttr(label) + ' (sebelumnya terkunci di ' + fmtNum(ct.mp) + ' pcs · ' + fmtMoney(Math.round(ct.bayar)) + (sp.any ? '; ' + escapeAttr(rekapMdLabel(sp)) + ' ' + fmtNum(ct.md) + ' pcs' : '') + ')');
+  } else {
+    const snap = buildRekapLockSnapshot(entitas, rg.start, rg.end);
+    const t = snap.tot;
+    if (!confirm('Kunci Rekap ' + ent + ' ' + label + '?\n\nTerjual Tokped/Shopee/TikTok: ' + fmtNum(t.mp) + ' · ' + fmtMoney(Math.round(t.bayar)) + (sp.any ? '\nTerjual ' + rekapMdLabel(sp) + ': ' + fmtNum(t.md) + ' · ' + fmtMoney(Math.round(t.bayarMD)) : '') + '\nTerjual WA: ' + fmtNum(t.wa) + '\n\nSetelah dikunci, angka ini TIDAK berubah walaupun ada edit/import di tanggal ' + label + ', sampai kuncinya dibuka.')) return;
+    state.settings.rekapLocks[key] = snap;
+    gsjDetailedAudit('mengunci 🔒 Rekap <b>' + escapeAttr(ent) + '</b> ' + escapeAttr(label) + ' di ' + fmtNum(t.mp) + ' pcs · ' + fmtMoney(Math.round(t.bayar)) + (sp.any ? '; ' + escapeAttr(rekapMdLabel(sp)) + ' ' + fmtNum(t.md) + ' pcs · ' + fmtMoney(Math.round(t.bayarMD)) : '') + ' (WA ' + fmtNum(t.wa) + ')');
+  }
+  saveState();
+  try { const chip = document.querySelector('.t3-rekapchip.active'); if (chip) chip.innerHTML = (getRekapLock(entitas, rg.start, rg.end) ? '🔒' : '📋') + ' Rekap ' + rg.d1 + '–' + rg.d2; } catch (e) {}
+  renderTab3Table();
+}
+function computeStokTerjualRekapLive(entitas, start, end) {
   const markup = state.settings.markupPerUnit || 0;
+  const sp = getRekapSplit(start);
   const agg = new Map();
   state.checkerRows.forEach(r => {
     if (r.entitas !== entitas || !r.tanggal || r.tanggal < start || r.tanggal > end) return;
@@ -7743,24 +7844,22 @@ function computeStokTerjualRekap(entitas, start, end) {
     const cls = classifyRowForPivot(r);
     const q = Number(r.qtyInternal != null ? r.qtyInternal : r.qty) || 0;
     let a = agg.get(k);
-    if (!a) { a = { mp: 0, wa: 0 }; agg.set(k, a); }
+    if (!a) { a = { o: 0, ms: 0, mt: 0, wa: 0 }; agg.set(k, a); }
     if (cls === 'wa') a.wa += q;
-    else if (cls !== 'fakturPajak') a.mp += q; // Faktur Pajak tidak ada di rekap (sama seperti file Excel)
+    else if (cls === 'fakturPajak') return; // Faktur Pajak tidak ada di rekap (sama seperti file Excel)
+    else if (cls === 'mShopee') a.ms += q;
+    else if (cls === 'mTokopedia') a.mt += q;
+    else a.o += q;
   });
   const catalog = getProductCatalogForEntity(entitas);
   const inCat = new Set(catalog.map(n => normalizeName(n)));
   // Penjualan produk yang DISEMBUNYIKAN tidak ikut rekap -> dicatat supaya kelihatan kenapa total beda.
   const hiddenSold = [];
-  agg.forEach((a, k) => { if (!inCat.has(k) && (a.mp || a.wa)) hiddenSold.push({ k, mp: a.mp, wa: a.wa }); });
+  agg.forEach((a, k) => { const mp = a.o + a.ms + a.mt; if (!inCat.has(k) && (mp || a.wa)) hiddenSold.push({ k, mp, wa: a.wa }); });
   computeStokTerjualRekap._hidden = hiddenSold;
   return catalog.map(nama => {
-    const a = agg.get(normalizeName(nama)) || { mp: 0, wa: 0 };
-    const hargaModal = avgModalFromInvoice(entitas, nama);
-    return {
-      nama, satuan: getProductSatuan(entitas, nama),
-      terjualMP: a.mp, wa: a.wa, totalTerjual: a.mp + a.wa,
-      hargaModal, totalPembayaran: a.mp * (hargaModal + markup),
-    };
+    const a = agg.get(normalizeName(nama)) || { o: 0, ms: 0, mt: 0, wa: 0 };
+    return rekapRowFromParts(nama, getProductSatuan(entitas, nama), a.o, a.ms, a.mt, a.wa, avgModalFromInvoice(entitas, nama), markup, sp, false);
   });
 }
 
@@ -7769,72 +7868,113 @@ function renderTab3RekapTable() {
   const entitas = tab3Entity;
   const rg = tab3HalfRange(tab3Period.month, tab3Period.half);
   const label = tab3RekapLabel(tab3Period.month, tab3Period.half);
+  const sp = getRekapSplit(rg.start);
+  const cfg = getRekapPisahConfig();
+  const mdLbl = rekapMdLabel(sp);
   const dlBtn = document.getElementById('t3-download');
-  if (dlBtn) dlBtn.textContent = `⬇️ Download Excel (Rekap ${label})`;
+  if (dlBtn) dlBtn.textContent = '⬇️ Download Excel (Rekap ' + label + ')';
   let rows = computeStokTerjualRekap(entitas, rg.start, rg.end);
+  const lock = getRekapLock(entitas, rg.start, rg.end);
+  let liveTot = null;
+  if (lock) {
+    liveTot = rekapTotals(computeStokTerjualRekapLive(entitas, rg.start, rg.end));
+    computeStokTerjualRekap._hidden = lock.hidden || [];
+  }
   const searchEl = document.getElementById('t3-search');
   const q = searchEl ? normalizeName(searchEl.value) : '';
   if (q) rows = rows.filter(r => normalizeName(r.nama).includes(q));
   if (tab3RekapOnlySold) rows = rows.filter(r => r.totalTerjual);
-  const tot = rows.reduce((a, r) => { a.mp += r.terjualMP; a.wa += r.wa; a.total += r.totalTerjual; a.bayar += r.totalPembayaran; return a; }, { mp: 0, wa: 0, total: 0, bayar: 0 });
-  document.getElementById('t3-summary').innerHTML = `
-    <div class="stat-box"><div class="label">Rekap</div><div class="value" style="font-size:15px;">${label}</div></div>
-    <div class="stat-box"><div class="label">Terjual Tokped/Shopee/TikTok</div><div class="value">${fmtNum(tot.mp)}</div></div>
-    <div class="stat-box"><div class="label">Terjual WA</div><div class="value">${fmtNum(tot.wa)}</div></div>
-    <div class="stat-box"><div class="label">Total Pembayaran</div><div class="value">${fmtMoney(Math.round(tot.bayar))}</div></div>
-    ${(computeStokTerjualRekap._hidden || []).length ? `<div style="grid-column:1/-1;font-size:12px;color:#92400E;background:#FEF3C7;border:1px solid #FDE68A;border-radius:8px;padding:6px 10px;">👁 Disembunyikan & tidak dihitung (atur lewat tombol <b>👁 Disembunyikan</b>): ${(computeStokTerjualRekap._hidden).map(h => `${escapeAttr(h.k)} (${fmtNum(h.mp + h.wa)})`).join(', ')}</div>` : ''}
-  `;
-  const d = `${String(rg.d1).padStart(2, '0')}-${rg.d2}`;
-  wrap.innerHTML = `
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:4px 0 8px;">
-      <label style="font-size:12.5px;display:flex;align-items:center;gap:5px;cursor:pointer;">
-        <input type="checkbox" id="t3-rekap-onlysold" ${tab3RekapOnlySold ? 'checked' : ''}> Hanya produk yang terjual
-      </label>
-      <button type="button" class="btn secondary small" id="t3-rekap-selisih" title="Total beda dari yang seharusnya? Cari penjualan yang tercatat di entitas lain tapi barangnya ada di ${escapeAttr(ENTITY_LABEL[entitas] || entitas)}, lalu kembalikan.">🔍 Cari selisih</button>
-      <span style="font-size:11.5px;color:var(--muted);">Total Pembayaran = Terjual Tokped/Shopee/TikTok × (Harga Modal + Rp${fmtNum(state.settings.markupPerUnit || 0)}) — WA tidak ikut dihitung.</span>
-    </div>
-    <div class="table-wrap" id="t3-scrollwrap">
-      <table class="dtable">
-        <thead><tr>
-          <th style="width:260px;">Nama Produk</th>
-          <th style="width:110px;">Stok Terjual Tokped Shopee Tiktok ${d}</th>
-          <th style="width:100px;">Stok Terjual WA ${d}</th>
-          <th style="width:95px;">Total Stok Terjual</th>
-          <th style="width:110px;">Harga Modal</th>
-          <th style="width:130px;">Total Pembayaran</th>
-          <th style="width:70px;">Satuan</th>
-        </tr></thead>
-        <tbody>
-          ${rows.map(r => `<tr>
-            <td>${escapeAttr(r.nama)}</td>
-            <td class="num" style="font-family:var(--mono);${r.terjualMP ? 'font-weight:700;color:#1E7A3B;' : ''}">${fmtNum(r.terjualMP)}</td>
-            <td class="num" style="font-family:var(--mono);">${fmtNum(r.wa)}</td>
-            <td class="num" style="font-family:var(--mono);font-weight:700;">${fmtNum(r.totalTerjual)}</td>
-            <td class="num" style="font-family:var(--mono);">${fmtMoney(Math.round(r.hargaModal))}</td>
-            <td class="num" style="font-family:var(--mono);">${fmtMoney(Math.round(r.totalPembayaran))}</td>
-            <td style="text-align:center;color:var(--muted);">${escapeAttr(r.satuan || 'Pcs')}</td>
-          </tr>`).join('') || `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:18px;">Tidak ada produk.</td></tr>`}
-        </tbody>
-        <tfoot><tr style="font-weight:700;background:#f3f5f9;">
-          <td>TOTAL (${fmtNum(rows.length)} produk)</td>
-          <td class="num" style="font-family:var(--mono);">${fmtNum(tot.mp)}</td>
-          <td class="num" style="font-family:var(--mono);">${fmtNum(tot.wa)}</td>
-          <td class="num" style="font-family:var(--mono);">${fmtNum(tot.total)}</td>
-          <td></td>
-          <td class="num" style="font-family:var(--mono);">${fmtMoney(Math.round(tot.bayar))}</td>
-          <td></td>
-        </tr></tfoot>
-      </table>
-    </div>
-    <p style="font-size:11px;color:var(--muted);margin-top:8px;" class="t3-fs-hide">
-      Rekap otomatis dari semua tanggal ${label} (hanya baca). Untuk mengubah angka, edit di tanggal harian-nya — rekap ikut berubah.
-      Harga Modal = Harga Modal yang sama dengan tampilan harian.
-    </p>
-  `;
+  const tot = rekapTotals(rows);
+  const lockedTot = lock ? rekapTotals(computeStokTerjualRekap(entitas, rg.start, rg.end)) : null;
+  let lockBanner = '';
+  if (lock) {
+    const same = liveTot && liveTot.mp === lockedTot.mp && liveTot.md === lockedTot.md && liveTot.wa === lockedTot.wa && Math.round(liveTot.bayar) === Math.round(lockedTot.bayar);
+    let at = '';
+    try { at = new Date(lock.at).toLocaleString('id-ID', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch (e) {}
+    lockBanner = '<div style="grid-column:1/-1;font-size:12px;color:#1E3A8A;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:6px 10px;">🔒 <b>Rekap terkunci</b> oleh ' + escapeAttr(lock.by || '-') + (at ? ' · ' + escapeAttr(at) : '') + '. Angka di sini = angka saat dikunci, tidak ikut berubah.'
+      + (liveTot ? (same ? ' Data harian sekarang masih sama.' : ' <span style="color:#92400E;">⚠ Data harian sekarang beda: ' + fmtNum(liveTot.mp) + ' pcs' + (sp.any ? ' + ' + escapeAttr(mdLbl) + ' ' + fmtNum(liveTot.md) : '') + ' (WA ' + fmtNum(liveTot.wa) + ') · ' + fmtMoney(Math.round(liveTot.bayar)) + ' — rekap tetap pakai angka terkunci.</span>') : '') + '</div>';
+  }
+  const hiddenList = computeStokTerjualRekap._hidden || [];
+  document.getElementById('t3-summary').innerHTML = ''
+    + '<div class="stat-box"><div class="label">Rekap</div><div class="value" style="font-size:15px;">' + (lock ? '🔒 ' : '') + label + '</div></div>'
+    + '<div class="stat-box"><div class="label">Terjual Tokped/Shopee/TikTok' + (sp.any ? ' (tanpa ' + escapeAttr(mdLbl) + ')' : '') + '</div><div class="value">' + fmtNum(tot.mp) + '</div></div>'
+    + '<div class="stat-box"><div class="label">Total Pembayaran' + (sp.any ? ' (tanpa ' + escapeAttr(mdLbl) + ')' : '') + '</div><div class="value">' + fmtMoney(Math.round(tot.bayar)) + '</div></div>'
+    + (sp.any ? '<div class="stat-box" style="border-color:#FDBA74;"><div class="label" style="color:#C2410C;">Terjual ' + escapeAttr(mdLbl) + '</div><div class="value">' + fmtNum(tot.md) + '</div></div>'
+      + '<div class="stat-box" style="border-color:#FDBA74;"><div class="label" style="color:#C2410C;">Total Pembayaran ' + escapeAttr(mdLbl) + '</div><div class="value">' + fmtMoney(Math.round(tot.bayarMD)) + '</div></div>' : '')
+    + '<div class="stat-box"><div class="label">Terjual WA</div><div class="value">' + fmtNum(tot.wa) + '</div></div>'
+    + lockBanner
+    + (hiddenList.length ? '<div style="grid-column:1/-1;font-size:12px;color:#92400E;background:#FEF3C7;border:1px solid #FDE68A;border-radius:8px;padding:6px 10px;">👁 Disembunyikan & tidak dihitung (atur lewat tombol <b>👁 Disembunyikan</b>): ' + hiddenList.map(h => escapeAttr(h.k) + ' (' + fmtNum((h.mp || 0) + (h.wa || 0)) + ')').join(', ') + '</div>' : '');
+  const d = String(rg.d1).padStart(2, '0') + '-' + rg.d2;
+  const before = String(rg.start).slice(0, 7) < (cfg.mulai || '0000-00');
+  const pisahCtl = '<span style="font-size:12.5px;display:inline-flex;align-items:center;gap:8px;padding:3px 8px;border:1px solid #FDBA74;border-radius:8px;background:#FFF7ED;" title="Penjualan Medident yang dicentang dikeluarkan dari kolom Tokped/Shopee/TikTok dan dibuat kolom sendiri (berlaku semua entitas, mulai ' + escapeAttr(bulanLabelID((cfg.mulai || '2026-10') + '-01')) + ')">🟠 Pisahkan Medident:'
+    + '<label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="t3-pisah-shopee" ' + (cfg.shopee ? 'checked' : '') + '> Shopee MD</label>'
+    + '<label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="t3-pisah-tokped" ' + (cfg.tokped ? 'checked' : '') + '> Tokped MD</label>'
+    + (before ? '<span style="color:var(--muted);">(belum berlaku di bulan ini — mulai ' + escapeAttr(bulanLabelID((cfg.mulai || '2026-10') + '-01')) + ')</span>' : '') + '</span>';
+  const ncol = sp.any ? 9 : 7;
+  const mono = 'font-family:var(--mono);';
+  const mdCell = 'background:#FFF7ED;';
+  wrap.innerHTML = ''
+    + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:4px 0 8px;">'
+    + '<button type="button" class="btn ' + (lock ? '' : 'secondary') + ' small" id="t3-rekap-lock" title="' + (lock ? 'Buka kunci — rekap dihitung ulang dari tanggal harian' : 'Kunci angka rekap ini supaya tidak berubah lagi') + '">' + (lock ? '🔓 Buka Kunci' : '🔒 Kunci Rekap Ini') + '</button>'
+    + pisahCtl
+    + '<label style="font-size:12.5px;display:flex;align-items:center;gap:5px;cursor:pointer;"><input type="checkbox" id="t3-rekap-onlysold" ' + (tab3RekapOnlySold ? 'checked' : '') + '> Hanya produk yang terjual</label>'
+    + '<button type="button" class="btn secondary small" id="t3-rekap-selisih" ' + (lock ? 'style="display:none;"' : '') + ' title="Total beda dari yang seharusnya? Cari penjualan yang tercatat di entitas lain tapi barangnya ada di ' + escapeAttr(ENTITY_LABEL[entitas] || entitas) + ', lalu kembalikan.">🔍 Cari selisih</button>'
+    + '<span style="font-size:11.5px;color:var(--muted);">Total Pembayaran = Terjual × (Harga Modal + Rp' + fmtNum(lock && lock.markup != null ? lock.markup : (state.settings.markupPerUnit || 0)) + ') — WA tidak ikut dihitung.' + (sp.any ? ' ' + escapeAttr(mdLbl) + ' dihitung terpisah (rumus sama).' : '') + '</span>'
+    + '</div>'
+    + '<div class="table-wrap" id="t3-scrollwrap"><table class="dtable"><thead><tr>'
+    + '<th style="width:260px;">Nama Produk</th>'
+    + '<th style="width:110px;">Stok Terjual Tokped Shopee Tiktok ' + d + (sp.any ? '<div style="font-weight:400;font-size:10px;">(tanpa ' + escapeAttr(mdLbl) + ')</div>' : '') + '</th>'
+    + (sp.any ? '<th style="width:100px;' + mdCell + 'color:#C2410C;">Stok Terjual ' + escapeAttr(mdLbl) + ' ' + d + '</th>' : '')
+    + '<th style="width:100px;">Stok Terjual WA ' + d + '</th>'
+    + '<th style="width:95px;">Total Stok Terjual</th>'
+    + '<th style="width:110px;">Harga Modal</th>'
+    + '<th style="width:130px;">Total Pembayaran</th>'
+    + (sp.any ? '<th style="width:130px;' + mdCell + 'color:#C2410C;">Total Pembayaran ' + escapeAttr(mdLbl) + '</th>' : '')
+    + '<th style="width:70px;">Satuan</th>'
+    + '</tr></thead><tbody>'
+    + (rows.map(r => '<tr>'
+      + '<td>' + escapeAttr(r.nama) + '</td>'
+      + '<td class="num" style="' + mono + (r.terjualMP ? 'font-weight:700;color:#1E7A3B;' : '') + '">' + fmtNum(r.terjualMP) + '</td>'
+      + (sp.any ? '<td class="num" style="' + mono + mdCell + (r.terjualMD ? 'font-weight:700;color:#C2410C;' : '') + '">' + fmtNum(r.terjualMD) + '</td>' : '')
+      + '<td class="num" style="' + mono + '">' + fmtNum(r.wa) + '</td>'
+      + '<td class="num" style="' + mono + 'font-weight:700;">' + fmtNum(r.totalTerjual) + '</td>'
+      + '<td class="num" style="' + mono + '">' + fmtMoney(Math.round(r.hargaModal)) + '</td>'
+      + '<td class="num" style="' + mono + '">' + fmtMoney(Math.round(r.totalPembayaran)) + '</td>'
+      + (sp.any ? '<td class="num" style="' + mono + mdCell + '">' + fmtMoney(Math.round(r.totalPembayaranMD)) + '</td>' : '')
+      + '<td style="text-align:center;color:var(--muted);">' + escapeAttr(r.satuan || 'Pcs') + '</td>'
+      + '</tr>').join('') || '<tr><td colspan="' + ncol + '" style="text-align:center;color:var(--muted);padding:18px;">Tidak ada produk.</td></tr>')
+    + '</tbody><tfoot><tr style="font-weight:700;background:#f3f5f9;">'
+    + '<td>TOTAL (' + fmtNum(rows.length) + ' produk)</td>'
+    + '<td class="num" style="' + mono + '">' + fmtNum(tot.mp) + '</td>'
+    + (sp.any ? '<td class="num" style="' + mono + mdCell + '">' + fmtNum(tot.md) + '</td>' : '')
+    + '<td class="num" style="' + mono + '">' + fmtNum(tot.wa) + '</td>'
+    + '<td class="num" style="' + mono + '">' + fmtNum(tot.total) + '</td>'
+    + '<td></td>'
+    + '<td class="num" style="' + mono + '">' + fmtMoney(Math.round(tot.bayar)) + '</td>'
+    + (sp.any ? '<td class="num" style="' + mono + mdCell + '">' + fmtMoney(Math.round(tot.bayarMD)) + '</td>' : '')
+    + '<td></td></tr></tfoot></table></div>'
+    + '<p style="font-size:11px;color:var(--muted);margin-top:8px;" class="t3-fs-hide">'
+    + (lock ? '🔒 Rekap ' + label + ' DIKUNCI — angka tidak ikut berubah walaupun tanggal harian-nya diedit / di-import ulang. Buka kunci dulu kalau memang perlu koreksi.'
+      : 'Rekap otomatis dari semua tanggal ' + label + ' (hanya baca). Untuk mengubah angka, edit di tanggal harian-nya — rekap ikut berubah.')
+    + ' Harga Modal = Harga Modal yang sama dengan tampilan harian.</p>';
   const cb = document.getElementById('t3-rekap-onlysold');
   if (cb) cb.addEventListener('change', () => { tab3RekapOnlySold = cb.checked; renderTab3Table(); });
   const sb = document.getElementById('t3-rekap-selisih');
   if (sb) sb.addEventListener('click', () => gsjRekapSelisih(entitas, rg, label, tot));
+  const lb = document.getElementById('t3-rekap-lock');
+  if (lb) lb.addEventListener('click', () => toggleRekapLock(entitas, rg, label));
+  [['t3-pisah-shopee', 'shopee', 'Shopee MD'], ['t3-pisah-tokped', 'tokped', 'Tokped MD']].forEach(([id, k, nm]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', () => {
+      const c = getRekapPisahConfig();
+      c[k] = el.checked;
+      state.settings.rekapPisahMD = c;
+      gsjDetailedAudit((el.checked ? 'memisahkan' : 'menggabungkan kembali') + ' <b>' + nm + '</b> ' + (el.checked ? 'dari' : 'ke') + ' kolom Tokped/Shopee/TikTok di Rekap Stok Terjual (semua entitas, mulai ' + escapeAttr(bulanLabelID((c.mulai || '2026-10') + '-01')) + ')');
+      saveState();
+      renderTab3Table();
+    });
+  });
 }
 
 // ---------- Cari selisih rekap ----------
@@ -8068,7 +8208,7 @@ function renderTab3DateTabs(dates, skipSync) {
   const rekapChips = [1, 2].map(h => {
     const act = tab3Period && tab3Period.month === tab3BrowseMonth && tab3Period.half === h;
     const rg = tab3HalfRange(tab3BrowseMonth, h);
-    return `<span class="filter-chip t3-rekapchip ${act ? 'active' : ''}" data-half="${h}" title="Rekap penjualan ${tab3RekapLabel(tab3BrowseMonth, h)} (dijumlah dari semua tanggal harian)">📋 Rekap ${rg.d1}–${rg.d2}</span>`;
+    return `<span class="filter-chip t3-rekapchip ${act ? 'active' : ''}" data-half="${h}" title="Rekap penjualan ${tab3RekapLabel(tab3BrowseMonth, h)} (dijumlah dari semua tanggal harian)">${getRekapLock(tab3Entity, rg.start, rg.end) ? '🔒' : '📋'} Rekap ${rg.d1}–${rg.d2}</span>`;
   }).join('');
 
   wrap.innerHTML = monthNav + (datesInBrowseMonth.length ? dateChips : `<span style="font-size:12px;color:var(--muted);align-self:center;">Tidak ada tanggal untuk bulan ini.</span>`)
@@ -9289,6 +9429,16 @@ function renderTab3TableKeepScroll() {
 }
 
 function renderTab3Table() {
+  renderTab3TableInner();
+  // Tanggal harian yang masuk periode rekap terkunci -> kasih tanda.
+  try {
+    if (tab3Period) return;
+    const hit = findRekapLockForDate(tab3Entity, tab3Date);
+    const sum = document.getElementById('t3-summary');
+    if (hit && sum) sum.insertAdjacentHTML('beforeend', `<div style="grid-column:1/-1;font-size:12px;color:#1E3A8A;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:6px 10px;">🔒 Tanggal ini masuk <b>Rekap ${escapeAttr(hit.label)}</b> yang terkunci — perubahan di tanggal ini tidak mengubah angka rekap terkunci (${fmtNum((hit.lock.tot || {}).mp || 0)} pcs).</div>`);
+  } catch (e) {}
+}
+function renderTab3TableInner() {
   const wrap = document.getElementById('t3-table-wrap');
   const hasAnyData = state.checkerRows.length || state.invoices.length || state.adjustments.length;
   if (!hasAnyData) {
@@ -9662,67 +9812,83 @@ function downloadStokTerjualExcelBulan(fromDate, toDate) {
 // Urutan produk di sheet harian selalu sama (katalog entitas), jadi baris rekap n -> baris harian n+(dataStart-2).
 function addStokTerjualRekapSheet(wb, entitas, monthKey, half, dailySheetNames, dailyDataStart, markup) {
   const rg = tab3HalfRange(monthKey, half);
-  const name = safeSheetName(`${rg.d1}-${rg.d2} ${bulanLabelID(monthKey + '-01').toUpperCase()}`);
+  const name = safeSheetName(rg.d1 + '-' + rg.d2 + ' ' + bulanLabelID(monthKey + '-01').toUpperCase());
   const ws = wb.addWorksheet(name);
-  const d = `${String(rg.d1).padStart(2, '0')}-${rg.d2}`;
-  ws.columns = [
+  const d = String(rg.d1).padStart(2, '0') + '-' + rg.d2;
+  const sp = getRekapSplit(rg.start);
+  const mdLbl = rekapMdLabel(sp);
+  const _rkLock = getRekapLock(entitas, rg.start, rg.end);
+  if (_rkLock && _rkLock.markup != null) markup = Number(_rkLock.markup) || 0;
+  // Kolom (huruf ikut otomatis): Nama | Toko | [MD] | WA | Total | HM | Bayar | [Bayar MD] | Satuan
+  const COLS = [
     { header: 'Nama Produk', key: 'nama', width: 38 },
-    { header: `Stok Terjual Tokped Shopee Tiktok ${d}`, key: 'mp', width: 16 },
-    { header: `Stok Terjual WA ${d}`, key: 'wa', width: 14 },
+    { header: 'Stok Terjual Tokped Shopee Tiktok ' + d + (sp.any ? ' (tanpa ' + mdLbl + ')' : ''), key: 'mp', width: 18 },
+  ];
+  if (sp.any) COLS.push({ header: 'Stok Terjual ' + mdLbl + ' ' + d, key: 'md', width: 16, md: true });
+  COLS.push({ header: 'Stok Terjual WA ' + d, key: 'wa', width: 14 },
     { header: 'Total Stok Terjual', key: 'total', width: 13 },
     { header: 'Harga Modal', key: 'hm', width: 14 },
-    { header: 'Total Pembayaran', key: 'bayar', width: 17 },
-    { header: 'Satuan', key: 'satuan', width: 10 },
-  ];
+    { header: 'Total Pembayaran' + (sp.any ? ' (tanpa ' + mdLbl + ')' : ''), key: 'bayar', width: 18 });
+  if (sp.any) COLS.push({ header: 'Total Pembayaran ' + mdLbl, key: 'bayarMD', width: 18, md: true });
+  COLS.push({ header: 'Satuan', key: 'satuan', width: 10 });
+  ws.columns = COLS.map(c => ({ header: c.header, key: c.key, width: c.width }));
+  const NC = COLS.length;
+  const col = k => { const i = COLS.findIndex(c => c.key === k); return String.fromCharCode(65 + i); };
   const head = ws.getRow(1);
   head.height = 34;
-  head.eachCell(c => {
+  head.eachCell((c, ci) => {
+    const isMd = COLS[ci - 1] && COLS[ci - 1].md;
     c.font = { name: 'Calibri', size: 10.5, bold: true, color: { argb: 'FFFFFFFF' } };
-    c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F2647' } };
+    c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: isMd ? 'FFFF9900' : 'FF0F2647' } };
     c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
   });
-  const q = n => `'${String(n).replace(/'/g, "''")}'`;
+  const q = n => "'" + String(n).replace(/'/g, "''") + "'";
+  // Kolom sheet harian: I = Terjual Shopee M, J = Terjual Tokopedia M, M = Grand Total, Q = WA
+  const sumDaily = (letter, dr) => 'SUM(' + dailySheetNames.map(s => q(s) + '!' + letter + dr).join(',') + ')';
+  const mdParts = dr => [sp.shopee ? sumDaily('I', dr) : null, sp.tokped ? sumDaily('J', dr) : null].filter(Boolean);
   const rows = computeStokTerjualRekap(entitas, rg.start, rg.end);
   const thin = { style: 'thin', color: { argb: 'FFE3E7EE' } };
   rows.forEach((r, i) => {
     const rn = i + 2;
     const dr = rn + (dailyDataStart - 2);
     const row = ws.getRow(rn);
-    row.getCell(1).value = r.nama;
-    row.getCell(2).value = { formula: `SUM(${dailySheetNames.map(s => `${q(s)}!M${dr}`).join(',')})`, result: r.terjualMP };
-    row.getCell(3).value = { formula: `SUM(${dailySheetNames.map(s => `${q(s)}!Q${dr}`).join(',')})`, result: r.wa };
-    row.getCell(4).value = { formula: `SUM(B${rn}:C${rn})`, result: r.totalTerjual };
-    // Harga modal ditulis APA ADANYA (dengan koma) supaya Total Pembayaran di Excel = di aplikasi.
     const _hm = Number(r.hargaModal) || 0;
-    row.getCell(5).value = _hm;
-    row.getCell(6).value = { formula: `B${rn}*(E${rn}+${markup})`, result: r.terjualMP * (_hm + markup) };
-    row.getCell(7).value = r.satuan || 'Pcs';
-    for (let c = 1; c <= 7; c++) {
+    row.getCell(col('nama')).value = r.nama;
+    row.getCell(col('mp')).value = _rkLock ? r.terjualMP : { formula: sumDaily('M', dr) + mdParts(dr).map(x => '-' + x).join(''), result: r.terjualMP };
+    if (sp.any) row.getCell(col('md')).value = _rkLock ? r.terjualMD : { formula: mdParts(dr).join('+'), result: r.terjualMD };
+    row.getCell(col('wa')).value = _rkLock ? r.wa : { formula: sumDaily('Q', dr), result: r.wa };
+    row.getCell(col('total')).value = { formula: col('mp') + rn + (sp.any ? '+' + col('md') + rn : '') + '+' + col('wa') + rn, result: r.totalTerjual };
+    // Harga modal ditulis APA ADANYA (dengan koma) supaya Total Pembayaran di Excel = di aplikasi.
+    row.getCell(col('hm')).value = _hm;
+    row.getCell(col('bayar')).value = { formula: col('mp') + rn + '*(' + col('hm') + rn + '+' + markup + ')', result: r.terjualMP * (_hm + markup) };
+    if (sp.any) row.getCell(col('bayarMD')).value = { formula: col('md') + rn + '*(' + col('hm') + rn + '+' + markup + ')', result: r.terjualMD * (_hm + markup) };
+    row.getCell(col('satuan')).value = r.satuan || 'Pcs';
+    for (let c = 1; c <= NC; c++) {
       const cell = row.getCell(c);
+      const k = COLS[c - 1].key;
       cell.font = { name: 'Calibri', size: 10 };
       cell.border = { top: thin, bottom: thin, left: thin, right: thin };
       cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
-      if (c === 5) cell.numFmt = Number.isInteger(_hm) ? '#,##0' : '#,##0.00';
-      if (c === 6) cell.numFmt = '#,##0';
-      if (i % 2 === 1) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF7F9FC' } };
+      if (k === 'hm') cell.numFmt = Number.isInteger(_hm) ? '#,##0' : '#,##0.00';
+      if (k === 'bayar' || k === 'bayarMD') cell.numFmt = '#,##0';
+      if (COLS[c - 1].md) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF2CC' } };
+      else if (i % 2 === 1) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF7F9FC' } };
     }
-    if (r.terjualMP > 0) row.getCell(2).font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF1E7A3B' } };
+    if (r.terjualMP > 0) row.getCell(col('mp')).font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF1E7A3B' } };
+    if (sp.any && r.terjualMD > 0) row.getCell(col('md')).font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FFC2410C' } };
   });
   const last = rows.length + 1;
   const tr = ws.getRow(last + 1);
   tr.getCell(1).value = 'TOTAL';
-  tr.getCell(2).value = { formula: `SUM(B2:B${last})` };
-  tr.getCell(3).value = { formula: `SUM(C2:C${last})` };
-  tr.getCell(4).value = { formula: `SUM(D2:D${last})` };
-  tr.getCell(6).value = { formula: `SUM(F2:F${last})` };
-  for (let c = 1; c <= 7; c++) {
+  ['mp', 'md', 'wa', 'total', 'bayar', 'bayarMD'].forEach(k => { if (COLS.some(c => c.key === k)) tr.getCell(col(k)).value = { formula: 'SUM(' + col(k) + '2:' + col(k) + last + ')' }; });
+  for (let c = 1; c <= NC; c++) {
     const cell = tr.getCell(c);
     cell.font = { name: 'Calibri', size: 10.5, bold: true };
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLS[c - 1].md ? 'FFFFE699' : 'FFD9D9D9' } };
     cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
-    if (c === 6) cell.numFmt = '#,##0';
+    if (COLS[c - 1].key === 'bayar' || COLS[c - 1].key === 'bayarMD') cell.numFmt = '#,##0';
   }
-  ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: 7 } };
+  ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: NC } };
   ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 1 }];
 }
 
@@ -11551,10 +11717,23 @@ const T8_BUYER = {
 };
 const T8_SENDER_ADDR = ['Komplek Grogol Permai blok A no 3', 'Jl. Prof Dr. Latumenten, Jelambar, Jakarta Barat'];
 const T8_SELLERS = {
-  GSM: { key: 'GSM', entitas: 'Gracia', label: 'GSM', fileTag: 'GSM', nama: 'PT. Gracia Sukses Medika', kode: 'INV-GSM', ppn: true, bank: 'BCA', noRek: '2680160603', atasNama: 'PT. GRACIA SUKSES MEDIKA', logo: 'Gracia' },
-  HNH: { key: 'HNH', entitas: 'HNH', label: 'H&H', fileTag: 'HH', nama: 'H & H Medical Supplies', kode: 'INV-HH', ppn: false, bank: 'BCA', noRek: '2680069568', atasNama: 'Josephine Holie Gracia', logo: 'HNH' },
+  GSM: { key: 'GSM', entitas: 'Gracia', label: 'GSM', fileTag: 'GSM', nama: 'PT. Gracia Sukses Medika', kode: 'INV-GSM', ppn: true, bank: 'BCA', noRek: '2680160603', atasNama: 'PT. GRACIA SUKSES MEDIKA', logo: 'Gracia', pill: 'gracia' },
+  HNH: { key: 'HNH', entitas: 'HNH', label: 'H&H', fileTag: 'HH', nama: 'H & H Medical Supplies', kode: 'INV-HH', ppn: false, bank: 'BCA', noRek: '2680069568', atasNama: 'Josephine Holie Gracia', logo: 'HNH', pill: 'hnh' },
+  // Penjualan Medident yang dipisah (centang "Pisahkan Medident" di Rekap Stok Terjual) = H&H membeli ke Gracia / Glomed.
+  // Isinya HANYA penjualan Medident yang dipisah; nomor INV-GSM berbagi urutan dengan invoice GSM ke Glomed.
+  GSM_HH: { key: 'GSM_HH', entitas: 'Gracia', md: true, buyerKey: 'HH', label: 'H&H beli ke Gracia', fileTag: 'HH_beli_ke_Gracia', sheetTag: 'HH BELI GRACIA', nama: 'PT. Gracia Sukses Medika', kode: 'INV-GSM', ppn: true, bank: 'BCA', noRek: '2680160603', atasNama: 'PT. GRACIA SUKSES MEDIKA', logo: 'Gracia', pill: 'gracia' },
+  GSJ_HH: { key: 'GSJ_HH', entitas: 'Glomed', md: true, buyerKey: 'HH', label: 'H&H beli ke Glomed', fileTag: 'HH_beli_ke_Glomed', sheetTag: 'HH BELI GLOMED', nama: 'PT Glomed Sukses Jaya', kode: 'INV-GSJ', ppn: true, bank: 'BCA', noRek: '2688870564', atasNama: 'PT Glomed Sukses Jaya', logo: 'Glomed', pill: 'glomed', senderAddr: ['Komplek Grogol Permai blok A no 19', 'Jl. Prof Dr. Latumenten, Jelambar, Jakarta Barat'] },
 };
-const T8_SELLER_KEYS = ['GSM', 'HNH'];
+const T8_SELLER_KEYS = ['GSM', 'HNH', 'GSM_HH', 'GSJ_HH'];
+// Pembeli: Glomed (default) atau H&H (alamat H&H bisa diisi/diubah di tab ini, tersimpan di settings.t8BuyerHH).
+function t8BuyerHH() {
+  const b = (typeof state !== 'undefined' && state.settings && state.settings.t8BuyerHH) || {};
+  return { nama: b.nama || 'H & H Medical Supplies', alamat1: b.alamat1 || '', alamat2: b.alamat2 || '' };
+}
+function t8BuyerOf(sellerKey) { const s = T8_SELLERS[sellerKey]; return s && s.buyerKey === 'HH' ? t8BuyerHH() : T8_BUYER; }
+function t8InvBuyer(inv) { return (inv && inv.buyer) || t8BuyerOf(inv.entitasKey); }
+function t8SenderAddr(sellerKey) { const s = T8_SELLERS[sellerKey]; return (s && s.senderAddr) || T8_SENDER_ADDR; }
+function t8BuyerShort(sellerKey) { const s = T8_SELLERS[sellerKey]; return s && s.buyerKey === 'HH' ? 'H&H' : 'Glomed'; }
 // Bucket dari classifyRowForPivot() yang dihitung sebagai "marketplace".
 const T8_MP_BUCKETS = ['ownShopee', 'ownTokopedia', 'ownTikTok', 'gmShopee', 'gmTokopedia', 'mShopee', 'mTokopedia'];
 const T8_ROMAN = ['', 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
@@ -11626,6 +11805,8 @@ function t8PaymentLine(sellerKey) {
 const T8_DEFAULT_EXCLUDE = {
   HNH: ['Bubble wrap', 'Biohazard (Plastik Sampah Medis) 80X60 (Pcs)'],
   GSM: ['Bubble wrap'],
+  GSM_HH: ['Bubble wrap'],
+  GSJ_HH: ['Bubble wrap'],
 };
 function t8ExcludeList(sellerKey) {
   state.settings = state.settings || {};
@@ -11651,7 +11832,7 @@ function t8SetExcluded(sellerKey, nama, on) {
       alert(`"${nama}" disembunyikan di Stok Terjual ${s.label}, jadi tetap tidak ditagihkan. Munculkan dulu produknya di Stok Terjual kalau mau ditagihkan.`);
     }
   }
-  gsjDetailedAudit(`${on ? 'mengecualikan' : 'memasukkan lagi'} <b>${escapeAttr(nama)}</b> ${on ? 'dari' : 'ke'} invoice ${escapeAttr(T8_SELLERS[sellerKey].label)} ke Glomed`);
+  gsjDetailedAudit(`${on ? 'mengecualikan' : 'memasukkan lagi'} <b>${escapeAttr(nama)}</b> ${on ? 'dari' : 'ke'} invoice ${escapeAttr(T8_SELLERS[sellerKey].label)} ke ${escapeAttr(t8BuyerShort(sellerKey))}`);
   saveState();
 }
 
@@ -11666,12 +11847,15 @@ function t8Recap(sellerKey, year, month, half) {
   const agg = {};
   const excl = t8ExcludedSet(sellerKey);
   const excluded = {};
+  // Pisahkan Medident: invoice ke Glomed TANPA Medident yang dipisah; invoice ke H&H HANYA Medident yang dipisah.
+  const sp = getRekapSplit(isoFrom);
+  const counts = b => T8_MP_BUCKETS.indexOf(b) !== -1 && t9IsMdRow(b, sp) === !!s.md;
   state.checkerRows.forEach(row => {
     if (row.entitas !== s.entitas || !row.tanggal || row.tanggal < isoFrom || row.tanggal > isoTo) return;
     if (!row.nama || !String(row.nama).trim()) return;
     if (excl.has(normalizeName(row.nama))) {
       const bucketX = classifyRowForPivot(row);
-      if (T8_MP_BUCKETS.indexOf(bucketX) !== -1) {
+      if (counts(bucketX)) {
         const kx = normalizeName(row.nama);
         const ex = excluded[kx] || (excluded[kx] = { nama: catMap[kx] || row.nama, qty: 0 });
         ex.qty += Number(row.qtyInternal != null ? row.qtyInternal : row.qty) || 0;
@@ -11682,8 +11866,8 @@ function t8Recap(sellerKey, year, month, half) {
     const q = Number(row.qtyInternal != null ? row.qtyInternal : row.qty) || 0;
     const key = normalizeName(row.nama);
     const a = agg[key] || (agg[key] = { nama: catMap[key] || row.nama, inCatalog: !!catMap[key], mp: 0, wa: 0 });
-    if (T8_MP_BUCKETS.indexOf(bucket) !== -1) a.mp += q;
-    else if (bucket === 'wa') a.wa += q;
+    if (counts(bucket)) a.mp += q;
+    else if (bucket === 'wa' && !s.md) a.wa += q;
   });
   const rows = Object.values(agg).map(a => ({
     nama: a.nama, mp: a.mp, wa: a.wa, inCatalog: a.inCatalog,
@@ -11733,10 +11917,10 @@ const t8 = (function () {
     bulan: d.getMonth() + 1,
     half: d.getDate() > 15 ? 2 : 1,
     tanggal: t8LocalISO(),   // tanggal invoice (bisa diedit)
-    noUrut: { GSM: '', HNH: '' }, // nomor urut diisi manual
+    noUrut: { GSM: '', HNH: '', GSM_HH: '', GSJ_HH: '' }, // nomor urut diisi manual
     result: null,            // { GSM: recap, HNH: recap } — hasil "Hitung Invoice" terakhir
     diag: null,              // ringkasan data periode (t8Diag)
-    savedIds: { GSM: '', HNH: '' },
+    savedIds: { GSM: '', HNH: '', GSM_HH: '', GSJ_HH: '' },
     viewId: '',              // id invoice yang dibuka di Riwayat
   };
 })();
@@ -11750,8 +11934,13 @@ function t8Num(n) { return Math.round(Number(n) || 0).toLocaleString('id-ID'); }
 function t8SavedFor(sellerKey) {
   return (state.salesInvoices || []).filter(r => r && r.entitasKey === sellerKey);
 }
+// Semua invoice tersimpan yang memakai KODE nomor yang sama (mis. INV-GSM dipakai GSM→Glomed & GSM→H&H).
+function t8SavedSameKode(sellerKey) {
+  const kode = T8_SELLERS[sellerKey].kode;
+  return (state.salesInvoices || []).filter(r => r && T8_SELLERS[r.entitasKey] && T8_SELLERS[r.entitasKey].kode === kode);
+}
 function t8LastSavedNo(sellerKey) {
-  const list = t8SavedFor(sellerKey);
+  const list = t8SavedSameKode(sellerKey);
   if (!list.length) return '';
   const latest = list.slice().sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0];
   return latest.noInvoice || '';
@@ -11831,11 +12020,11 @@ function t8InvoiceHTML(inv) {
   return `
   <div class="t8-paper">
     <div class="hd">${logo ? `<img src="${logo}" alt="logo">` : ''}</div>
-    <div class="addr">${t8Esc(T8_SENDER_ADDR[0])}<br>${t8Esc(T8_SENDER_ADDR[1])}</div>
+    <div class="addr">${t8Esc(t8SenderAddr(inv.entitasKey)[0])}<br>${t8Esc(t8SenderAddr(inv.entitasKey)[1])}</div>
     <div class="tgl">Jakarta, ${t8Esc(t8DateLong(inv.tanggal))}</div>
     <h1>INVOICE</h1>
     <div class="no">${t8Esc(inv.noInvoice)}</div>
-    <div class="to">Kepada Yth.<br><b>${t8Esc(T8_BUYER.nama)}</b><br>${t8Esc(T8_BUYER.alamat1)}<br>${t8Esc(T8_BUYER.alamat2)}</div>
+    <div class="to">Kepada Yth.<br><b>${t8Esc(t8InvBuyer(inv).nama)}</b><br>${t8Esc(t8InvBuyer(inv).alamat1)}<br>${t8Esc(t8InvBuyer(inv).alamat2)}</div>
     <div>Dengan hormat,</div>
     <table class="tb">
       <thead><tr><th style="width:36px;">NO</th><th style="width:80px;">BANYAKNYA</th><th style="width:80px;">SATUAN/ISI</th><th>PENJELASAN PEKERJAAN / JENIS BARANG</th><th style="width:100px;">HARGA</th><th style="width:120px;">JUMLAH</th></tr></thead>
@@ -11853,6 +12042,7 @@ function t8DraftRecord(sellerKey) {
   if (!rc) return null;
   return {
     entitasKey: sellerKey,
+    buyer: Object.assign({}, t8BuyerOf(sellerKey)),
     noUrut: t8.noUrut[sellerKey],
     noInvoice: t8FullNo(sellerKey, t8.noUrut[sellerKey], rc.bulan, rc.tahun),
     tanggal: t8.tanggal,
@@ -11873,7 +12063,7 @@ function t8SaveOne(sellerKey) {
   if (t8.savedIds[sellerKey]) return { ok: false, err: `Invoice ${label} sudah tersimpan.` };
   if (!draft.items.length) return { ok: false, err: `Invoice ${label} kosong (tidak ada penjualan marketplace di periode ini).` };
   if (!String(draft.noUrut || '').replace(/\D/g, '')) return { ok: false, err: `Isi nomor urut invoice ${label} dulu.` };
-  if (t8SavedFor(sellerKey).some(r => r.noInvoice === draft.noInvoice)) {
+  if (t8SavedSameKode(sellerKey).some(r => r.noInvoice === draft.noInvoice)) {
     return { ok: false, err: `Nomor ${draft.noInvoice} sudah dipakai invoice lain yang tersimpan — ganti nomor urutnya.` };
   }
   const same = t8SavedFor(sellerKey).find(r => r.tahun === draft.tahun && r.bulan === draft.bulan && r.half === draft.half);
@@ -11899,7 +12089,7 @@ function t8SaveKeys(keys) {
     if (!d) { errs.push('Belum ada hasil hitung.'); return; }
     if (!d.items.length) { errs.push(`Invoice ${T8_SELLERS[k].label} kosong.`); return; }
     if (!String(d.noUrut || '').replace(/\D/g, '')) { errs.push(`Isi nomor urut invoice ${T8_SELLERS[k].label} dulu.`); return; }
-    if (t8SavedFor(k).some(r => r.noInvoice === d.noInvoice)) { errs.push(`Nomor ${d.noInvoice} sudah dipakai.`); return; }
+    if (t8SavedSameKode(k).some(r => r.noInvoice === d.noInvoice)) { errs.push(`Nomor ${d.noInvoice} sudah dipakai.`); return; }
     draftsOk.push(k);
   });
   if (errs.length) { t8Message(errs.join('\n'), 'err'); return; }
@@ -11935,7 +12125,7 @@ function t8ImgInfo(url) {
 }
 function t8SheetName(inv) {
   const s = T8_SELLERS[inv.entitasKey];
-  return `GLOMED ${s.fileTag} ${inv.half === 1 ? '1-15' : `16-${t8Range(inv.tahun, inv.bulan, 2).to}`} ${T8_BULAN[inv.bulan].toUpperCase()}`.slice(0, 31);
+  return `${s.sheetTag || 'GLOMED ' + s.fileTag} ${inv.half === 1 ? '1-15' : `16-${t8Range(inv.tahun, inv.bulan, 2).to}`} ${T8_BULAN[inv.bulan].toUpperCase()}`.slice(0, 31);
 }
 async function t8AddSheet(wb, inv) {
   const s = T8_SELLERS[inv.entitasKey];
@@ -11969,15 +12159,15 @@ async function t8AddSheet(wb, inv) {
     c.alignment = Object.assign({ vertical: 'middle', wrapText: true }, (opt && opt.align) || {});
     return c;
   };
-  mergeSet(7, 'A', 'F', T8_SENDER_ADDR[0], { align: { horizontal: 'left' } });
-  mergeSet(8, 'A', 'F', T8_SENDER_ADDR[1], { align: { horizontal: 'left' } });
+  mergeSet(7, 'A', 'F', t8SenderAddr(inv.entitasKey)[0], { align: { horizontal: 'left' } });
+  mergeSet(8, 'A', 'F', t8SenderAddr(inv.entitasKey)[1], { align: { horizontal: 'left' } });
   mergeSet(10, 'D', 'F', `Jakarta, ${t8DateLong(inv.tanggal)}`, { align: { horizontal: 'right' } });
   mergeSet(12, 'A', 'F', 'INVOICE', { font: { bold: true, size: 14 }, align: { horizontal: 'center' } });
   mergeSet(13, 'A', 'F', inv.noInvoice, { font: { bold: true }, align: { horizontal: 'center' } });
   ws.getCell('A14').value = 'Kepada Yth.'; ws.getCell('A14').font = font();
-  ws.getCell('A15').value = T8_BUYER.nama; ws.getCell('A15').font = font({ bold: true });
-  ws.getCell('A16').value = T8_BUYER.alamat1; ws.getCell('A16').font = font();
-  ws.getCell('A17').value = T8_BUYER.alamat2; ws.getCell('A17').font = font();
+  ws.getCell('A15').value = t8InvBuyer(inv).nama; ws.getCell('A15').font = font({ bold: true });
+  ws.getCell('A16').value = t8InvBuyer(inv).alamat1; ws.getCell('A16').font = font();
+  ws.getCell('A17').value = t8InvBuyer(inv).alamat2; ws.getCell('A17').font = font();
   ws.getCell('A19').value = 'Dengan hormat,'; ws.getCell('A19').font = font();
 
   const HR = 21;
@@ -12056,8 +12246,9 @@ async function t8ExportExcel(invs, fileName) {
 function t8FileName(invs) {
   const a = invs[0];
   const per = a.half === 1 ? '1-15' : `16-${t8Range(a.tahun, a.bulan, 2).to}`;
+  if (invs.length > 1 && invs.some(i => T8_SELLERS[i.entitasKey] && T8_SELLERS[i.entitasKey].md)) return `Invoice_Semua_${T8_BULAN[a.bulan]}_${a.tahun}_${per}.xlsx`;
   const who = invs.length > 1 ? 'GSM_HH' : T8_SELLERS[a.entitasKey].fileTag;
-  return `Invoice_${who}_ke_Glomed_${T8_BULAN[a.bulan]}_${a.tahun}_${per}.xlsx`;
+  return `Invoice_${who}${T8_SELLERS[a.entitasKey].md && invs.length === 1 ? '' : '_ke_Glomed'}_${T8_BULAN[a.bulan]}_${a.tahun}_${per}.xlsx`;
 }
 
 // ---------- Cetak / PDF (jendela cetak sendiri — di dialog print pilih "Save as PDF") ----------
@@ -12102,8 +12293,8 @@ function t8RenderBaru() {
   const monthOpts = T8_BULAN.map((b, i) => i ? `<option value="${i}" ${t8.bulan === i ? 'selected' : ''}>${b}</option>` : '').join('');
   el.innerHTML = `
     <div class="card">
-      <h2 style="font-size:14px;">📤 Invoice ke PT Glomed Sukses Jaya</h2>
-      <p class="desc" style="margin-top:-6px;">Rekap otomatis dari Stok Terjual, hasilnya 2 invoice sekaligus: <b>GSM</b> (kena PPN 11%) dan <b>H&amp;H</b> (tanpa PPN). Hanya barang yang laku di marketplace (Shopee, Tokopedia, TikTok — semua toko) yang ikut; penjualan WA, Faktur Pajak, dan Lainnya tidak. Harga = Harga Modal + Rp1.000 (GSM dibagi 1,11).</p>
+      <h2 style="font-size:14px;">📤 Invoice ke PT Glomed Sukses Jaya &amp; ke H&amp;H</h2>
+      <p class="desc" style="margin-top:-6px;">Rekap otomatis dari Stok Terjual: <b>GSM → Glomed</b> (PPN 11%) dan <b>H&amp;H → Glomed</b> (tanpa PPN) berisi barang yang laku di marketplace (Shopee, Tokopedia, TikTok) <b>tanpa Medident yang dipisah</b>; <b>H&amp;H beli ke Gracia</b> dan <b>H&amp;H beli ke Glomed</b> (PPN 11%) berisi <b>hanya Medident yang dipisah</b> (ikut centang "Pisahkan Medident" di Rekap Stok Terjual — sama dengan Total Omset). WA, Faktur Pajak, dan Lainnya tidak ikut. Harga = Harga Modal + Rp1.000 (yang kena PPN dibagi 1,11).</p>
       <div class="form-grid">
         <div class="field"><label>Bulan</label><select id="t8-bulan">${monthOpts}</select></div>
         <div class="field"><label>Tahun</label><input type="number" id="t8-tahun" min="2020" max="2100" value="${t8.tahun}"></div>
@@ -12143,7 +12334,7 @@ function t8Compute() {
   t8.result = {};
   T8_SELLER_KEYS.forEach(k => { t8.result[k] = t8Recap(k, t8.tahun, t8.bulan, t8.half); });
   t8.diag = t8Diag(t8.tahun, t8.bulan, t8.half);
-  t8.savedIds = { GSM: '', HNH: '' };
+  t8.savedIds = { GSM: '', HNH: '', GSM_HH: '', GSJ_HH: '' };
   t8RenderPreview();
   t8Message('');
   const dup = T8_SELLER_KEYS.map(k => {
@@ -12198,7 +12389,7 @@ function t8RenderPreview() {
     <div class="card t8-card" data-key="${k}">
       <div class="t8-inv-head">
         <div>
-          <div class="t8-inv-title"><span class="pill ${k === 'GSM' ? 'gracia' : 'hnh'}">${s.label}</span> ${t8Esc(s.nama)} → ${t8Esc(T8_BUYER.nama)}</div>
+          <div class="t8-inv-title"><span class="pill ${s.pill || 'hnh'}">${s.label}</span> ${t8Esc(s.nama)} → ${t8Esc(t8BuyerOf(k).nama)}</div>
           <div class="t8-inv-sub">Periode ${t8Esc(per)} · ${rc.items.length} barang · Total ${t8Rp(rc.total)}${rc.hasPPN ? ' (termasuk PPN 11%)' : ' (tanpa PPN)'}</div>
         </div>
         <div class="t8-actions">
@@ -12213,6 +12404,10 @@ function t8RenderPreview() {
         <span class="t8-fullno" data-fullno="${k}">${t8Esc(draft.noInvoice)}</span>
         <span style="font-size:11px;color:var(--muted);">${last ? `Terakhir tersimpan di sini: ${t8Esc(last)}` : 'Nomor diisi manual'}</span>
       </div>
+      ${s.buyerKey === 'HH' && !saved ? `<div class="t8-no-row" style="flex-wrap:wrap;"><label style="font-size:12px;font-weight:700;">Alamat H&amp;H (penerima)</label>
+        <input type="text" data-t8-hh="alamat1" placeholder="Alamat baris 1" value="${t8Esc(t8BuyerHH().alamat1)}" style="flex:1;min-width:200px;">
+        <input type="text" data-t8-hh="alamat2" placeholder="Alamat baris 2" value="${t8Esc(t8BuyerHH().alamat2)}" style="flex:1;min-width:200px;">
+        <span style="font-size:11px;color:var(--muted);">(boleh dikosongkan dulu)</span></div>` : ''}
       ${t8WarningsHTML(rc)}
       ${empty ? `<div class="t8-empty">Tidak ada penjualan marketplace ${t8Esc(s.label)} di periode ini.</div>` : `<div class="t8-paper-wrap">${t8InvoiceHTML(draft)}</div>`}
       ${skipped}
@@ -12231,10 +12426,10 @@ function t8RenderPreview() {
   }).join('');
   el.innerHTML = t8DiagHTML() + cards + `
     <div class="card" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
-      <span style="font-size:12.5px;color:var(--muted);">Kedua invoice sekaligus:</span>
-      <button class="btn" data-act="save-all">💾 Simpan Keduanya</button>
-      <button class="btn secondary" data-act="xls-all">📥 Excel Gabungan (2 sheet)</button>
-      <button class="btn secondary" data-act="print-all">🖨️ Cetak Keduanya</button>
+      <span style="font-size:12.5px;color:var(--muted);">Semua invoice yang ada isinya sekaligus:</span>
+      <button class="btn" data-act="save-all">💾 Simpan Semua</button>
+      <button class="btn secondary" data-act="xls-all">📥 Excel Gabungan</button>
+      <button class="btn secondary" data-act="print-all">🖨️ Cetak Semua</button>
     </div>`;
 
   el.querySelectorAll('input[data-no]').forEach(inp => {
@@ -12268,13 +12463,20 @@ function t8RenderPreview() {
     const card = b.closest('.t8-card'); const k = card.dataset.key;
     const v = (card.querySelector('[data-t8-exname]').value || '').trim();
     if (!v) return;
-    if (!confirm(`"${v}" tidak ditagihkan ke Glomed di invoice ${T8_SELLERS[k].label} (semua periode)?`)) return;
+    if (!confirm(`"${v}" tidak ditagihkan ke ${t8BuyerShort(k)} di invoice ${T8_SELLERS[k].label} (semua periode)?`)) return;
     t8SetExcluded(k, v, true);
     t8Compute();
   }));
-  el.querySelectorAll(':scope > .card [data-act="save-all"]').forEach(b => b.addEventListener('click', () => t8SaveKeys(T8_SELLER_KEYS)));
-  el.querySelectorAll(':scope > .card [data-act="xls-all"]').forEach(b => b.addEventListener('click', () => t8DoExport(T8_SELLER_KEYS)));
-  el.querySelectorAll(':scope > .card [data-act="print-all"]').forEach(b => b.addEventListener('click', () => t8DoPrint(T8_SELLER_KEYS)));
+  const filledKeys = () => T8_SELLER_KEYS.filter(k => t8.result[k] && t8.result[k].items.length);
+  el.querySelectorAll(':scope > .card [data-act="save-all"]').forEach(b => b.addEventListener('click', () => t8SaveKeys(filledKeys())));
+  el.querySelectorAll(':scope > .card [data-act="xls-all"]').forEach(b => b.addEventListener('click', () => t8DoExport(filledKeys())));
+  el.querySelectorAll(':scope > .card [data-act="print-all"]').forEach(b => b.addEventListener('click', () => t8DoPrint(filledKeys())));
+  el.querySelectorAll('input[data-t8-hh]').forEach(inp => inp.addEventListener('change', () => {
+    state.settings.t8BuyerHH = Object.assign({}, t8BuyerHH(), { [inp.dataset.t8Hh]: inp.value.trim() });
+    gsjDetailedAudit('mengubah alamat H&amp;H di invoice ke H&amp;H: ' + escapeAttr(state.settings.t8BuyerHH.alamat1 + ' / ' + state.settings.t8BuyerHH.alamat2));
+    saveState();
+    t8RenderPreview();
+  }));
 }
 
 // Ambil draft yang siap dipakai export/cetak (nomor urut wajib terisi supaya nomor di file tidak kosong).
@@ -12307,7 +12509,7 @@ function t8RenderRiwayat() {
     const s = T8_SELLERS[r.entitasKey] || T8_SELLERS.GSM;
     return `<tr data-id="${t8Esc(r.id)}">
       <td style="font-family:var(--mono);font-weight:700;">${t8Esc(r.noInvoice)}</td>
-      <td><span class="pill ${r.entitasKey === 'GSM' ? 'gracia' : 'hnh'}">${s.label}</span></td>
+      <td><span class="pill ${s.pill || 'hnh'}">${s.label}</span></td>
       <td>${t8Esc(t8PeriodLabel(r.tahun, r.bulan, r.half))}</td>
       <td>${t8Esc(t8DateLong(r.tanggal))}</td>
       <td style="text-align:right;font-family:var(--mono);">${t8Rp(r.total)}</td>
@@ -12322,7 +12524,7 @@ function t8RenderRiwayat() {
   const viewing = list.find(r => r.id === t8.viewId);
   el.innerHTML = `
     <div class="card">
-      <h2 style="font-size:14px;">📚 Riwayat Invoice ke Glomed</h2>
+      <h2 style="font-size:14px;">📚 Riwayat Invoice (ke Glomed &amp; ke H&amp;H)</h2>
       <p class="desc" style="margin-top:-6px;">Invoice yang sudah disimpan (tersimpan permanen, bisa dibuka dari device lain). Isinya snapshot saat dibuat — kalau data Stok Terjual berubah belakangan, invoice lama tidak ikut berubah.</p>
       ${list.length ? `<div class="table-wrap"><table class="dtable" style="min-width:820px;">
         <thead><tr><th>No. Invoice</th><th>Penerbit</th><th>Periode</th><th>Tanggal Invoice</th><th style="text-align:right;">Total</th><th>Dibuat oleh</th><th></th></tr></thead>
@@ -12375,8 +12577,15 @@ const T9_PPN_RATE = 0.11;
 const T9_ENT = {
   GSM: { key: 'GSM', entitas: 'Gracia', label: 'Gracia (GSM)', short: 'Gracia', pill: 'gracia', color: '#111827', fileTag: 'GRACIA', sheetTag: 'OMSET GRACIA', extra: false }, // baris 'TOTAL Pembelian Glomed ke GSM' & 'PPN 11% GLOMED ke GSM' tidak ditampilkan lagi
   HNH: { key: 'HNH', entitas: 'HNH', label: 'H&H', short: 'H&H', pill: 'hnh', color: '#EF4444', fileTag: 'H_H', sheetTag: 'OMSET H&H', extra: false },
+  // Penjualan Medident (toko milik H&H) yang dipisah dari omset utama (lihat Pisahkan Medident di Rekap Stok Terjual):
+  // barang Gracia / Glomed yang laku di toko Medident = H&H membeli ke Gracia / Glomed.
+  GSM_MD: { key: 'GSM_MD', entitas: 'Gracia', md: true, label: 'H&H beli ke Gracia', short: 'H&H→Gracia', pill: 'gracia', color: '#F59E0B', fileTag: 'H_H_BELI_KE_GRACIA', sheetTag: 'OMSET H&H BELI KE GRACIA', colTitle: 'OMSET PEMBELIAN H&H KE GRACIA', extra: false },
+  GSJ_MD: { key: 'GSJ_MD', entitas: 'Glomed', md: true, label: 'H&H beli ke Glomed', short: 'H&H→Glomed', pill: 'glomed', color: '#0EA5E9', fileTag: 'H_H_BELI_KE_GLOMED', sheetTag: 'OMSET H&H BELI KE GLOMED', colTitle: 'OMSET PEMBELIAN H&H KE GLOMED', extra: false },
 };
-const T9_KEYS = ['GSM', 'HNH'];
+const T9_KEYS = ['GSM', 'HNH', 'GSM_MD', 'GSJ_MD'];
+const T9_MAIN = ['GSM', 'HNH']; // dipakai untuk "Gabungan" (omset utama, tanpa Medident yang dipisah)
+const T9_MD_KEYS = ['GSM_MD', 'GSJ_MD'];
+function t9IsMdRow(bucket, sp) { return (bucket === 'mShopee' && sp.shopee) || (bucket === 'mTokopedia' && sp.tokped); }
 const T9_BULAN = ['', 'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
 const T9_BULAN_PENDEK = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
 
@@ -12466,6 +12675,7 @@ function t9Compute(sellerKey, year, month, ctx) {
   const days = [];
   for (let d = 1; d <= nDays; d++) days.push({ day: d, iso: `${year}-${t9Pad(month)}-${t9Pad(d)}`, omset: 0, qty: 0, rows: 0, items: [], exclWA: 0, exclFaktur: 0 });
   const agg = {};
+  const sp = getRekapSplit(year + '-' + t9Pad(month) + '-01'); // Pisahkan Medident (sama dengan Rekap Stok Terjual)
   (ctx.rows[s.entitas + '|' + year + '-' + t9Pad(month)] || []).forEach(r => {
     const day = Number(r.tanggal.slice(8, 10));
     if (!(day >= 1 && day <= nDays)) return;
@@ -12477,6 +12687,8 @@ function t9Compute(sellerKey, year, month, ctx) {
       return;
     }
     if (!r.nama || !String(r.nama).trim()) return;
+    // Omset utama TANPA Medident yang dipisah; omset "H&H beli ke ..." HANYA Medident yang dipisah.
+    if (t9IsMdRow(bucket, sp) !== !!s.md) return;
     if (t9HiddenSet(s.entitas).has(normalizeName(r.nama))) return; // produk disembunyikan -> tidak dihitung (sama dengan Stok Terjual)
     const key = day + '||' + normalizeName(r.nama);
     const a = agg[key] || (agg[key] = { day, nama: r.nama, qty: 0 });
@@ -12525,6 +12737,7 @@ function t9MakeSnap(y, m, comps) {
 }
 function t9FromSnap(snap, key) {
   const s = snap[key];
+  if (!s) return t9Compute(key, snap.tahun, snap.bulan); // simpanan lama belum punya omset ini -> hitung langsung
   const days = s.d.map((v, i) => ({ day: i + 1, iso: `${snap.tahun}-${t9Pad(snap.bulan)}-${t9Pad(i + 1)}`, omset: v[0], qty: v[1], rows: v[2], items: [], exclWA: 0, exclFaktur: 0 }));
   return {
     sellerKey: key, tahun: snap.tahun, bulan: snap.bulan, days,
@@ -12548,7 +12761,7 @@ let t9Data = null;
 function t9Rp(n) { return 'Rp ' + Math.round(Number(n) || 0).toLocaleString('id-ID'); }
 function t9TglPendek(iso) { const p = iso.split('-'); return `${p[2]}/${p[1]}/${p[0].slice(2)}`; }
 function t9Vals(bag, key) {
-  if (key === 'GAB') return bag.GSM.days.map((d, i) => d.omset + (bag.HNH.days[i] ? bag.HNH.days[i].omset : 0));
+  if (key === 'GAB') return bag.GSM.days.map((d, i) => d.omset + (bag.HNH.days[i] ? bag.HNH.days[i].omset : 0)); // Gabungan = Gracia + H&H (tanpa Medident yang dipisah)
   return bag[key].days.map(d => d.omset);
 }
 function t9Pct(p) { return (p > 0 ? '+' : p < 0 ? '−' : '') + Math.abs(p).toLocaleString('id-ID', { maximumFractionDigits: 1, minimumFractionDigits: 1 }) + '%'; }
@@ -12667,14 +12880,14 @@ function t9ChartHTML() {
     const prevSeries = labels.map((_, i) => (i < prev.length ? prev[i] : null));
     if (kind === 'harian') {
       const bars = ent === 'GAB'
-        ? T9_KEYS.map(k => ({ name: T9_ENT[k].short, color: T9_ENT[k].color, values: d.cur[k].days.map(x => x.omset) }))
+        ? T9_MAIN.map(k => ({ name: T9_ENT[k].short, color: T9_ENT[k].color, values: d.cur[k].days.map(x => x.omset) }))
         : [{ name: curName, color: colorOf, values: cur }];
       svg = t9SvgChart({
         labels, bars, stacked: ent === 'GAB',
         lines: [{ name: prevName, color: '#94A3B8', dashed: true, values: prevSeries }],
         tip: i => `Tgl ${i + 1}\n${curName}: ${t9Rp(cur[i])}\n${prevName}: ${prevSeries[i] == null ? '—' : t9Rp(prevSeries[i])}`,
       });
-      legend = (ent === 'GAB' ? T9_KEYS.map(k => `<span><i style="background:${T9_ENT[k].color}"></i>${t8Esc(T9_ENT[k].short)} ${t8Esc(curName)}</span>`).join('') : `<span><i style="background:${colorOf}"></i>${t8Esc(curName)}</span>`)
+      legend = (ent === 'GAB' ? T9_MAIN.map(k => `<span><i style="background:${T9_ENT[k].color}"></i>${t8Esc(T9_ENT[k].short)} ${t8Esc(curName)}</span>`).join('') : `<span><i style="background:${colorOf}"></i>${t8Esc(curName)}</span>`)
         + `<span><i class="ln" style="background:#94A3B8"></i>${t8Esc(prevName)} (tanggal yang sama)</span>`;
     } else {
       let a = 0, b = 0;
@@ -12692,13 +12905,13 @@ function t9ChartHTML() {
     const rows = d.trend;
     const labels = rows.map(r => `${T9_BULAN_PENDEK[r.bulan]} ${String(r.tahun).slice(2)}`);
     const bars = ent === 'GAB'
-      ? T9_KEYS.map(k => ({ name: T9_ENT[k].short, color: T9_ENT[k].color, values: rows.map(r => r[k]) }))
+      ? T9_MAIN.map(k => ({ name: T9_ENT[k].short, color: T9_ENT[k].color, values: rows.map(r => r[k]) }))
       : [{ name: T9_ENT[ent].short, color: colorOf, values: rows.map(r => r[ent]) }];
     svg = t9SvgChart({
       labels, bars, stacked: ent === 'GAB', valueLabels: true, height: 260,
-      tip: i => `${T9_BULAN[rows[i].bulan]} ${rows[i].tahun}\n` + (ent === 'GAB' ? T9_KEYS.map(k => `${T9_ENT[k].short}: ${t9Rp(rows[i][k])}`).join('\n') + `\nGabungan: ${t9Rp(rows[i].GSM + rows[i].HNH)}` : t9Rp(rows[i][ent])) + (rows[i].src === 'tersimpan' ? '\n(angka tersimpan)' : ''),
+      tip: i => `${T9_BULAN[rows[i].bulan]} ${rows[i].tahun}\n` + (ent === 'GAB' ? T9_MAIN.map(k => `${T9_ENT[k].short}: ${t9Rp(rows[i][k])}`).join('\n') + `\nGabungan: ${t9Rp(rows[i].GSM + rows[i].HNH)}` : t9Rp(rows[i][ent])) + (rows[i].src === 'tersimpan' ? '\n(angka tersimpan)' : ''),
     });
-    legend = (ent === 'GAB' ? T9_KEYS.map(k => `<span><i style="background:${T9_ENT[k].color}"></i>${t8Esc(T9_ENT[k].short)}</span>`).join('') : `<span><i style="background:${colorOf}"></i>${t8Esc(T9_ENT[ent].short)}</span>`);
+    legend = (ent === 'GAB' ? T9_MAIN.map(k => `<span><i style="background:${T9_ENT[k].color}"></i>${t8Esc(T9_ENT[k].short)}</span>`).join('') : `<span><i style="background:${colorOf}"></i>${t8Esc(T9_ENT[ent].short)}</span>`);
     note = 'Total omset (DPP+PPN) 6 bulan terakhir sampai bulan yang dipilih. Bulan yang belum disimpan memakai hitungan terbaru.';
   }
   return `
@@ -12714,6 +12927,8 @@ function t9ChartHTML() {
           <button data-v="GAB" class="${ent === 'GAB' ? 'on' : ''}">Gabungan</button>
           <button data-v="GSM" class="${ent === 'GSM' ? 'on' : ''}">Gracia</button>
           <button data-v="HNH" class="${ent === 'HNH' ? 'on' : ''}">H&amp;H</button>
+          <button data-v="GSM_MD" class="${ent === 'GSM_MD' ? 'on' : ''}">H&amp;H→Gracia</button>
+          <button data-v="GSJ_MD" class="${ent === 'GSJ_MD' ? 'on' : ''}">H&amp;H→Glomed</button>
         </div>
       </div>
     </div>
@@ -12792,7 +13007,7 @@ function renderTab9() {
   // status simpanan
   let snapBar;
   if (snap) {
-    const dLive = T9_KEYS.map(k => ({ k, diff: t9Round2(live[k].summ.dppPpn - snap[k].dppPpn) }));
+    const dLive = T9_KEYS.filter(k => snap[k]).map(k => ({ k, diff: t9Round2(live[k].summ.dppPpn - snap[k].dppPpn) }));
     const same = dLive.every(x => Math.abs(x.diff) < 1);
     snapBar = `<div class="t9-snapbar ok"><span>📌 <b>Angka ${T9_BULAN[m]} ${y} tersimpan</b> (${t8Esc(new Date(snap.savedAt).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' }))} oleh ${t8Esc(snap.savedBy || '-')}).
       ${t9.useLive ? '<b>Sekarang menampilkan hitungan terbaru.</b>' : 'Angka di bawah <b>dibekukan</b> dan tidak ikut berubah.'}
@@ -12805,13 +13020,13 @@ function renderTab9() {
   el.innerHTML = `
     <div class="card">
       <h2 style="font-size:14px;">📈 Total Omset</h2>
-      <p class="desc" style="margin-top:-6px;">Omset per tanggal diambil dari <b>Total Pembayaran</b> di Stok Terjual (Grand Total terjual × (Harga Modal + markup Rp${Math.round(cur.GSM.markup || 0).toLocaleString('id-ID')})). Penjualan Faktur Pajak dan WA tidak ikut, sama seperti kolom Grand Total di Stok Terjual. Tampilan & export mengikuti file <i>TOTAL OMSET</i>.</p>
+      <p class="desc" style="margin-top:-6px;">Omset per tanggal diambil dari <b>Total Pembayaran</b> di Stok Terjual (Grand Total terjual × (Harga Modal + markup Rp${Math.round(cur.GSM.markup || 0).toLocaleString('id-ID')})). Penjualan Faktur Pajak dan WA tidak ikut, sama seperti kolom Grand Total di Stok Terjual.${(() => { const sp = getRekapSplit(y + '-' + t9Pad(m) + '-01'); return sp.any ? ` <b>${rekapMdLabel(sp)} dipisah</b>: tidak masuk Omset Gracia / H&amp;H, tapi masuk <b>Total Omset H&amp;H beli ke Gracia</b> (barang Gracia) dan <b>H&amp;H beli ke Glomed</b> (barang Glomed). ${rekapMdLabel(sp)} dari stok H&amp;H sendiri tidak masuk omset mana pun.` : ''; })()} Tampilan & export mengikuti file <i>TOTAL OMSET</i>.</p>
       <div class="form-grid">
         <div class="field"><label>Bulan</label><select id="t9-bulan">${monthOpts}</select></div>
         <div class="field"><label>Tahun</label><input type="number" id="t9-tahun" min="2020" max="2100" value="${y}"></div>
         <div class="field"><label>&nbsp;</label><button class="btn secondary" id="t9-refresh">🔄 Hitung ulang</button></div>
         <div class="field"><label>&nbsp;</label><button class="btn" id="t9-save">💾 ${snap ? 'Perbarui simpanan' : `Simpan omset ${T9_BULAN[m]}`}</button></div>
-        <div class="field"><label>&nbsp;</label><button class="btn secondary" id="t9-xls-all">📥 Excel Keduanya</button></div>
+        <div class="field"><label>&nbsp;</label><button class="btn secondary" id="t9-xls-all">📥 Excel Semua</button></div>
       </div>
       <div id="t9-msg"></div>
       ${snapBar}
@@ -12821,9 +13036,12 @@ function renderTab9() {
       <div class="stat-box hnh"><div class="label">Omset H&amp;H (DPP+PPN)</div><div class="value">${t9Rp(hTot)}</div>${chip(cmpH)}</div>
       <div class="stat-box"><div class="label">Gabungan (DPP+PPN)</div><div class="value">${t9Rp(gTot + hTot)}</div>${chip(cmpA)}</div>
     </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:14px;">
+      ${T9_MD_KEYS.map(k => `<div class="stat-box ${T9_ENT[k].pill}" style="border-color:#FDBA74;"><div class="label">Total Omset ${t8Esc(T9_ENT[k].label)} (DPP+PPN)</div><div class="value">${t9Rp(cur[k].summ.dppPpn)}</div>${chip(t9Comparison(t9Vals(t9Data.cur, k), t9Vals(t9Data.prev, k), y, m, now))}</div>`).join('')}
+    </div>
     <div class="card">
       <div class="t8-inv-title" style="margin-bottom:10px;">⚖️ Perbandingan dengan bulan lalu</div>
-      <div class="t9-cmp">${['GSM', 'HNH', 'GAB'].map(k => t9CmpBoxHTML(k)).join('')}</div>
+      <div class="t9-cmp">${['GSM', 'HNH', 'GAB', 'GSM_MD', 'GSJ_MD'].map(k => t9CmpBoxHTML(k)).join('')}</div>
       <div style="font-size:11px;color:var(--muted);margin-top:8px;">“Berjalan” = membandingkan tgl 1 sampai hari ini dengan tgl 1 sampai tanggal yang sama di bulan lalu, jadi adil walau bulan ini belum selesai.</div>
     </div>
     <div class="card" id="t9-chart-card"></div>
@@ -12877,7 +13095,7 @@ function t9Save() {
   if (problems.length && !confirm(`Omset ${label} ${problems.join(' dan ')}.\nAngka yang disimpan akan dibekukan seperti sekarang.\n\nTetap simpan?`)) return;
   const old = d.snap;
   if (old) {
-    const beda = T9_KEYS.map(k => `${T9_ENT[k].short}: ${t9Rp(old[k].dppPpn)} → ${t9Rp(d.live[k].summ.dppPpn)}`).join('\n');
+    const beda = T9_KEYS.map(k => `${T9_ENT[k].short}: ${old[k] ? t9Rp(old[k].dppPpn) : '—'} → ${t9Rp(d.live[k].summ.dppPpn)}`).join('\n');
     if (!confirm(`Omset ${label} sudah pernah disimpan.\nGanti dengan hitungan terbaru?\n\n${beda}`)) return;
   }
   const rec = t9MakeSnap(y, m, d.live);
@@ -12887,7 +13105,7 @@ function t9Save() {
   saveState();
   if (typeof gsjFlushSyncNow === 'function') gsjFlushSyncNow('omsetBulanan');
   renderTab9();
-  t9Msg(`Omset ${label} tersimpan (Gracia ${t9Rp(rec.GSM.dppPpn)} · H&H ${t9Rp(rec.HNH.dppPpn)}).`, 'ok');
+  t9Msg(`Omset ${label} tersimpan (Gracia ${t9Rp(rec.GSM.dppPpn)} · H&H ${t9Rp(rec.HNH.dppPpn)} · H&H beli ke Gracia ${t9Rp(rec.GSM_MD.dppPpn)} · H&H beli ke Glomed ${t9Rp(rec.GSJ_MD.dppPpn)}).`, 'ok');
 }
 
 function t9RenderRiwayat() {
@@ -12899,7 +13117,7 @@ function t9RenderRiwayat() {
     const pm = t9PrevMonth(r.tahun, r.bulan);
     const cur = r.GSM.dppPpn + r.HNH.dppPpn;
     let prevTot = 0;
-    T9_KEYS.forEach(k => { prevTot += t9Effective(k, pm.tahun, pm.bulan, ctx).summ.dppPpn; });
+    T9_MAIN.forEach(k => { prevTot += t9Effective(k, pm.tahun, pm.bulan, ctx).summ.dppPpn; });
     return `<tr data-id="${t8Esc(r.id)}">
       <td><b>${t8Esc(T9_BULAN[r.bulan])} ${r.tahun}</b></td>
       <td style="text-align:right;font-family:var(--mono);">${t9Rp(r.GSM.dppPpn)}</td>
@@ -12978,13 +13196,13 @@ function t9CardHTML(c) {
   return `
     <div class="card" style="margin-bottom:0;" data-t9card="${c.sellerKey}">
       <div class="t8-inv-head" style="margin-bottom:8px;">
-        <div class="t8-inv-title"><span class="pill ${s.pill}">${t8Esc(s.label)}</span> Omset ${T9_BULAN[c.bulan]} ${c.tahun} ${frozen ? '<span class="t8-badge-saved" style="margin-left:6px;">📌 tersimpan</span>' : ''}</div>
+        <div class="t8-inv-title"><span class="pill ${s.pill}">${t8Esc(s.label)}</span> ${s.md ? 'Total Omset' : 'Omset'} ${T9_BULAN[c.bulan]} ${c.tahun} ${frozen ? '<span class="t8-badge-saved" style="margin-left:6px;">📌 tersimpan</span>' : ''}</div>
         <div class="t8-actions"><button class="btn secondary small" data-t9xls="${c.sellerKey}">📥 Excel</button></div>
       </div>
       ${warn.length ? `<div class="t8-warn-box">⚠️ Cek dulu:<ul>${warn.join('')}</ul></div>` : ''}
       <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">${frozen ? 'Angka tersimpan (dibekukan) — rincian barang hanya tersedia untuk hitungan terbaru.' : 'Klik baris tanggal untuk lihat barang apa saja yang membentuk angkanya.'}</div>
       <div class="table-wrap"><table class="dtable" style="min-width:0;">
-        <thead><tr><th style="width:44px;text-align:center;">NO</th><th style="text-align:center;">TANGGAL</th><th style="text-align:right;">OMSET PEMBELIAN GLOMED ${t8Esc(namaBulan)}</th></tr></thead>
+        <thead><tr><th style="width:44px;text-align:center;">NO</th><th style="text-align:center;">TANGGAL</th><th style="text-align:right;">${t8Esc(s.colTitle || 'OMSET PEMBELIAN GLOMED')} ${t8Esc(namaBulan)}</th></tr></thead>
         <tbody>${rows}</tbody>
         <tfoot>
           <tr style="font-weight:800;background:#F5F6FE;"><td colspan="2" style="text-align:center;">TOTAL DPP+PPN</td><td style="text-align:right;font-family:var(--mono);">${Math.round(c.summ.dppPpn).toLocaleString('id-ID')}</td></tr>
@@ -13015,7 +13233,7 @@ function t9AddSheet(wb, c, sheetName) {
   t.font = F({ size: 11, bold: true });
   t.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
 
-  ['NO', 'TANGGAL', `OMSET PEMBELIAN GLOMED ${T9_BULAN[c.bulan].toUpperCase()}`].forEach((h, i) => {
+  ['NO', 'TANGGAL', `${s.colTitle || 'OMSET PEMBELIAN GLOMED'} ${T9_BULAN[c.bulan].toUpperCase()}`].forEach((h, i) => {
     const cell = ws.getCell(4, i + 1);
     cell.value = h; cell.font = F({ bold: true }); cell.border = box;
     cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFF00' } };
@@ -13067,7 +13285,7 @@ async function t9Export(comps) {
       const name = comps.length > 1 ? T9_ENT[c.sellerKey].sheetTag : 'OMSET BULAN ' + T9_BULAN[c.bulan].toUpperCase();
       t9AddSheet(wb, c, name);
     });
-    const tag = comps.length > 1 ? 'GRACIA_dan_H_H' : T9_ENT[c0.sellerKey].fileTag;
+    const tag = comps.length > 2 ? 'SEMUA' : comps.length > 1 ? 'GRACIA_dan_H_H' : T9_ENT[c0.sellerKey].fileTag;
     const fileName = `TOTAL_OMSET_${tag}_${T9_BULAN[c0.bulan].toUpperCase()}_${c0.tahun}.xlsx`;
     const buf = await wb.xlsx.writeBuffer();
     const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
