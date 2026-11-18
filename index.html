@@ -2424,7 +2424,8 @@ function computeAllStock(excludeCheckerIds) {
     const bound = genBound[r.entitas];
     if (bound !== null && r.tanggal <= bound) return;
     const rec = ensure(r.entitas, r.nama);
-    rec.qty -= Number(r.qty) || 0;
+    // qty hasil Pengali Stok (qtyInternal), sama seperti Stok Terjual & pemotongan stok otomatis
+    rec.qty -= Number(r.qtyInternal != null ? r.qtyInternal : r.qty) || 0;
   });
 
   return stock;
@@ -3416,7 +3417,9 @@ function computeStockAsOfDate(entitas, dateISO) {
   state.checkerRows.forEach(r => {
     if (r.entitas !== entitas || r.tanggal >= dateISO) return;
     if (bound !== null && r.tanggal <= bound) return;
-    ensure(r.nama).qty -= Number(r.qty) || 0;
+    // pakai qty hasil Pengali Stok (qtyInternal) — sama dengan yang dikurangkan di Stok Akhir, supaya
+    // Stok Awal hari ini = Stok Akhir kemarin (dulu pakai qty pesanan -> stok produk Pengali kelebihan).
+    ensure(r.nama).qty -= Number(r.qtyInternal != null ? r.qtyInternal : r.qty) || 0;
   });
   return result;
 }
@@ -8363,7 +8366,9 @@ function computeSingleProductPivot(entitas, tanggal, nama, stokAwalMap, dayRows,
   const grandTotal = totalOwn + totalGM + totalM;
   const matchingInvoiceItems = dayInvoiceItems.filter(it => normalizeName(it.nama) === key);
   const penambahanInvoice = matchingInvoiceItems.reduce((s,it) => s + (Number(it.qty)||0), 0);
-  const penambahanManual = dayAdjustments.filter(a => normalizeName(a.nama) === key).reduce((s,a) => s + (Number(a.qty)||0), 0);
+  // Baris "Stok Awal (import)" BUKAN barang masuk: itu angka stok fisik awal bulan berikutnya yang disimpan
+  // dengan tanggal akhir bulan (batas generasi). Dulu ikut terhitung +Stok di tanggal itu (mis. 31 Okt +26.950).
+  const penambahanManual = dayAdjustments.filter(a => normalizeName(a.nama) === key && a.keterangan !== 'Stok Awal (import)').reduce((s,a) => s + (Number(a.qty)||0), 0);
   const penambahan = penambahanInvoice + penambahanManual;
   const hargaModal = avgModalFromInvoice(entitas, nama);
   // Pisahkan Medident (centang di Rekap Stok Terjual): penjualan Medident yang dipisah TIDAK masuk Total Pembayaran
@@ -9931,6 +9936,7 @@ function buildStokTerjualWorkbookAndDownload(entitas, dates, filenameBase, opts)
   const sortedDates = [...dates].sort();
   const halfKeyOf = t => bulanKey(t) + '|' + (Number(t.slice(8, 10)) <= 15 ? 1 : 2);
   let curHalfSheets = [];
+  let _prevDaily = null; // sheet tanggal sebelumnya (untuk rumus Stok Awal = Stok Akhir kemarin)
   sortedDates.forEach((tanggal, dateIdx) => {
     const pivot = computeStokTerjualPivot(entitas, tanggal);
     const markup = state.settings.markupPerUnit || 0;
@@ -9939,6 +9945,12 @@ function buildStokTerjualWorkbookAndDownload(entitas, dates, filenameBase, opts)
     // dan dihitung di kolom P "Total Pembayaran MD" (rumus sama: qty x (Harga Modal + markup)).
     const _spX = getRekapSplit(tanggal);
     const _mdCols = [_spX.shopee ? 'I' : null, _spX.tokped ? 'J' : null].filter(Boolean);
+    // Stok Awal (kolom B) = Stok Akhir (kolom T) di sheet tanggal sebelumnya, kalau tanggal itu ada di file ini.
+    const _pd = new Date(tanggal + 'T00:00:00'); _pd.setDate(_pd.getDate() - 1);
+    const _pdIso = _pd.getFullYear() + '-' + String(_pd.getMonth() + 1).padStart(2, '0') + '-' + String(_pd.getDate()).padStart(2, '0');
+    // Hari pertama setelah Stok Awal (import) baru: Stok Awal diambil dari hasil import, bukan Stok Akhir kemarin.
+    const _genStart = (typeof iuActiveGeneration === 'function') && ((iuActiveGeneration(entitas, tanggal) || {}).tanggal === _pdIso);
+    const _prevName = (_prevDaily && _prevDaily.tanggal === _pdIso && !_genStart) ? _prevDaily.name : null;
     const ws = wb.addWorksheet(safeSheetName(sheetName));
     const COLS = [
       { header: 'Nama Produk', key: 'nama', width: 30 },
@@ -10054,6 +10066,7 @@ function buildStokTerjualWorkbookAndDownload(entitas, dates, filenameBase, opts)
       if (!Number.isInteger(Number(r.hargaModal) || 0)) row.getCell('hargaModal').numFmt = '#,##0.00';
       // kolom: Q = Faktur Pajak, R = WA, S = +Stok (bergeser 1 karena kolom P Total Pembayaran MD)
       row.getCell('stokAkhir').value = { formula: `B${rn}+S${rn}-M${rn}-Q${rn}-R${rn}`, result: r.stokAkhir };
+      if (_prevName) row.getCell('stokAwal').value = { formula: `'${_prevName.replace(/'/g, "''")}'!T${rn}`, result: r.stokAwal };
 
       const zebraOn = idx % 2 === 1;
       COLS.forEach(col => {
@@ -10086,11 +10099,31 @@ function buildStokTerjualWorkbookAndDownload(entitas, dates, filenameBase, opts)
       });
     });
 
+    // Baris TOTAL di bawah data: jumlah Grand Total Terjual, Total Pembayaran & Total Pembayaran MD.
+    if (pivot.length) {
+      const _lastData = ws.rowCount;
+      const tr = ws.addRow({ nama: 'TOTAL' });
+      tr.height = 20;
+      COLS.forEach(col => {
+        const c = tr.getCell(col.key);
+        c.font = { name: 'Calibri', size: 10.5, bold: true };
+        c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: col.key === 'totalPembayaranMD' ? 'FFFFE699' : 'FFD9D9D9' } };
+        c.border = { top: { style: 'thin', color: { argb: 'FF333333' } }, bottom: { style: 'thin', color: { argb: 'FF333333' } } };
+        c.alignment = { horizontal: col.key === 'nama' ? 'left' : 'center', vertical: 'middle' };
+      });
+      [['grandTotal', r => r.grandTotal], ['totalPembayaran', r => r.totalPembayaran], ['totalPembayaranMD', r => r.totalPembayaranMD]].forEach(([k, get]) => {
+        const L = ws.getColumn(k).letter;
+        const c = tr.getCell(k);
+        c.value = { formula: 'SUM(' + L + DATA_START_ROW + ':' + L + _lastData + ')', result: pivot.reduce((s, r) => s + (Number(get(r)) || 0), 0) };
+        c.numFmt = '#,##0';
+      });
+    }
     ws.autoFilter = { from: { row: HEADER_ROW, column: 1 }, to: { row: HEADER_ROW, column: N } };
     ws.views = [{ state: 'frozen', xSplit: 2, ySplit: DATA_START_ROW - 1, showGridLines: false }];
 
     // ===== Sheet REKAP "1-15 BULAN" / "16-31 BULAN" — ditaruh setelah tanggal terakhir periode itu =====
     curHalfSheets.push(ws.name);
+    _prevDaily = { tanggal, name: ws.name };
     const next = sortedDates[dateIdx + 1];
     if (!next || halfKeyOf(next) !== halfKeyOf(tanggal)) {
       const needRekap = opts.rekap === 'always' || (opts.rekap !== 'never' && curHalfSheets.length >= 2);
@@ -12016,6 +12049,10 @@ body{margin:0;background:#fff;}
 .t8-page{page-break-after:always;}
 .t8-page:last-child{page-break-after:auto;}
 .t8-paper table.tb tr.warn td{background:#fff;}
+/* Garis paling kanan tabel kadang hilang saat dicetak (tabel 100% lebar, garisnya terpotong di tepi
+   halaman). Beri ruang 2px supaya garis kanan selalu ikut tercetak. */
+.t8-page{padding:0 2px;box-sizing:border-box;}
+.t8-paper table.tb{width:calc(100% - 2px);}
 `;
 const T8_APP_CSS = `
 .t8-paper-wrap{border:1px solid #D7DCE6;border-radius:10px;padding:22px 26px;background:#fff;max-width:860px;overflow-x:auto;}
