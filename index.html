@@ -1525,7 +1525,7 @@ function getProductCatalogForPeriod(entitas, dateISO) {
   try { gen = (typeof iuActiveGenFor === 'function') ? iuActiveGenFor(entitas, dateISO) : null; } catch (e) { gen = null; }
   if (!gen || !gen.rows || !gen.rows.length) return full;
   const E = gen.tanggal;
-  const ck = `${entitas}|${E}|${full.length}|${state.checkerRows.length}|${state.adjustments.length}|${state.invoices.length}|${state.masterProduk.length}`;
+  const ck = `${entitas}|${E}|${full.length}|${state.checkerRows.length}|${state.adjustments.length}|${state.invoices.length}|${state.masterProduk.length}|${(state.hiddenProducts || []).length}|${(state.hiddenProducts || []).filter(h => h && h.removed).length}`;
   if (_periodCatCache.key === ck) return _periodCatCache.list;
   const keep = new Set();
   gen.rows.forEach(r => keep.add(normalizeName(r.nama)));
@@ -1538,6 +1538,8 @@ function getProductCatalogForPeriod(entitas, dateISO) {
   state.checkerRows.forEach(r => { if (r.entitas === entitas && r.tanggal > E) keep.add(normalizeName(r.nama)); });
   // HNH tetap menampilkan produk yang di-"tetap"-kan ke HNH di Master Produk (sama seperti katalog lengkap)
   if (entitas === 'HNH') state.masterProduk.forEach(m => { if (m.entitasTetap === 'HNH' && m.namaInternal) keep.add(normalizeName(m.namaInternal)); });
+  // produk yang sengaja di-"👁 Tampilkan lagi" -> selalu tampil
+  (state.hiddenProducts || []).forEach(h => { if (h && h.removed && h.entitas === entitas) keep.add(normalizeName(h.nama)); });
   const list = full.filter(n => keep.has(normalizeName(n)));
   _periodCatCache = { key: ck, list };
   return list;
@@ -3473,7 +3475,7 @@ function getProductCatalogForEntity(entitas) {
     state.masterProduk.forEach(m => { if (m.entitasTetap === entitas && m.namaInternal) names.add(m.namaInternal); });
   }
   state.checkerRows.forEach(r => { if (r.entitas === entitas) names.add(r.nama); });
-  const hidden = new Set((state.hiddenProducts || []).filter(h => h.entitas === entitas).map(h => normalizeName(h.nama)));
+  const hidden = new Set(gsjActiveHidden().filter(h => h.entitas === entitas).map(h => normalizeName(h.nama)));
   // Nama yang cuma beda huruf besar/kecil atau spasi ("W/Cuff" vs "W/CUFF") itu PRODUK YANG SAMA —
   // stok & penjualannya memang sudah digabung (dicocokkan tanpa beda huruf), jadi di daftar cukup
   // tampil 1 baris. Dulu muncul 2 baris dengan angka yang sama persis (dobel di total & Excel).
@@ -3487,10 +3489,23 @@ function getProductCatalogForEntity(entitas) {
 // Removes a product from the persistent catalog view for one entity (doesn't delete the
 // underlying transaction history — just hides it from the Stok Terjual list, e.g. for
 // junk/blank rows). Reversible via state.hiddenProducts.
+// Daftar tersembunyi disinkron ke server dengan cara DIGABUNG (bukan ditimpa). Dulu "Tampilkan lagi" cuma
+// menghapus dari daftar di laptop ini -> waktu digabung dengan server, produknya ikut tersembunyi lagi
+// (tidak pernah bisa muncul). Sekarang "tampilkan lagi" disimpan sebagai tanda {removed:true, at} dan yang
+// paling baru (at) yang menang, jadi bisa disembunyikan / ditampilkan bolak-balik.
+function gsjActiveHidden() { return (state.hiddenProducts || []).filter(h => h && !h.removed); }
+function unhideProductForEntity(entitas, nama) {
+  const k = normalizeName(nama);
+  const now = new Date().toISOString();
+  state.hiddenProducts = (state.hiddenProducts || []).filter(x => !(x.entitas === entitas && normalizeName(x.nama) === k));
+  state.hiddenProducts.push({ entitas, nama, removed: true, at: now });
+}
 function hideProductForEntity(entitas, nama) {
   state.hiddenProducts = state.hiddenProducts || [];
-  if (!state.hiddenProducts.some(h => h.entitas === entitas && normalizeName(h.nama) === normalizeName(nama))) {
-    state.hiddenProducts.push({ entitas, nama });
+  const k = normalizeName(nama);
+  if (!gsjActiveHidden().some(h => h.entitas === entitas && normalizeName(h.nama) === k)) {
+    state.hiddenProducts = state.hiddenProducts.filter(h => !(h.entitas === entitas && normalizeName(h.nama) === k)); // buang tanda "ditampilkan lagi"
+    state.hiddenProducts.push({ entitas, nama, at: new Date().toISOString() });
   }
 }
 
@@ -9586,7 +9601,14 @@ function renderTab3TableInner() {
   if (tab3MergeOnly) pivot = pivot.filter(r => t3NeedsMerge(r));
   const searchEl = document.getElementById('t3-search');
   const q = searchEl ? normalizeName(searchEl.value) : '';
-  if (q) pivot = pivot.filter(r => normalizeName(r.nama).includes(q));
+  if (q) {
+    pivot = pivot.filter(r => normalizeName(r.nama).includes(q));
+    // Dicari tapi tidak ada di daftar periode ini (nama lama, stok 0, tidak ada transaksi bulan ini) -> tetap tampilkan
+    try {
+      const have = new Set(pivot.map(r => normalizeName(r.nama)));
+      getProductCatalogForEntity(entitas).forEach(n => { const k = normalizeName(n); if (k.includes(q) && !have.has(k)) { have.add(k); pivot.push(computeSingleProductPivot(entitas, tab3Date, n)); } });
+    } catch (e) {}
+  }
   if (tab3FuzzyOnly) pivot = pivot.filter(r => r.fuzzyContributors && r.fuzzyContributors.length);
   pivot = applyColumnFilters(pivot, TAB3_COLUMN_DEFS, tab3ColumnFilters);
   pivot = applySortState(pivot, TAB3_COLUMN_DEFS, tab3SortState);
@@ -12009,7 +12031,7 @@ function t8ExcludeList(sellerKey) {
 function t8ExcludedSet(sellerKey) {
   const s = T8_SELLERS[sellerKey];
   const set = new Set(t8ExcludeList(sellerKey).map(n => normalizeName(n)));
-  (state.hiddenProducts || []).forEach(h => { if (h.entitas === s.entitas) set.add(normalizeName(h.nama)); });
+  gsjActiveHidden().forEach(h => { if (h.entitas === s.entitas) set.add(normalizeName(h.nama)); });
   return set;
 }
 function t8SetExcluded(sellerKey, nama, on) {
@@ -12020,7 +12042,7 @@ function t8SetExcluded(sellerKey, nama, on) {
   if (!on && i >= 0) list.splice(i, 1);
   if (!on) { // kalau ternyata dikecualikan karena disembunyikan di Stok Terjual, beri tahu
     const s = T8_SELLERS[sellerKey];
-    if ((state.hiddenProducts || []).some(h => h.entitas === s.entitas && normalizeName(h.nama) === k)) {
+    if (gsjActiveHidden().some(h => h.entitas === s.entitas && normalizeName(h.nama) === k)) {
       alert(`"${nama}" disembunyikan di Stok Terjual ${s.label}, jadi tetap tidak ditagihkan. Munculkan dulu produknya di Stok Terjual kalau mau ditagihkan.`);
     }
   }
@@ -14751,9 +14773,18 @@ function gsjMergeNamaCustomerFromServer(sd) {
 // pakai versi lama menimpanya dengan data tanpa daftar ini -> Bubble Wrap muncul lagi.
 const GSJ_LISTS_ID = 'lists';
 const gsjHiddenKey = h => (h.entitas || '') + '||' + normalizeName(h.nama);
+function gsjMergeHiddenLatest(a, b) {
+  const m = new Map();
+  [...(a || []), ...(b || [])].forEach(x => {
+    if (!x) return;
+    const k = gsjHiddenKey(x), cur = m.get(k);
+    if (!cur || String(x.at || '') > String(cur.at || '') || (String(x.at || '') === String(cur.at || '') && x.removed && !cur.removed)) m.set(k, x);
+  });
+  return [...m.values()];
+}
 function gsjMergeLists(a, b) {
   return {
-    hiddenProducts: gsjMergeByKey((a && a.hiddenProducts) || [], (b && b.hiddenProducts) || [], gsjHiddenKey),
+    hiddenProducts: gsjMergeHiddenLatest((a && a.hiddenProducts) || [], (b && b.hiddenProducts) || []),
     dobelResolutions: gsjMergeByKey((a && a.dobelResolutions) || [], (b && b.dobelResolutions) || [], x => x.key),
     entityMoves: gsjMergeByKey((a && a.entityMoves) || [], (b && b.entityMoves) || [], x => x.id)
       .filter(x => !(((a && a.entityMovesDone) || []).concat((b && b.entityMovesDone) || [])).includes(x.id))
@@ -19012,12 +19043,12 @@ if (typeof renderTab2Table === 'function') {
 //   👁 Tampilkan lagi      -> muncul & dihitung lagi
 //   🔗 Gabung ke ...      -> untuk nama dobel: penjualan/stok/faktur dipindah ke nama yang benar, lalu ikut dihitung
 function t9HiddenSet(entitas) {
-  return new Set((state.hiddenProducts || []).filter(h => h.entitas === entitas).map(h => normalizeName(h.nama)));
+  return new Set(gsjActiveHidden().filter(h => h.entitas === entitas).map(h => normalizeName(h.nama)));
 }
 function t3HiddenManager() {
   const ent = tab3Entity;
   const lbl = (typeof ENTITY_LABEL !== 'undefined' && ENTITY_LABEL[ent]) || ent;
-  const list = (state.hiddenProducts || []).filter(h => h.entitas === ent);
+  const list = gsjActiveHidden().filter(h => h.entitas === ent);
   const ym = (tab3Date || todayISO()).slice(0, 7);
   const stat = new Map();
   state.checkerRows.forEach(r => {
@@ -19050,7 +19081,7 @@ function t3HiddenManager() {
   };
   m.querySelectorAll('[data-show]').forEach(b => b.onclick = () => {
     const h = list[Number(b.dataset.show)];
-    state.hiddenProducts = (state.hiddenProducts || []).filter(x => !(x.entitas === h.entitas && normalizeName(x.nama) === normalizeName(h.nama)));
+    unhideProductForEntity(h.entitas, h.nama);
     // ikut dihitung lagi juga di Invoice ke Glomed (keluarkan dari daftar pengecualian invoice entitas ini)
     try { Object.keys(T8_SELLERS).forEach(k => { if (T8_SELLERS[k].entitas === h.entitas) t8SetExcluded(k, h.nama, false); }); } catch (e) {}
     if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`menampilkan lagi produk <b>${esc(h.nama)}</b> di Stok Terjual ${esc(lbl)}`);
@@ -19064,7 +19095,7 @@ function t3HiddenManager() {
     if (!confirm(`Gabungkan "${h.nama}" ke "${target}"?\n\nSemua penjualan, stok & faktur dengan nama "${h.nama}" dipindah ke "${target}" dan ikut dihitung.`)) return;
     const c = mergeProductNames(h.nama, target);
     try { Object.keys(T8_SELLERS).forEach(k => { if (T8_SELLERS[k].entitas === h.entitas) t8SetExcluded(k, h.nama, false); }); } catch (e) {}
-    state.hiddenProducts = (state.hiddenProducts || []).filter(x => normalizeName(x.nama) !== normalizeName(h.nama));
+    gsjActiveHidden().filter(x => normalizeName(x.nama) === normalizeName(h.nama)).forEach(x => unhideProductForEntity(x.entitas, x.nama));
     recomputeAllCheckerRows();
     if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`menggabungkan produk tersembunyi <b>${esc(h.nama)}</b> ke <b>${esc(target)}</b> (${c.checkerRows} penjualan, ${c.adjustments} stok, ${c.invoiceItems} barang faktur)`);
     after(`🔗 ${h.nama} digabung ke ${target}`);
@@ -19073,7 +19104,7 @@ function t3HiddenManager() {
 function t3HiddenButton() {
   const pg = document.getElementById('t3-pengali');
   if (!pg || document.getElementById('t3-hidden-btn')) return;
-  const n = (state.hiddenProducts || []).filter(h => h.entitas === tab3Entity).length;
+  const n = gsjActiveHidden().filter(h => h.entitas === tab3Entity).length;
   const b = document.createElement('button');
   b.className = 'btn secondary small'; b.id = 't3-hidden-btn'; b.type = 'button';
   b.title = 'Atur produk yang disembunyikan: tampilkan lagi atau gabung ke nama yang benar';
