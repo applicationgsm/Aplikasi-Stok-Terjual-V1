@@ -953,7 +953,6 @@ let state = {
   omsetBulanan: [],   // {id:'omset-YYYY-MM', tahun, bulan, savedAt, savedBy, markup, GSM:{d:[[omset,qty,rows]..],dppPpn,dpp,ppnGlomed,noModal}, HNH:{...}} — omset bulanan yang disimpan (Tab 9)
   dobelResolutions: [], // {key:'invId::itemId', decision:'duplikat'|'bukan', at, by} — keputusan atas kandidat Faktur berisiko dobel dgn Stok Awal
   hiddenProducts: [], // {entitas, nama} - produk yang disembunyikan dari daftar Stok Terjual
-  hiddenRemoved: [], // {k, at} - tanda 'sudah ditampilkan lagi' supaya tidak muncul tersembunyi lagi dari device lain
   settings: { feeDefault: 13, markupPerUnit: 1000 },
   lastEditedBy: '',
   lastEditedAt: '',
@@ -1093,7 +1092,7 @@ function uid() {
 // dan total memori riwayat Undo dibatasi.
 const SNAP_SKIP_KEYS = { lastEditedBy: 1, lastEditedAt: 1 };
 const GSJ_SETTINGS_KEYS = ['settings', 'hargaModalOverride', 'namaCustomer']; // disimpan di gsj_settings 'main'
-const GSJ_LIST_KEYS = ['hiddenProducts', 'hiddenRemoved', 'dobelResolutions', 'entityMoves', 'entityMovesDone'];    // disimpan di gsj_settings 'lists' (digabung)
+const GSJ_LIST_KEYS = ['hiddenProducts', 'dobelResolutions', 'entityMoves', 'entityMovesDone'];    // disimpan di gsj_settings 'lists' (digabung)
 const UNDO_MAX_CHARS = 60e6; // ±120 MB teks unik untuk seluruh riwayat Undo
 const LOCAL_MAX_CHARS = 4.5e6; // batas aman localStorage (±5 juta karakter)
 // Jalur cepat: kalau pemanggil tahu persis tabel mana yang berubah (mis. edit harga di Riwayat Faktur cuma
@@ -1368,7 +1367,6 @@ function importJSON(file, callback) {
         omsetBulanan: parsed.omsetBulanan || [],
         dobelResolutions: parsed.dobelResolutions || [],
         hiddenProducts: parsed.hiddenProducts || [],
-        hiddenRemoved: parsed.hiddenRemoved || [],
         settings: Object.assign({ feeDefault: 13, markupPerUnit: 1000 }, parsed.settings || {}),
       };
       saveState();
@@ -1513,6 +1511,38 @@ function invalidateMasterProdukIndex() {
 // physical product came along — simply improving future name-resolution (recompute) doesn't
 // retroactively combine data that was already recorded under two different names.
 // Returns a summary of how many records were updated, for confirmation/undo purposes.
+// ===== Katalog per PERIODE Stok Awal =====
+// Katalog lengkap (getProductCatalogForEntity) memuat SEMUA nama yang pernah ada di riwayat entitas itu,
+// termasuk nama lama dari periode Stok Awal sebelumnya (mis. ejaan lama "Glycerin 1 LT" yang cuma ada di
+// Faktur bulan lalu). Nama seperti itu stoknya pasti 0 di periode sekarang (tidak ada di Stok Awal aktif &
+// tidak ada transaksi baru), jadi cuma bikin "Jumlah SKU" beda dengan file Stok Awal.
+// Untuk tanggal yang punya Stok Awal aktif, daftar dibatasi ke: nama di Stok Awal aktif + nama yang punya
+// transaksi (Faktur Masuk / penyesuaian / penjualan) SETELAH tanggal Stok Awal itu. Riwayat lama tidak diubah.
+let _periodCatCache = { key: '', list: null };
+function getProductCatalogForPeriod(entitas, dateISO) {
+  const full = getProductCatalogForEntity(entitas);
+  let gen = null;
+  try { gen = (typeof iuActiveGenFor === 'function') ? iuActiveGenFor(entitas, dateISO) : null; } catch (e) { gen = null; }
+  if (!gen || !gen.rows || !gen.rows.length) return full;
+  const E = gen.tanggal;
+  const ck = `${entitas}|${E}|${full.length}|${state.checkerRows.length}|${state.adjustments.length}|${state.invoices.length}|${state.masterProduk.length}`;
+  if (_periodCatCache.key === ck) return _periodCatCache.list;
+  const keep = new Set();
+  gen.rows.forEach(r => keep.add(normalizeName(r.nama)));
+  state.invoices.forEach(inv => {
+    if (inv.entitas !== entitas) return;
+    const t = (typeof getInvoiceTanggalStok === 'function') ? getInvoiceTanggalStok(inv) : inv.tanggal;
+    if (t > E) (inv.items || []).forEach(it => keep.add(normalizeName(it.nama)));
+  });
+  state.adjustments.forEach(a => { if (a.entitas === entitas && a.tanggal > E) keep.add(normalizeName(a.nama)); });
+  state.checkerRows.forEach(r => { if (r.entitas === entitas && r.tanggal > E) keep.add(normalizeName(r.nama)); });
+  // HNH tetap menampilkan produk yang di-"tetap"-kan ke HNH di Master Produk (sama seperti katalog lengkap)
+  if (entitas === 'HNH') state.masterProduk.forEach(m => { if (m.entitasTetap === 'HNH' && m.namaInternal) keep.add(normalizeName(m.namaInternal)); });
+  const list = full.filter(n => keep.has(normalizeName(n)));
+  _periodCatCache = { key: ck, list };
+  return list;
+}
+
 function mergeProductNames(fromName, toName) {
   if (normalizeName(fromName) === normalizeName(toName)) return { adjustments: 0, checkerRows: 0, invoiceItems: 0, masterProduk: 0 };
   const fromKey = normalizeName(fromName);
@@ -3460,7 +3490,7 @@ function getProductCatalogForEntity(entitas) {
 function hideProductForEntity(entitas, nama) {
   state.hiddenProducts = state.hiddenProducts || [];
   if (!state.hiddenProducts.some(h => h.entitas === entitas && normalizeName(h.nama) === normalizeName(nama))) {
-    state.hiddenProducts.push({ entitas, nama, at: Date.now() });
+    state.hiddenProducts.push({ entitas, nama });
   }
 }
 
@@ -7864,7 +7894,7 @@ function computeStokTerjualRekapLive(entitas, start, end) {
     else if (cls === 'mTokopedia') a.mt += q;
     else a.o += q;
   });
-  const catalog = getProductCatalogForEntity(entitas);
+  const catalog = getProductCatalogForPeriod(entitas, start);
   const inCat = new Set(catalog.map(n => normalizeName(n)));
   // Penjualan produk yang DISEMBUNYIKAN tidak ikut rekap -> dicatat supaya kelihatan kenapa total beda.
   const hiddenSold = [];
@@ -8253,7 +8283,7 @@ function computeStokTerjualPivot(entitas, tanggal) {
     if (invoiceSudahTermasukStokAwal(inv, tanggal)) return; // barang sudah datang sebelum Stok Awal -> sudah termasuk
     (inv.items || []).forEach(it => dayInvoiceItems.push({ ...it, _jenisDokumen: inv.jenisDokumen }));
   });
-  const catalog = getProductCatalogForEntity(entitas);
+  const catalog = getProductCatalogForPeriod(entitas, tanggal);
   return catalog.map(nama => computeSingleProductPivot(entitas, tanggal, nama, stokAwalMap, dayRows, dayAdjustments, dayInvoiceItems));
 }
 
@@ -14148,26 +14178,34 @@ function iuRenderGenerations() {
 function iuOutsideStokAwal(ent) {
   const nk = normalizeName;
   const imp = {};
-  // Dicek terhadap generasi Stok Awal AKTIF (yang dipakai Sisa Stok Real-Time sekarang) -- kalau produk
-  // cuma ada di generasi LAMA yang sudah tergantikan, tetap dianggap "di luar Stok Awal" saat ini.
+  // Dicek terhadap generasi Stok Awal AKTIF (yang dipakai Sisa Stok Real-Time sekarang).
+  const gen = (typeof iuLatestGeneration === 'function') ? iuLatestGeneration(ent) : null;
+  const E = gen ? gen.tanggal : '';
   iuStokAwalActiveRows(ent).forEach(a => { imp[nk(a.nama)] = a.nama; });
   const impList = Object.keys(imp).map(k => ({ nama: imp[k], tokens: tokenize(imp[k]) })).filter(x => x.tokens.size >= 1);
   const src = {};
   const get = (nama) => src[nk(nama)] || (src[nk(nama)] = { inv: 0, invQty: 0, sales: 0, adj: 0 });
+  // Yang dihitung cuma transaksi di PERIODE Stok Awal aktif (setelah tanggal Stok Awal) — riwayat lama
+  // sudah tidak memengaruhi stok sekarang.
+  const inPeriod = (t) => !E || t > E;
   state.invoices.forEach(inv => {
     if (inv.entitas !== ent) return;
+    if (!inPeriod((typeof getInvoiceTanggalStok === 'function') ? getInvoiceTanggalStok(inv) : inv.tanggal)) return;
     (inv.items || []).forEach(it => { const s = get(it.nama); s.inv++; s.invQty += Number(it.qty) || 0; });
   });
-  state.adjustments.forEach(a => { if (a.entitas === ent && a.keterangan !== 'Stok Awal (import)') get(a.nama).adj++; });
-  state.checkerRows.forEach(r => { if (r.entitas === ent) get(r.nama).sales++; });
-  const catalog = getProductCatalogForEntity(ent);
-  const outside = catalog.filter(n => !imp[nk(n)]).map(nama => {
+  state.adjustments.forEach(a => { if (a.entitas === ent && a.keterangan !== 'Stok Awal (import)' && inPeriod(a.tanggal)) get(a.nama).adj++; });
+  state.checkerRows.forEach(r => { if (r.entitas === ent && inPeriod(r.tanggal)) get(r.nama).sales++; });
+  const fullCatalog = getProductCatalogForEntity(ent);
+  const today = new Date(Date.now() + 7 * 3600e3).toISOString().slice(0, 10);
+  const catalog = E ? getProductCatalogForPeriod(ent, iuAddDaysISO(E, 1) > today ? iuAddDaysISO(E, 1) : today) : fullCatalog;
+  const okMap = (state.settings && state.settings.outsideStokAwalOk) || {};
+  let okCount = 0;
+  const outside = catalog.filter(n => !imp[nk(n)]).filter(n => { if (okMap[ent + '|' + nk(n)]) { okCount++; return false; } return true; }).map(nama => {
     const s = src[nk(nama)] || { inv: 0, invQty: 0, sales: 0, adj: 0 };
     const parts = [];
     if (s.inv) parts.push(`Faktur Masuk (${s.inv}×, total ${Math.round(s.invQty).toLocaleString('id-ID')} pcs)`);
     if (s.adj) parts.push(`penyesuaian (${s.adj}×)`);
     if (s.sales) parts.push(`penjualan (${s.sales} baris)`);
-    // tebak: apakah ini sebenarnya produk yang sama dengan salah satu nama di Stok Awal?
     const ta = tokenize(nama);
     let best = null;
     if (ta.size >= 1) {
@@ -14177,9 +14215,37 @@ function iuOutsideStokAwal(ent) {
         if (sc >= 0.65 && (!best || sc > best.score)) best = { nama: c.nama, score: sc, spelling: hasSpellingVariantWord(ta, c.tokens) };
       });
     }
-    return { nama, src: parts.join(' + ') || 'tidak ada catatan lain', best };
+    return { nama, src: parts.join(' + ') || (ent === 'HNH' ? 'Master Produk (produk tetap HNH)' : 'tidak ada catatan lain'), best };
   });
-  return { ent, catalogCount: catalog.length, impCount: impList.length, outside };
+  return { ent, E, catalogCount: catalog.length, fullCount: fullCatalog.length, impCount: impList.length, impNames: impList.map(x => x.nama), outside, okCount };
+}
+
+// Gabungkan nama di luar Stok Awal ke nama yang ADA di Stok Awal — HANYA untuk entitas ini dan HANYA
+// transaksi SETELAH tanggal Stok Awal aktif. Riwayat lama (periode sebelumnya) & entitas lain tidak disentuh,
+// jadi laporan bulan lalu tetap sama. Master Produk diarahkan (kolom Nama di <entitas>) supaya penjualan
+// marketplace berikutnya langsung masuk ke nama Stok Awal.
+function iuMergeOutsideName(ent, fromName, toName, E) {
+  const fk = normalizeName(fromName);
+  const c = { inv: 0, adj: 0, sales: 0, master: 0 };
+  if (!fk || fk === normalizeName(toName)) return c;
+  const after = (t) => !E || t > E;
+  state.invoices.forEach(inv => {
+    if (inv.entitas !== ent || !after((typeof getInvoiceTanggalStok === 'function') ? getInvoiceTanggalStok(inv) : inv.tanggal)) return;
+    (inv.items || []).forEach(it => { if (normalizeName(it.nama) === fk) { it.nama = toName; c.inv++; } });
+  });
+  state.adjustments.forEach(a => {
+    if (a.entitas === ent && a.keterangan !== 'Stok Awal (import)' && after(a.tanggal) && normalizeName(a.nama) === fk) { a.nama = toName; c.adj++; }
+  });
+  state.checkerRows.forEach(r => {
+    if (r.entitas === ent && after(r.tanggal) && normalizeName(r.nama) === fk) { r.nama = toName; r.namaCanonical = toName; c.sales++; }
+  });
+  const field = { Gracia: 'namaGracia', HNH: 'namaHNH', Glomed: 'namaGlomed' }[ent];
+  state.masterProduk.forEach(m => {
+    const eff = m[field] || m.namaInternal;
+    if (eff && normalizeName(eff) === fk) { m[field] = toName; c.master++; }
+  });
+  invalidateMasterProdukIndex();
+  return c;
 }
 
 function iuRenderOutside() {
@@ -14189,20 +14255,59 @@ function iuRenderOutside() {
   const label = iuEntLabel(r.ent);
   const n = (x) => x.toLocaleString('id-ID');
   const likelySame = r.outside.filter(x => x.best).length;
-  const rows = r.outside.map(x => `<tr>
+  const stale = r.fullCount - r.catalogCount;
+  const dlId = 'au-imp-names';
+  const rows = r.outside.map((x, i) => `<tr data-i="${i}">
       <td>${escapeAttr(x.nama)}</td>
       <td style="font-size:11.5px;color:var(--muted);">${escapeAttr(x.src)}</td>
-      <td style="font-size:12px;">${x.best ? `<b>${escapeAttr(x.best.nama)}</b> <span style="color:var(--muted);">(${Math.round(x.best.score * 100)}%${x.best.spelling ? ', beda ejaan' : ', nama lebih panjang/pendek'})</span>` : '<span style="color:var(--muted);">— produk lain (tidak ada yang mirip di Stok Awal)</span>'}</td>
+      <td style="font-size:12px;">${x.best ? `<span style="color:var(--muted);">saran (${Math.round(x.best.score * 100)}%${x.best.spelling ? ', beda ejaan' : ''}):</span>` : '<span style="color:var(--muted);">tidak ada yang mirip — cari manual kalau memang sama:</span>'}
+        <div style="display:flex;gap:4px;margin-top:3px;align-items:center;">
+          <input type="text" list="${dlId}" data-au-to value="${x.best ? escapeAttr(x.best.nama) : ''}" placeholder="ketik nama di Stok Awal…" style="flex:1;min-width:200px;padding:3px 6px;border:1px solid #c9c5b8;border-radius:5px;font-size:12px;">
+          <button class="btn small" data-au-merge style="padding:2px 8px;font-size:11px;background:#16a34a;color:#fff;border-color:#16a34a;white-space:nowrap;">🔗 Gabung</button>
+          <button class="btn secondary small" data-au-ok title="Memang produk lain (bukan duplikat) — tidak ditampilkan lagi di daftar ini" style="padding:2px 8px;font-size:11px;white-space:nowrap;">✓ Produk lain</button>
+        </div>
+      </td>
     </tr>`).join('');
   box.innerHTML = `
+    <datalist id="${dlId}">${r.impNames.map(x => `<option value="${escapeAttr(x)}">`).join('')}</datalist>
     <div class="t9-snapbar none" style="display:block;">
-      <b>${escapeAttr(label)}:</b> katalog di aplikasi <b>${n(r.catalogCount)}</b> produk = <b>${n(r.impCount)}</b> yang punya Stok Awal (import) + <b>${n(r.outside.length)}</b> yang tidak punya.
-      ${r.outside.length ? `<div style="margin-top:4px;">Dari ${n(r.outside.length)} itu, <b>${n(likelySame)}</b> kelihatannya cuma nama lain dari produk yang sudah ada di Stok Awal (kemungkinan duplikat), sisanya <b>${n(r.outside.length - likelySame)}</b> produk lain yang namanya hanya muncul di Faktur Masuk / penjualan / penyesuaian.</div>` : '<div style="margin-top:4px;">Semua produk di katalog punya Stok Awal — jumlahnya sama dengan file.</div>'}
+      <b>${escapeAttr(label)}:</b> daftar produk periode ini <b>${n(r.catalogCount)}</b> = <b>${n(r.impCount)}</b> dari Stok Awal (import) + <b>${n(r.catalogCount - r.impCount)}</b> lainnya.
+      ${stale > 0 ? `<div style="margin-top:4px;">✅ <b>${n(stale)}</b> nama lama yang cuma ada di riwayat periode sebelumnya (stoknya 0 & tidak ada transaksi baru) sudah <b>tidak dihitung</b> lagi di Stok Terjual periode ini. Riwayat bulan lalu tidak diubah.</div>` : ''}
+      ${r.outside.length ? `<div style="margin-top:4px;">Perlu dicek: <b>${n(r.outside.length)}</b> nama punya transaksi di periode ini tapi tidak ada di Stok Awal — <b>${n(likelySame)}</b> ada saran nama yang mirip. Pastikan dulu sarannya benar (cek ukuran/warna/merek), baru klik <b>🔗 Gabung</b>.</div>` : `<div style="margin-top:4px;">✅ Semua nama periode ini sudah cocok dengan Stok Awal.</div>`}
+      ${r.okCount ? `<div style="margin-top:4px;color:var(--muted);">${n(r.okCount)} nama sudah ditandai "produk lain" sebelumnya. <a href="#" id="au-ok-reset">tampilkan lagi</a></div>` : ''}
     </div>
-    ${r.outside.length ? `<div class="table-wrap" style="max-height:420px;overflow:auto;margin-top:8px;"><table class="dtable" style="min-width:640px;">
-      <thead><tr><th>Produk (di luar Stok Awal)</th><th>Asalnya dari</th><th>Kemungkinan sama dengan (di Stok Awal)</th></tr></thead>
+    ${r.outside.length ? `<div class="table-wrap" style="max-height:460px;overflow:auto;margin-top:8px;"><table class="dtable" style="min-width:760px;">
+      <thead><tr><th>Produk (tidak ada di Stok Awal)</th><th>Transaksi di periode ini</th><th>Gabung ke nama di Stok Awal</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
-      <div style="font-size:11.5px;color:var(--muted);margin-top:6px;">Yang "mirip" → gabungkan lewat tombol <b>Cek Kemungkinan Duplikat</b> (Tab Master Produk) supaya jadi satu produk. Yang tidak mirip: memang produk lain — wajar ada di aplikasi tapi tidak ada di file Stok Awal (mis. dibeli lewat Faktur Masuk atau sudah pernah terjual).</div>` : ''}`;
+      <div style="font-size:11.5px;color:var(--muted);margin-top:6px;">🔗 Gabung = transaksi nama ini (khusus ${escapeAttr(label)}, mulai periode Stok Awal sekarang) dipindah ke nama Stok Awal, dan Master Produk diarahkan ke nama itu supaya penjualan berikutnya langsung masuk. Entitas lain & bulan lalu tidak berubah. Bisa di-undo (Ctrl+Z).</div>` : ''}`;
+  box.querySelectorAll('tr[data-i]').forEach(tr => {
+    const x = r.outside[Number(tr.dataset.i)];
+    tr.querySelector('[data-au-merge]').addEventListener('click', () => {
+      const to = tr.querySelector('[data-au-to]').value.trim();
+      const target = r.impNames.find(v => normalizeName(v) === normalizeName(to));
+      if (!target) { alert('Pilih nama yang ADA di Stok Awal (ketik lalu pilih dari daftar).'); return; }
+      if (!confirm(`Gabungkan "${x.nama}" ke "${target}" (${label})?\n\nTransaksi periode ini dipindah ke "${target}". Bulan lalu & entitas lain tidak berubah.`)) return;
+      const c = iuMergeOutsideName(r.ent, x.nama, target, r.E);
+      recomputeAllCheckerRows();
+      gsjDetailedAudit(`menggabungkan <b>${escapeAttr(x.nama)}</b> ke <b>${escapeAttr(target)}</b> di ${escapeAttr(label)} (periode Stok Awal sekarang: ${c.sales} penjualan, ${c.inv} item faktur, ${c.adj} penyesuaian, ${c.master} Master Produk)`);
+      saveState();
+      if (typeof gsjShowToast === "function") gsjShowToast(`✓ "${x.nama.slice(0, 40)}" digabung ke "${target.slice(0, 40)}"`);
+      iuRenderOutside();
+    });
+    tr.querySelector('[data-au-ok]').addEventListener('click', () => {
+      state.settings.outsideStokAwalOk = Object.assign({}, state.settings.outsideStokAwalOk || {}, { [r.ent + '|' + normalizeName(x.nama)]: true });
+      gsjDetailedAudit(`menandai <b>${escapeAttr(x.nama)}</b> (${escapeAttr(label)}) sebagai produk lain, bukan duplikat Stok Awal`);
+      saveState();
+      iuRenderOutside();
+    });
+  });
+  const rs = box.querySelector('#au-ok-reset');
+  if (rs) rs.addEventListener('click', (e) => {
+    e.preventDefault();
+    const o = Object.assign({}, state.settings.outsideStokAwalOk || {});
+    Object.keys(o).forEach(k => { if (k.indexOf(r.ent + '|') === 0) delete o[k]; });
+    state.settings.outsideStokAwalOk = o; saveState(); iuRenderOutside();
+  });
 }
 
 // ============================================================================
@@ -14622,15 +14727,7 @@ const GSJ_LISTS_ID = 'lists';
 const gsjHiddenKey = h => (h.entitas || '') + '||' + normalizeName(h.nama);
 function gsjMergeLists(a, b) {
   return {
-    // Disembunyikan vs ditampilkan lagi: dulu daftar cuma DIGABUNG (a + b), jadi "Tampilkan lagi" selalu
-    // kembali tersembunyi dari server/device lain. Sekarang ada tanda hapus (hiddenRemoved {k, at}):
-    // produk tetap tersembunyi hanya kalau disembunyikan SETELAH terakhir ditampilkan lagi.
-    hiddenRemoved: gsjMergeLatest((a && a.hiddenRemoved) || [], (b && b.hiddenRemoved) || [], x => x.k),
-    hiddenProducts: (() => {
-      const tomb = new Map(gsjMergeLatest((a && a.hiddenRemoved) || [], (b && b.hiddenRemoved) || [], x => x.k).map(x => [x.k, Number(x.at) || 0]));
-      return gsjMergeLatest((a && a.hiddenProducts) || [], (b && b.hiddenProducts) || [], gsjHiddenKey)
-        .filter(x => !(tomb.has(gsjHiddenKey(x)) && tomb.get(gsjHiddenKey(x)) >= (Number(x.at) || 0)));
-    })(),
+    hiddenProducts: gsjMergeByKey((a && a.hiddenProducts) || [], (b && b.hiddenProducts) || [], gsjHiddenKey),
     dobelResolutions: gsjMergeByKey((a && a.dobelResolutions) || [], (b && b.dobelResolutions) || [], x => x.key),
     entityMoves: gsjMergeByKey((a && a.entityMoves) || [], (b && b.entityMoves) || [], x => x.id)
       .filter(x => !(((a && a.entityMovesDone) || []).concat((b && b.entityMovesDone) || [])).includes(x.id))
@@ -14638,22 +14735,16 @@ function gsjMergeLists(a, b) {
     entityMovesDone: [...new Set(((a && a.entityMovesDone) || []).concat((b && b.entityMovesDone) || []))].slice(-800),
   };
 }
-function gsjMergeLatest(a, b, keyFn) {
-  const m = new Map();
-  [...(a || []), ...(b || [])].forEach(x => { if (!x) return; const k = keyFn(x); const o = m.get(k); if (!o || (Number(x.at) || 0) >= (Number(o.at) || 0)) m.set(k, x); });
-  return [...m.values()];
-}
-function gsjListsLocal() { return { hiddenRemoved: state.hiddenRemoved || [], hiddenProducts: state.hiddenProducts || [], dobelResolutions: state.dobelResolutions || [], entityMoves: state.entityMoves || [], entityMovesDone: state.entityMovesDone || [] }; }
+function gsjListsLocal() { return { hiddenProducts: state.hiddenProducts || [], dobelResolutions: state.dobelResolutions || [], entityMoves: state.entityMoves || [], entityMovesDone: state.entityMovesDone || [] }; }
 let gsjListsBaselineJSON = null;
 function gsjApplyLists(merged) {
   const before = JSON.stringify(gsjListsLocal());
   state.hiddenProducts = merged.hiddenProducts;
-  state.hiddenRemoved = merged.hiddenRemoved || [];
   state.dobelResolutions = merged.dobelResolutions;
   state.entityMoves = merged.entityMoves;
   state.entityMovesDone = merged.entityMovesDone;
   if (JSON.stringify(gsjListsLocal()) !== before) {
-    gsjRemoteTouchedKeys.add('hiddenProducts'); gsjRemoteTouchedKeys.add('hiddenRemoved'); gsjRemoteTouchedKeys.add('dobelResolutions');
+    gsjRemoteTouchedKeys.add('hiddenProducts'); gsjRemoteTouchedKeys.add('dobelResolutions');
     gsjRemoteTouchedKeys.add('entityMoves'); gsjRemoteTouchedKeys.add('entityMovesDone');
     if (typeof gsjUpdateMovesBadge === 'function') setTimeout(gsjUpdateMovesBadge, 0);
     return true;
@@ -14805,7 +14896,7 @@ async function gsjInitialSyncFromSupabase() {
       if (gsjMergeNamaCustomerFromServer(sd)) gsjSettingsNeedPush = true;
       // Sisa dari versi sebelumnya yang sempat menaruh daftar ini di baris 'main' -> ikut digabung.
       if (Array.isArray(sd.hiddenProducts) || Array.isArray(sd.dobelResolutions)) {
-        const m = gsjMergeLists(gsjListsLocal(), sd); state.hiddenProducts = m.hiddenProducts; state.hiddenRemoved = m.hiddenRemoved || []; state.dobelResolutions = m.dobelResolutions;
+        const m = gsjMergeLists(gsjListsLocal(), sd); state.hiddenProducts = m.hiddenProducts; state.dobelResolutions = m.dobelResolutions;
       }
     }
     setTimeout(() => { if (typeof gsjPushLists === 'function') gsjPushLists(); }, 300); // ambil + gabung + simpan daftar tersembunyi
@@ -18934,7 +19025,6 @@ function t3HiddenManager() {
   m.querySelectorAll('[data-show]').forEach(b => b.onclick = () => {
     const h = list[Number(b.dataset.show)];
     state.hiddenProducts = (state.hiddenProducts || []).filter(x => !(x.entitas === h.entitas && normalizeName(x.nama) === normalizeName(h.nama)));
-    state.hiddenRemoved = (state.hiddenRemoved || []).filter(x => x.k !== gsjHiddenKey(h)).concat([{ k: gsjHiddenKey(h), at: Date.now() }]);
     // ikut dihitung lagi juga di Invoice ke Glomed (keluarkan dari daftar pengecualian invoice entitas ini)
     try { Object.keys(T8_SELLERS).forEach(k => { if (T8_SELLERS[k].entitas === h.entitas) t8SetExcluded(k, h.nama, false); }); } catch (e) {}
     if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`menampilkan lagi produk <b>${esc(h.nama)}</b> di Stok Terjual ${esc(lbl)}`);
@@ -18948,7 +19038,6 @@ function t3HiddenManager() {
     if (!confirm(`Gabungkan "${h.nama}" ke "${target}"?\n\nSemua penjualan, stok & faktur dengan nama "${h.nama}" dipindah ke "${target}" dan ikut dihitung.`)) return;
     const c = mergeProductNames(h.nama, target);
     try { Object.keys(T8_SELLERS).forEach(k => { if (T8_SELLERS[k].entitas === h.entitas) t8SetExcluded(k, h.nama, false); }); } catch (e) {}
-    (state.hiddenProducts || []).filter(x => normalizeName(x.nama) === normalizeName(h.nama)).forEach(x => { state.hiddenRemoved = (state.hiddenRemoved || []).filter(y => y.k !== gsjHiddenKey(x)).concat([{ k: gsjHiddenKey(x), at: Date.now() }]); });
     state.hiddenProducts = (state.hiddenProducts || []).filter(x => normalizeName(x.nama) !== normalizeName(h.nama));
     recomputeAllCheckerRows();
     if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`menggabungkan produk tersembunyi <b>${esc(h.nama)}</b> ke <b>${esc(target)}</b> (${c.checkerRows} penjualan, ${c.adjustments} stok, ${c.invoiceItems} barang faktur)`);
