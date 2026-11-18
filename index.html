@@ -7479,6 +7479,7 @@ let tab3Date = null;
 const TAB3_PAGE_SIZE = 50;
 let tab3LoadedCount = TAB3_PAGE_SIZE;
 let tab3FuzzyOnly = false;
+let tab3MergeOnly = false; // filter "Perlu Digabung": cuma nama mentah marketplace yang belum digabung ke nama produk
 let tab3ColumnFilters = {};
 let tab3SortState = { key: null, dir: 'asc' };
 const TAB3_COLUMN_DEFS = [
@@ -7609,6 +7610,7 @@ function renderTab3() {
           <div class="tag-row" style="margin-top:6px;">
             <input type="text" id="t3-search" placeholder="🔎 Cari nama produk..." style="flex:1;min-width:200px;padding:7px 10px;border:1px solid #c9c5b8;border-radius:6px;font-size:13px;">
             <button class="btn secondary small" id="t3-fuzzy-filter">${tab3FuzzyOnly ? '✓ ' : ''}⚠ Perlu Dicek Saja</button>
+            <button class="btn secondary small" id="t3-merge-filter" title="Tampilkan cuma nama produk yang masih judul mentah marketplace (belum digabung ke nama produk yang benar), lengkap dengan sumbernya">${tab3MergeOnly ? '✓ ' : ''}🔗 Perlu Digabung</button>
             <button class="btn secondary small" id="t3-pengali" title="Atur pengali stok (misal 1 box = 20 pcs) langsung dari sini — isi kata kunci dari kolom cari">🔢 Pengali Stok</button>
           </div>
         </div>
@@ -7635,6 +7637,11 @@ function renderTab3() {
     tab3FuzzyOnly = !tab3FuzzyOnly;
     tab3LoadedCount = TAB3_PAGE_SIZE;
     document.getElementById('t3-fuzzy-filter').innerHTML = `${tab3FuzzyOnly ? '✓ ' : ''}⚠ Perlu Dicek Saja`;
+    renderTab3Table();
+  });
+  document.getElementById('t3-merge-filter').addEventListener('click', () => {
+    tab3MergeOnly = !tab3MergeOnly;
+    tab3LoadedCount = TAB3_PAGE_SIZE;
     renderTab3Table();
   });
   document.getElementById('t3-download').addEventListener('click', downloadStokTerjualExcel);
@@ -9383,18 +9390,91 @@ function qeSetPengali(row, n) {
   qeAfterChange(`mengubah <b>pengali</b> listing "${escapeAttr(row.namaAsli.slice(0, 60))}"${row.variasi ? ` (${escapeAttr(row.variasi)})` : ''} dari ${old} menjadi ${n} (dari Stok Terjual)`);
 }
 
+// ===== Filter "Perlu Digabung" + info SUMBER nama mentah di Stok Terjual =====
+// Nama yang masih berupa judul mentah marketplace (mis. "Elasto One/ Crepe Cohesive Bandage / Perban Elastis /
+// Verban Elastis"): dari daftar nama mentah sistem (gsjRawNameSet), ATAU kelihatan seperti judul listing
+// (>= 3 bagian dipisah "/" dan minimal 2 bagiannya berupa kata-kata) dan tidak tercatat sebagai nama bersih.
+function t3LooksLikeListingTitle(nama) {
+  const parts = String(nama || '').split('/').map(x => x.trim()).filter(Boolean);
+  if (parts.length < 3) return false;
+  return parts.filter(x => (x.match(/[A-Za-z]{3,}/g) || []).length >= 2).length >= 2;
+}
+function t3NeedsMerge(r) {
+  const nama = r && r.nama ? r.nama : '';
+  if (!nama) return false;
+  const k = normalizeName(nama);
+  const okNames = (state.settings && state.settings.rawNamesOk) || {};
+  if (okNames[k]) return false; // sudah ditandai "biarkan, ini produk sendiri"
+  if (_t3RawSet && _t3RawSet.has(k)) return true;
+  if (r.fuzzyContributors && r.fuzzyContributors.length) return false;
+  return t3LooksLikeListingTitle(nama);
+}
+let _t3SrcIdx = null;
+function t3BuildSrcIdx() {
+  const idx = new Map();
+  const add = (k) => { let o = idx.get(k); if (!o) { o = { sales: [], master: [], adj: 0, inv: 0 }; idx.set(k, o); } return o; };
+  state.checkerRows.forEach(r => { if (r.nama) add(normalizeName(r.nama)).sales.push(r); });
+  state.masterProduk.forEach(m => { if (m.namaInternal) add(normalizeName(m.namaInternal)).master.push(m); });
+  state.adjustments.forEach(a => { if (a.nama && a.keterangan !== 'Auto top-up (catatan Master Produk)') add(normalizeName(a.nama)).adj++; });
+  state.invoices.forEach(inv => (inv.items || []).forEach(it => { if (it.nama) add(normalizeName(it.nama)).inv++; }));
+  return idx;
+}
+function t3FmtTgl(iso) {
+  const BL = ['Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agu','Sep','Okt','Nov','Des'];
+  const [y, m, d] = String(iso || '').split('-').map(Number);
+  return d ? `${d} ${BL[m - 1]}${y !== new Date().getFullYear() ? ' ' + y : ''}` : '';
+}
+function t3RawSourceInfo(nama) {
+  if (!_t3SrcIdx) _t3SrcIdx = t3BuildSrcIdx();
+  const o = _t3SrcIdx.get(normalizeName(nama)) || { sales: [], master: [], adj: 0, inv: 0 };
+  const parts = [], detail = [];
+  // Toko & marketplace asal penjualan
+  const byToko = new Map();
+  o.sales.forEach(r => { const t = `${r.sumber || 'Lainnya'}${r.channel ? ' ' + r.channel : ''}`; byToko.set(t, (byToko.get(t) || 0) + 1); });
+  const tanggal = o.sales.map(r => r.tanggal).filter(Boolean).sort();
+  if (o.sales.length) {
+    const tgl = tanggal.length ? (tanggal[0] === tanggal[tanggal.length - 1] ? t3FmtTgl(tanggal[0]) : `${t3FmtTgl(tanggal[0])} – ${t3FmtTgl(tanggal[tanggal.length - 1])}`) : '';
+    parts.push(`Penjualan ${[...byToko.keys()].join(', ')} · ${o.sales.length}x${tgl ? ' (' + tgl + ')' : ''}`);
+  }
+  // Variasi listing marketplace yang memakai nama ini
+  const vars = new Set();
+  o.sales.forEach(r => { if (r.variasi) vars.add(r.variasi); });
+  o.master.forEach(m => { if (m.variasiMarketplace && m.variasiMarketplace !== '-' && m.variasiMarketplace !== 'Default') vars.add(m.variasiMarketplace); });
+  if (vars.size) parts.push(`variasi ${[...vars].slice(0, 3).map(v => '"' + v + '"').join(', ')}${vars.size > 3 ? ` +${vars.size - 3}` : ''}`);
+  // Asal nama di Master Produk
+  const srcM = o.master.map(m => m.createdSource).filter(Boolean);
+  if (srcM.length) {
+    const s0 = srcM[0];
+    parts.push(/import\s+shopee/i.test(s0) ? 'nama dibuat otomatis waktu import Shopee'
+      : /import\s+tokopedia/i.test(s0) ? 'nama dibuat otomatis waktu import Tokopedia'
+      : /tiktok/i.test(s0) ? 'nama dibuat otomatis waktu import TikTok'
+      : 'Master Produk: ' + s0.replace(/\s*\(.*\)\s*$/, ''));
+  }
+  if (o.adj) parts.push(`${o.adj} catatan stok`);
+  if (o.inv) parts.push(`${o.inv} item faktur`);
+  if (!parts.length) parts.push('tidak ada penjualan/faktur — cuma dari riwayat stok');
+  // Detail (tooltip): judul listing lengkap
+  const titles = new Map();
+  o.sales.forEach(r => { if (r.namaAsli) { const t = `${r.sumber || ''}${r.channel ? ' ' + r.channel : ''}: "${r.namaAsli}"${r.variasi ? ' — variasi ' + r.variasi : ''}`; titles.set(t, (titles.get(t) || 0) + 1); } });
+  o.master.forEach(m => { const t = `Master Produk: "${m.namaMarketplace}"${m.variasiMarketplace ? ' — variasi ' + m.variasiMarketplace : ''}${m.createdSource ? ' [' + m.createdSource + ']' : ''}`; if (!titles.has(t)) titles.set(t, 0); });
+  titles.forEach((n, t) => detail.push(`• ${t}${n ? ` (${n} penjualan)` : ''}`));
+  return { short: 'Sumber: ' + parts.join(' · '), detail: 'Asal nama ini:\n' + (detail.join('\n') || '(tidak ada listing marketplace)') };
+}
+
 function buildTab3RowHTML(r) {
   // Products whose Nama Produk still looks like a raw, un-mapped marketplace title (long
   // and/or "/"-separated aliases) get a small diagnostic icon — clicking it computes, on
   // demand, the closest catalog candidate found and its score, so it's visible right in the
   // app why it either did or didn't get auto-matched, without needing to dig through raw data.
-  const looksRaw = _t3RawSet ? _t3RawSet.has(normalizeName(r.nama)) : ((!r.fuzzyContributors || !r.fuzzyContributors.length) && (r.nama.includes('/') || r.nama.length > 55));
+  const looksRaw = t3NeedsMerge(r);
+  const srcInfo = looksRaw ? t3RawSourceInfo(r.nama) : null;
   return `
     <tr data-nama="${escapeAttr(r.nama)}">
       <td>
         <span data-action="quickedit" title="Klik untuk cek & ubah transaksi produk ini di tanggal ini (entitas, nama internal, pengali)" style="cursor:pointer;border-bottom:1px dashed #9ca3af;">${escapeAttr(r.nama)}</span>
         ${r.fuzzyContributors && r.fuzzyContributors.length ? `<span title="${escapeAttr('Dicocokkan OTOMATIS dari nama marketplace berikut (belum ada Master Produk):\n' + r.fuzzyContributors.map(f => `• "${f.namaAsli}" (mirip ${Math.round(f.score*100)}%)`).join('\n') + '\n\nCek dulu apakah ini memang produk yang sama. Kalau benar, tambahkan Master Produk supaya tidak perlu dicocokkan otomatis lagi.')}" style="cursor:help;color:var(--amber);margin-left:3px;">⚠</span>` : ''}
         ${looksRaw ? (() => { const best0 = rawNameBestCandidate(r.nama); const best = best0 && best0.score >= 0.75 ? best0 : null; return `<div style="margin-top:3px;font-size:11px;">${best ? `💡 <b>${escapeAttr(best.nama)}</b> <span style="color:var(--muted);">(${Math.round(best.score * 100)}%)</span> <button class="btn small" data-action="quickmerge" data-to="${escapeAttr(best.nama)}" style="padding:1px 7px;font-size:10.5px;background:#16a34a;color:#fff;border-color:#16a34a;" title="Buka jendela gabung (sudah terisi saran ini) — bisa diatur per variasi">🔗 Gabung…</button>` : `<button class="btn secondary small" data-action="whynotmerged" style="padding:1px 7px;font-size:10.5px;" title="Pilih produk yang benar per variasi, jadikan produk sendiri, atau biarkan">🔗 Rapikan nama…</button>`}</div>`; })() : ''}
+        ${srcInfo ? `<div style="margin-top:2px;font-size:10.5px;color:#6b7280;line-height:1.35;max-width:340px;" title="${escapeAttr(srcInfo.detail)}">📍 ${escapeAttr(srcInfo.short)}</div>` : ''}
       </td>
       <td data-cell="satuan" style="text-align:center; color:var(--muted);">${escapeAttr(r.satuan || 'Pcs')}</td>
       <td class="num" data-cell="stokAwal" style="font-family:var(--mono); ${r.stokAwal<0?'color:var(--red);':''}">
@@ -9465,6 +9545,13 @@ function renderTab3TableInner() {
   const entitas = tab3Entity;
   let pivot = computeStokTerjualPivot(entitas, tab3Date);
   try { _t3RawSet = gsjRawNameSet(); } catch (e) { _t3RawSet = null; }
+  _t3SrcIdx = null; // sumber nama mentah dihitung ulang tiap render (lihat t3RawSourceInfo)
+  {
+    const nMerge = pivot.filter(r => t3NeedsMerge(r)).length;
+    const mb = document.getElementById('t3-merge-filter');
+    if (mb) mb.innerHTML = `${tab3MergeOnly ? '✓ ' : ''}🔗 Perlu Digabung${nMerge ? ` <b style="background:#dc2626;color:#fff;border-radius:9px;padding:0 6px;margin-left:2px;">${nMerge}</b>` : ''}`;
+  }
+  if (tab3MergeOnly) pivot = pivot.filter(r => t3NeedsMerge(r));
   const searchEl = document.getElementById('t3-search');
   const q = searchEl ? normalizeName(searchEl.value) : '';
   if (q) pivot = pivot.filter(r => normalizeName(r.nama).includes(q));
