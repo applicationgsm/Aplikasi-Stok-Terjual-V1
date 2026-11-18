@@ -14135,8 +14135,11 @@ function iuRenderAuditCard() {
   box.querySelector('#au-file').addEventListener('change', e => { iuAudit.file = e.target.files[0] || null; box.querySelector('#au-run').disabled = !iuAudit.file; });
   box.querySelector('#au-date').addEventListener('change', e => { iuAudit.date = e.target.value; });
   box.querySelector('#au-run').addEventListener('click', () => iuAuditRun());
-  box.querySelector('#au-outside-btn').addEventListener('click', () => iuRenderOutside());
+  box.querySelector('#au-outside-btn').addEventListener('click', () => { iuAudit.showOutside = true; iuRenderOutside(); });
   if (hadResult) iuAuditRenderResult();
+  // Tab ini ikut digambar ulang tiap ada perubahan data / sinkron dari user lain (beberapa detik sekali) —
+  // daftar "produk di luar Stok Awal" yang sudah dibuka harus ikut digambar lagi, jangan hilang.
+  if (iuAudit.showOutside) { try { iuRenderOutside(); } catch (e) {} }
   iuRenderGenerations();
 }
 
@@ -14251,18 +14254,24 @@ function iuMergeOutsideName(ent, fromName, toName, E) {
 function iuRenderOutside() {
   const box = document.getElementById('au-outside');
   if (!box) return;
+  // Simpan isian, posisi scroll & kursor sebelum digambar ulang (supaya tidak hilang waktu ada sinkron)
+  // (disimpan di iuAudit, karena kotak #au-outside sendiri ikut dibuat ulang oleh iuRenderAuditCard)
+  const ost = iuAudit.outsideUi && iuAudit.outsideUi.ent === iuAudit.ent ? iuAudit.outsideUi : (iuAudit.outsideUi = { ent: iuAudit.ent, vals: {}, scroll: 0, focus: null });
+  const prevVals = ost.vals;
+  const prevScroll = ost.scroll;
+  const prevFocus = ost.focus;
   const r = iuOutsideStokAwal(iuAudit.ent || 'Gracia');
   const label = iuEntLabel(r.ent);
   const n = (x) => x.toLocaleString('id-ID');
   const likelySame = r.outside.filter(x => x.best).length;
   const stale = r.fullCount - r.catalogCount;
   const dlId = 'au-imp-names';
-  const rows = r.outside.map((x, i) => `<tr data-i="${i}">
+  const rows = r.outside.map((x, i) => `<tr data-i="${i}" data-nama="${escapeAttr(x.nama)}">
       <td>${escapeAttr(x.nama)}</td>
       <td style="font-size:11.5px;color:var(--muted);">${escapeAttr(x.src)}</td>
       <td style="font-size:12px;">${x.best ? `<span style="color:var(--muted);">saran (${Math.round(x.best.score * 100)}%${x.best.spelling ? ', beda ejaan' : ''}):</span>` : '<span style="color:var(--muted);">tidak ada yang mirip — cari manual kalau memang sama:</span>'}
         <div style="display:flex;gap:4px;margin-top:3px;align-items:center;">
-          <input type="text" list="${dlId}" data-au-to value="${x.best ? escapeAttr(x.best.nama) : ''}" placeholder="ketik nama di Stok Awal…" style="flex:1;min-width:200px;padding:3px 6px;border:1px solid #c9c5b8;border-radius:5px;font-size:12px;">
+          <input type="text" list="${dlId}" data-au-to value="${escapeAttr(prevVals[x.nama] != null ? prevVals[x.nama] : (x.best ? x.best.nama : ''))}" placeholder="ketik nama di Stok Awal…" style="flex:1;min-width:200px;padding:3px 6px;border:1px solid #c9c5b8;border-radius:5px;font-size:12px;">
           <button class="btn small" data-au-merge style="padding:2px 8px;font-size:11px;background:#16a34a;color:#fff;border-color:#16a34a;white-space:nowrap;">🔗 Gabung</button>
           <button class="btn secondary small" data-au-ok title="Memang produk lain (bukan duplikat) — tidak ditampilkan lagi di daftar ini" style="padding:2px 8px;font-size:11px;white-space:nowrap;">✓ Produk lain</button>
         </div>
@@ -14271,6 +14280,7 @@ function iuRenderOutside() {
   box.innerHTML = `
     <datalist id="${dlId}">${r.impNames.map(x => `<option value="${escapeAttr(x)}">`).join('')}</datalist>
     <div class="t9-snapbar none" style="display:block;">
+      <a href="#" id="au-outside-close" style="float:right;font-size:12px;">✕ Tutup</a>
       <b>${escapeAttr(label)}:</b> daftar produk periode ini <b>${n(r.catalogCount)}</b> = <b>${n(r.impCount)}</b> dari Stok Awal (import) + <b>${n(r.catalogCount - r.impCount)}</b> lainnya.
       ${stale > 0 ? `<div style="margin-top:4px;">✅ <b>${n(stale)}</b> nama lama yang cuma ada di riwayat periode sebelumnya (stoknya 0 & tidak ada transaksi baru) sudah <b>tidak dihitung</b> lagi di Stok Terjual periode ini. Riwayat bulan lalu tidak diubah.</div>` : ''}
       ${r.outside.length ? `<div style="margin-top:4px;">Perlu dicek: <b>${n(r.outside.length)}</b> nama punya transaksi di periode ini tapi tidak ada di Stok Awal — <b>${n(likelySame)}</b> ada saran nama yang mirip. Pastikan dulu sarannya benar (cek ukuran/warna/merek), baru klik <b>🔗 Gabung</b>.</div>` : `<div style="margin-top:4px;">✅ Semua nama periode ini sudah cocok dengan Stok Awal.</div>`}
@@ -14301,6 +14311,22 @@ function iuRenderOutside() {
       iuRenderOutside();
     });
   });
+  const nw = box.querySelector('.table-wrap');
+  if (nw && prevScroll) nw.scrollTop = prevScroll;
+  if (nw) nw.addEventListener('scroll', () => { ost.scroll = nw.scrollTop; });
+  box.querySelectorAll('tr[data-nama] [data-au-to]').forEach(inp => {
+    const nm = inp.closest('tr').dataset.nama;
+    inp.addEventListener('input', () => { ost.vals[nm] = inp.value; ost.focus = { nama: nm, pos: inp.selectionStart }; });
+    inp.addEventListener('focus', () => { ost.focus = { nama: nm, pos: inp.selectionStart }; });
+    inp.addEventListener('blur', () => { setTimeout(() => { if (!document.activeElement || !document.activeElement.matches || !document.activeElement.matches('[data-au-to]')) ost.focus = null; }, 0); });
+  });
+  if (prevFocus) {
+    const tr = [...box.querySelectorAll('tr[data-nama]')].find(t => t.dataset.nama === prevFocus.nama);
+    const inp = tr && tr.querySelector('[data-au-to]');
+    if (inp) { inp.focus(); try { inp.setSelectionRange(prevFocus.pos, prevFocus.pos); } catch (e) {} }
+  }
+  const cl = box.querySelector('#au-outside-close');
+  if (cl) cl.addEventListener('click', (e) => { e.preventDefault(); iuAudit.showOutside = false; box.innerHTML = ''; });
   const rs = box.querySelector('#au-ok-reset');
   if (rs) rs.addEventListener('click', (e) => {
     e.preventDefault();
