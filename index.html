@@ -953,6 +953,7 @@ let state = {
   omsetBulanan: [],   // {id:'omset-YYYY-MM', tahun, bulan, savedAt, savedBy, markup, GSM:{d:[[omset,qty,rows]..],dppPpn,dpp,ppnGlomed,noModal}, HNH:{...}} — omset bulanan yang disimpan (Tab 9)
   dobelResolutions: [], // {key:'invId::itemId', decision:'duplikat'|'bukan', at, by} — keputusan atas kandidat Faktur berisiko dobel dgn Stok Awal
   hiddenProducts: [], // {entitas, nama} - produk yang disembunyikan dari daftar Stok Terjual
+  hiddenRemoved: [], // {k, at} - tanda 'sudah ditampilkan lagi' supaya tidak muncul tersembunyi lagi dari device lain
   settings: { feeDefault: 13, markupPerUnit: 1000 },
   lastEditedBy: '',
   lastEditedAt: '',
@@ -1092,7 +1093,7 @@ function uid() {
 // dan total memori riwayat Undo dibatasi.
 const SNAP_SKIP_KEYS = { lastEditedBy: 1, lastEditedAt: 1 };
 const GSJ_SETTINGS_KEYS = ['settings', 'hargaModalOverride', 'namaCustomer']; // disimpan di gsj_settings 'main'
-const GSJ_LIST_KEYS = ['hiddenProducts', 'dobelResolutions', 'entityMoves', 'entityMovesDone'];    // disimpan di gsj_settings 'lists' (digabung)
+const GSJ_LIST_KEYS = ['hiddenProducts', 'hiddenRemoved', 'dobelResolutions', 'entityMoves', 'entityMovesDone'];    // disimpan di gsj_settings 'lists' (digabung)
 const UNDO_MAX_CHARS = 60e6; // ±120 MB teks unik untuk seluruh riwayat Undo
 const LOCAL_MAX_CHARS = 4.5e6; // batas aman localStorage (±5 juta karakter)
 // Jalur cepat: kalau pemanggil tahu persis tabel mana yang berubah (mis. edit harga di Riwayat Faktur cuma
@@ -1367,6 +1368,7 @@ function importJSON(file, callback) {
         omsetBulanan: parsed.omsetBulanan || [],
         dobelResolutions: parsed.dobelResolutions || [],
         hiddenProducts: parsed.hiddenProducts || [],
+        hiddenRemoved: parsed.hiddenRemoved || [],
         settings: Object.assign({ feeDefault: 13, markupPerUnit: 1000 }, parsed.settings || {}),
       };
       saveState();
@@ -3458,7 +3460,7 @@ function getProductCatalogForEntity(entitas) {
 function hideProductForEntity(entitas, nama) {
   state.hiddenProducts = state.hiddenProducts || [];
   if (!state.hiddenProducts.some(h => h.entitas === entitas && normalizeName(h.nama) === normalizeName(nama))) {
-    state.hiddenProducts.push({ entitas, nama });
+    state.hiddenProducts.push({ entitas, nama, at: Date.now() });
   }
 }
 
@@ -14620,7 +14622,15 @@ const GSJ_LISTS_ID = 'lists';
 const gsjHiddenKey = h => (h.entitas || '') + '||' + normalizeName(h.nama);
 function gsjMergeLists(a, b) {
   return {
-    hiddenProducts: gsjMergeByKey((a && a.hiddenProducts) || [], (b && b.hiddenProducts) || [], gsjHiddenKey),
+    // Disembunyikan vs ditampilkan lagi: dulu daftar cuma DIGABUNG (a + b), jadi "Tampilkan lagi" selalu
+    // kembali tersembunyi dari server/device lain. Sekarang ada tanda hapus (hiddenRemoved {k, at}):
+    // produk tetap tersembunyi hanya kalau disembunyikan SETELAH terakhir ditampilkan lagi.
+    hiddenRemoved: gsjMergeLatest((a && a.hiddenRemoved) || [], (b && b.hiddenRemoved) || [], x => x.k),
+    hiddenProducts: (() => {
+      const tomb = new Map(gsjMergeLatest((a && a.hiddenRemoved) || [], (b && b.hiddenRemoved) || [], x => x.k).map(x => [x.k, Number(x.at) || 0]));
+      return gsjMergeLatest((a && a.hiddenProducts) || [], (b && b.hiddenProducts) || [], gsjHiddenKey)
+        .filter(x => !(tomb.has(gsjHiddenKey(x)) && tomb.get(gsjHiddenKey(x)) >= (Number(x.at) || 0)));
+    })(),
     dobelResolutions: gsjMergeByKey((a && a.dobelResolutions) || [], (b && b.dobelResolutions) || [], x => x.key),
     entityMoves: gsjMergeByKey((a && a.entityMoves) || [], (b && b.entityMoves) || [], x => x.id)
       .filter(x => !(((a && a.entityMovesDone) || []).concat((b && b.entityMovesDone) || [])).includes(x.id))
@@ -14628,16 +14638,22 @@ function gsjMergeLists(a, b) {
     entityMovesDone: [...new Set(((a && a.entityMovesDone) || []).concat((b && b.entityMovesDone) || []))].slice(-800),
   };
 }
-function gsjListsLocal() { return { hiddenProducts: state.hiddenProducts || [], dobelResolutions: state.dobelResolutions || [], entityMoves: state.entityMoves || [], entityMovesDone: state.entityMovesDone || [] }; }
+function gsjMergeLatest(a, b, keyFn) {
+  const m = new Map();
+  [...(a || []), ...(b || [])].forEach(x => { if (!x) return; const k = keyFn(x); const o = m.get(k); if (!o || (Number(x.at) || 0) >= (Number(o.at) || 0)) m.set(k, x); });
+  return [...m.values()];
+}
+function gsjListsLocal() { return { hiddenRemoved: state.hiddenRemoved || [], hiddenProducts: state.hiddenProducts || [], dobelResolutions: state.dobelResolutions || [], entityMoves: state.entityMoves || [], entityMovesDone: state.entityMovesDone || [] }; }
 let gsjListsBaselineJSON = null;
 function gsjApplyLists(merged) {
   const before = JSON.stringify(gsjListsLocal());
   state.hiddenProducts = merged.hiddenProducts;
+  state.hiddenRemoved = merged.hiddenRemoved || [];
   state.dobelResolutions = merged.dobelResolutions;
   state.entityMoves = merged.entityMoves;
   state.entityMovesDone = merged.entityMovesDone;
   if (JSON.stringify(gsjListsLocal()) !== before) {
-    gsjRemoteTouchedKeys.add('hiddenProducts'); gsjRemoteTouchedKeys.add('dobelResolutions');
+    gsjRemoteTouchedKeys.add('hiddenProducts'); gsjRemoteTouchedKeys.add('hiddenRemoved'); gsjRemoteTouchedKeys.add('dobelResolutions');
     gsjRemoteTouchedKeys.add('entityMoves'); gsjRemoteTouchedKeys.add('entityMovesDone');
     if (typeof gsjUpdateMovesBadge === 'function') setTimeout(gsjUpdateMovesBadge, 0);
     return true;
@@ -14789,7 +14805,7 @@ async function gsjInitialSyncFromSupabase() {
       if (gsjMergeNamaCustomerFromServer(sd)) gsjSettingsNeedPush = true;
       // Sisa dari versi sebelumnya yang sempat menaruh daftar ini di baris 'main' -> ikut digabung.
       if (Array.isArray(sd.hiddenProducts) || Array.isArray(sd.dobelResolutions)) {
-        const m = gsjMergeLists(gsjListsLocal(), sd); state.hiddenProducts = m.hiddenProducts; state.dobelResolutions = m.dobelResolutions;
+        const m = gsjMergeLists(gsjListsLocal(), sd); state.hiddenProducts = m.hiddenProducts; state.hiddenRemoved = m.hiddenRemoved || []; state.dobelResolutions = m.dobelResolutions;
       }
     }
     setTimeout(() => { if (typeof gsjPushLists === 'function') gsjPushLists(); }, 300); // ambil + gabung + simpan daftar tersembunyi
@@ -18918,6 +18934,7 @@ function t3HiddenManager() {
   m.querySelectorAll('[data-show]').forEach(b => b.onclick = () => {
     const h = list[Number(b.dataset.show)];
     state.hiddenProducts = (state.hiddenProducts || []).filter(x => !(x.entitas === h.entitas && normalizeName(x.nama) === normalizeName(h.nama)));
+    state.hiddenRemoved = (state.hiddenRemoved || []).filter(x => x.k !== gsjHiddenKey(h)).concat([{ k: gsjHiddenKey(h), at: Date.now() }]);
     // ikut dihitung lagi juga di Invoice ke Glomed (keluarkan dari daftar pengecualian invoice entitas ini)
     try { Object.keys(T8_SELLERS).forEach(k => { if (T8_SELLERS[k].entitas === h.entitas) t8SetExcluded(k, h.nama, false); }); } catch (e) {}
     if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`menampilkan lagi produk <b>${esc(h.nama)}</b> di Stok Terjual ${esc(lbl)}`);
@@ -18931,6 +18948,7 @@ function t3HiddenManager() {
     if (!confirm(`Gabungkan "${h.nama}" ke "${target}"?\n\nSemua penjualan, stok & faktur dengan nama "${h.nama}" dipindah ke "${target}" dan ikut dihitung.`)) return;
     const c = mergeProductNames(h.nama, target);
     try { Object.keys(T8_SELLERS).forEach(k => { if (T8_SELLERS[k].entitas === h.entitas) t8SetExcluded(k, h.nama, false); }); } catch (e) {}
+    (state.hiddenProducts || []).filter(x => normalizeName(x.nama) === normalizeName(h.nama)).forEach(x => { state.hiddenRemoved = (state.hiddenRemoved || []).filter(y => y.k !== gsjHiddenKey(x)).concat([{ k: gsjHiddenKey(x), at: Date.now() }]); });
     state.hiddenProducts = (state.hiddenProducts || []).filter(x => normalizeName(x.nama) !== normalizeName(h.nama));
     recomputeAllCheckerRows();
     if (typeof gsjDetailedAudit === 'function') gsjDetailedAudit(`menggabungkan produk tersembunyi <b>${esc(h.nama)}</b> ke <b>${esc(target)}</b> (${c.checkerRows} penjualan, ${c.adjustments} stok, ${c.invoiceItems} barang faktur)`);
